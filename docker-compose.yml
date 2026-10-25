@@ -1,0 +1,119 @@
+# Novacore — local LEMP stack.
+#
+# Drive this through `bin/novacore` rather than `docker compose` directly: the CLI
+# generates nginx vhosts, certificates and data/compose.generated.yml, and only
+# starts the PHP versions your sites actually use.
+
+name: novacore
+
+x-php-build-args: &php-build-args
+  UID: ${NOVACORE_UID:-1000}
+  GID: ${NOVACORE_GID:-1000}
+
+x-php: &php
+  restart: unless-stopped
+  profiles: [php]
+  environment:
+    XDEBUG_MODE: ${XDEBUG_MODE:-develop,debug}
+    # Where the database is from inside Novacore. Configs can fall back to
+    # 127.0.0.1 when it's unset, so tools on the host connect too. The vhosts
+    # pass it to web requests, since PHP-FPM clears the environment.
+    NOVACORE_DB_HOST: mariadb
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  # Lets `up --wait` hold off until FPM accepts connections, so requests
+  # straight after a restart don't get a 502.
+  healthcheck:
+    test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+    interval: 30s
+    timeout: 5s
+    start_period: 30s
+    start_interval: 1s
+  volumes:
+    - ${SITES_DIR:-./sites}:/var/www/sites:z
+    - ./data/certs:/etc/novacore/certs:ro,z
+    - ./logs:/var/log/novacore:z
+  networks: [novacore]
+
+# Containers get fixed names (novacore-nginx, novacore-php84, ...) rather than
+# Compose's numbered ones: there's only ever one Novacore per machine, and a
+# second copy fails straight away on the names instead of on the ports.
+services:
+  nginx:
+    container_name: novacore-nginx
+    build: ./docker/nginx
+    image: novacore/nginx
+    restart: unless-stopped
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-80}:80
+      - ${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./data/nginx/sites:/etc/nginx/sites:ro,z
+      - ./data/nginx/www:/etc/novacore/www:ro,z
+      - ./data/certs:/etc/novacore/certs:z
+      - ${SITES_DIR:-./sites}:/var/www/sites:ro,z
+    networks: [novacore]
+
+  mariadb:
+    container_name: novacore-mariadb
+    image: mariadb:11.8
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      MARIADB_USER: ${DB_USER:-novacore}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-novacore}
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${DB_PORT:-3306}:3306
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./docker/mariadb/init:/docker-entrypoint-initdb.d:ro,z
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [novacore]
+
+  php74:
+    <<: *php
+    container_name: novacore-php74
+    image: novacore/php:7.4
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "7.4" } }
+  php80:
+    <<: *php
+    container_name: novacore-php80
+    image: novacore/php:8.0
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.0" } }
+  php81:
+    <<: *php
+    container_name: novacore-php81
+    image: novacore/php:8.1
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.1" } }
+  php82:
+    <<: *php
+    container_name: novacore-php82
+    image: novacore/php:8.2
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.2" } }
+  php83:
+    <<: *php
+    container_name: novacore-php83
+    image: novacore/php:8.3
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.3" } }
+  php84:
+    <<: *php
+    container_name: novacore-php84
+    image: novacore/php:8.4
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.4" } }
+  php85:
+    <<: *php
+    container_name: novacore-php85
+    image: novacore/php:8.5
+    build: { context: ./docker/php, args: { <<: *php-build-args, PHP_VERSION: "8.5" } }
+
+networks:
+  novacore:
+
+volumes:
+  db-data:

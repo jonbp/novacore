@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# novacore-cert <domain>... — issue certificates signed by the Novacore local CA.
+#
+# Creates the CA on first use. Each certificate covers the domain and its
+# subdomains (example.localhost and *.example.localhost).
+
+set -eu
+
+dir=/etc/novacore/certs
+cd "$dir"
+
+if [ ! -f ca.key ] || [ ! -f ca.crt ]; then
+    echo "Creating Novacore local certificate authority"
+    cat > ca.cnf <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+prompt = no
+[dn]
+CN = Novacore Local CA
+O = Novacore
+[v3_ca]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+    openssl req -x509 -new -nodes -newkey rsa:4096 -sha256 -days 3650 \
+        -config ca.cnf -keyout ca.key -out ca.crt 2>/dev/null
+    chmod 600 ca.key
+    rm -f ca.cnf
+fi
+
+for domain in "$@"; do
+    echo "Issuing certificate for $domain"
+    cat > "$domain.ext" <<EOF
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:$domain, DNS:*.$domain
+authorityKeyIdentifier = keyid
+EOF
+    openssl req -new -nodes -newkey rsa:2048 -subj "/CN=$domain" \
+        -keyout "$domain.key" -out "$domain.csr" 2>/dev/null
+    # 825 days is the longest validity macOS/iOS accept for private CAs.
+    openssl x509 -req -sha256 -days 825 -in "$domain.csr" \
+        -CA ca.crt -CAkey ca.key -CAcreateserial \
+        -extfile "$domain.ext" -out "$domain.crt" 2>/dev/null
+    chmod 644 "$domain.key"
+    rm -f "$domain.csr" "$domain.ext"
+done

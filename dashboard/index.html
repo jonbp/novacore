@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Novacore</title>
+<link rel="icon" href="novacore.svg" type="image/svg+xml">
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #f6f6f4; --card: #fff; --muted: #6b6b6b; --line: #e2e2df; --accent: #17d4a4; --link: #0b8f6d; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececec; --bg: #131615; --card: #1b1f1e; --muted: #9a9a9a; --line: #2c3331; --link: #17d4a4; } }
+  body { font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 1120px; margin: 0 auto; padding: 48px 16px; }
+  h1 { margin: 0 0 4px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; color: var(--accent); }
+  h1 img { width: 32px; height: 32px; }
+  h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 40px 0 10px; }
+  .lede { color: var(--muted); margin: 0; }
+  .wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 0.8rem; font-weight: 600; color: var(--muted); padding: 6px 8px; border-bottom: 2px solid var(--accent); }
+  td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th, td { white-space: nowrap; }
+  th:first-child, td:first-child { padding-left: 0; }
+  a { color: var(--link); text-decoration: none; font-weight: 600; }
+  a:hover { text-decoration: underline; }
+  code { font: 0.88em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td code, dd code { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 14px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 0.95rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  .cmd { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; font-size: 0.92rem; }
+  .cmd dt code { color: var(--fg); }
+  footer { margin-top: 40px; color: var(--muted); font-size: 0.85rem; }
+  @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+  @media (max-width: 560px) { .cmd { grid-template-columns: 1fr; gap: 0; } .cmd dd { margin-bottom: 8px; } }
+</style>
+</head>
+<body>
+<h1><img src="novacore.svg" alt="">Novacore</h1>
+<p class="lede">Local PHP sites on nginx, PHP-FPM and MariaDB. Run <code>novacore help</code> for every command.</p>
+
+<h2>Sites</h2>
+<div class="wrap"><table>
+<thead><tr><th>Site</th><th>PHP</th><th>Database</th><th>Doc root</th></tr></thead>
+<tbody>{{SITE_ROWS}}</tbody>
+</table></div>
+
+<h2>Database</h2>
+<div class="grid">
+  <div class="card"><h3>From PHP (inside Novacore)</h3><dl><dt>Host</dt><dd><code>mariadb:3306</code></dd><dt>User</dt><dd><code>{{DB_USER}}</code></dd><dt>Password</dt><dd><code>{{DB_PASSWORD}}</code></dd></dl></div>
+  <div class="card"><h3>From your machine</h3><dl><dt>Host</dt><dd><code>127.0.0.1:{{DB_PORT}}</code></dd><dt>User</dt><dd><code>{{DB_USER}}</code></dd><dt>Password</dt><dd><code>{{DB_PASSWORD}}</code></dd></dl></div>
+</div>
+
+<h2>Common commands</h2>
+<div class="grid">
+  <div class="card"><h3>Sites</h3><dl class="cmd">
+    <dt><code>site add &lt;name&gt;</code></dt><dd>Serve sites/&lt;name&gt; at https://&lt;name&gt;.{{NOVACORE_TLD}}</dd>
+    <dt><code>site info &lt;name&gt;</code></dt><dd>URL, paths and DB settings</dd>
+    <dt><code>site rm &lt;name&gt;</code></dt><dd>Stop serving (files kept)</dd>
+    <dt><code>open [site]</code></dt><dd>Open in your browser</dd>
+  </dl></div>
+  <div class="card"><h3>PHP</h3><dl class="cmd">
+    <dt><code>php &lt;site&gt; X.Y</code></dt><dd>Switch a site's PHP version</dd>
+    <dt><code>xdebug on|off</code></dt><dd>Toggle Xdebug</dd>
+    <dt><code>shell [site]</code></dt><dd>Bash in the PHP container</dd>
+    <dt><code>wp|composer &lt;site&gt; …</code></dt><dd>Run WP-CLI or Composer</dd>
+  </dl></div>
+  <div class="card"><h3>Databases</h3><dl class="cmd">
+    <dt><code>db list</code></dt><dd>List databases</dd>
+    <dt><code>db import &lt;db&gt; &lt;file&gt;</code></dt><dd>Load a .sql or .sql.gz</dd>
+    <dt><code>db export &lt;db&gt;</code></dt><dd>Dump to .sql.gz</dd>
+    <dt><code>db shell [db]</code></dt><dd>MariaDB console</dd>
+  </dl></div>
+  <div class="card"><h3>Debugging</h3><dl class="cmd">
+    <dt><code>errors [site]</code></dt><dd>Follow PHP error logs</dd>
+    <dt><code>logs [service]</code></dt><dd>Follow container logs</dd>
+    <dt><code>status</code></dt><dd>Containers and sites</dd>
+    <dt><code>trust</code></dt><dd>Fix certificate warnings</dd>
+  </dl></div>
+</div>
+
+<footer>Config lives in <code>.env</code> and <code>sites.conf</code>; apply changes with <code>novacore reload</code>.</footer>
+</body>
+</html>

@@ -1,0 +1,6 @@
+# Per-machine state
+.env
+sites.conf
+sites/
+data/
+logs/

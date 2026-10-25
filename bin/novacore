@@ -1,0 +1,1326 @@
+#!/usr/bin/env bash
+#
+# novacore — manage local PHP sites on a Dockerised LEMP stack.
+# Run `novacore help` for usage.
+
+set -euo pipefail
+
+NOVACORE_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+cd "$NOVACORE_ROOT"
+
+SUPPORTED_PHP=(7.4 8.0 8.1 8.2 8.3 8.4 8.5)
+SITES_CONF="$NOVACORE_ROOT/sites.conf"
+DATA_DIR="$NOVACORE_ROOT/data"
+LOGS_DIR="$NOVACORE_ROOT/logs"
+
+# --- Output ------------------------------------------------------------------
+#
+# The same look as Ignition and WP-CLI Sync: a banner, a heading per task with
+# its outcome and time, and a summary line at the end. Command output is held
+# back: its latest line shows while it runs, and the rest only if it fails.
+# Commands that just report something skip the banner, so they stay terse.
+
+IS_TTY=0
+if [[ -t 1 ]]; then IS_TTY=1; fi
+RUN_START=''
+TASK_START=''
+TERM_COLS=''
+
+# color TEXT SGR — wrap text in an ANSI colour, e.g. 32 or '1;34'.
+color() {
+    if (( IS_TTY )); then printf '\e[%sm%s\e[0m' "$2" "$1"; else printf '%s' "$1"; fi
+}
+
+# Clear the current line, ready to redraw it.
+clear_line() {
+    if (( IS_TTY )); then printf '\r\e[2K'; fi
+}
+
+# Milliseconds since the epoch. Whole seconds on Bash before 5.0 (macOS).
+now_ms() {
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        local us=${EPOCHREALTIME//[.,]/}
+        echo $(( us / 1000 ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+# elapsed START_MS — the time since START_MS as a short label, e.g. 4.2s or 1m 3s.
+elapsed() {
+    local ms=$(( $(now_ms) - $1 ))
+    if (( ms < 60000 )); then
+        printf '%d.%ds' $(( ms / 1000 )) $(( ms % 1000 / 100 ))
+    else
+        printf '%dm %ds' $(( ms / 60000 )) $(( (ms % 60000 + 500) / 1000 ))
+    fi
+}
+
+# count N SINGULAR PLURAL — e.g. "1 site" or "3 sites".
+count() { if (( $1 == 1 )); then echo "1 $2"; else echo "$1 $3"; fi; }
+
+# join SEPARATOR ITEM...
+join() {
+    local sep=$1 out item
+    shift
+    (( $# )) || return 0
+    out=$1
+    shift
+    for item in "$@"; do out+=$sep$item; done
+    printf '%s' "$out"
+}
+
+# The git tag this checkout is on, or "dev".
+version() {
+    local tag
+    tag=$(git -C "$NOVACORE_ROOT" describe --tags 2>/dev/null) || { echo dev; return; }
+    echo "v$tag"
+}
+
+# header PART... — the banner at the start of a command, e.g. "Starting".
+header() {
+    RUN_START=$(now_ms)
+    # Novacore's own colour (#17D4A4, the dashboard's teal) where the terminal
+    # supports it, cyan elsewhere.
+    local brand='1;36'
+    case ${COLORTERM:-} in truecolor|24bit) brand='1;38;2;23;212;164' ;; esac
+    printf '\n%s  %s\n' "$(color '○ Novacore' "$brand")" "$(join "$(color ' · ' 90)" "$@" "$(color "$(version)" 90)")"
+}
+
+# heading NAME — a task heading. Starts the task's timer.
+heading() {
+    TASK_START=$(now_ms)
+    printf '\n%s\n' "$(color "› $1" '1;34')"
+}
+
+# result MESSAGE [success|warning|error] — a task's outcome, with its time.
+result() {
+    local symbol=✔ c=32 time=''
+    case ${2:-success} in
+        warning) symbol=! c=33 ;;
+        error)   symbol=✖ c=31 ;;
+    esac
+    [[ -z $TASK_START ]] || time=" $(color "($(elapsed "$TASK_START"))" 90)"
+    clear_line
+    printf '  %s%s\n' "$(color "$symbol $1" "$c")" "$time"
+}
+
+# A warning within a task.
+warn() {
+    clear_line
+    printf '  %s\n' "$(color "! $*" 33)"
+}
+
+# message TITLE MESSAGE [COLOR] — a standalone note.
+message() { printf '  %s%s\n' "$(color "$1: " "${3:-90}")" "$2"; }
+
+hint() { message Hint "$1" 33; }
+
+# detail LABEL VALUE — one line of a summary, e.g. a site's URL.
+detail() { printf '  %s%s\n' "$(color "$(printf '%-16s' "$1")" 90)" "$2"; }
+
+# complete MESSAGE — the closing line, with the time since the banner.
+complete() { printf '\n%s\n' "$(color "✔ $1 in $(elapsed "$RUN_START")" '1;32')"; }
+
+# fail MESSAGE [HINT] — end the command with an error, and a hint on fixing it.
+fail() {
+    clear_line
+    {
+        printf '\n%s\n' "$(color "✖ $1" '1;31')"
+        [[ -z ${2:-} ]] || hint "$2"
+        echo
+    } >&2
+    exit 1
+}
+
+# Redraw a single gray status line, trimmed to the terminal width.
+status_line() {
+    (( IS_TTY )) || return 0
+    if [[ -z $TERM_COLS ]]; then
+        # Read with stty, from the terminal itself; tput says 80 when piped.
+        TERM_COLS=$(stty size </dev/tty 2>/dev/null | awk '{ print $2 }') || true
+        [[ $TERM_COLS =~ ^[1-9][0-9]*$ ]] || TERM_COLS=80
+    fi
+    local text=$1
+    (( ${#text} < TERM_COLS )) || text="${text:0:TERM_COLS-2}…"
+    clear_line
+    color "$text" 90
+}
+
+# block FILE — the last lines of a command's output, e.g. after it failed.
+block() {
+    local max=15 total line
+    total=$(grep -c . "$1") || true
+    if (( total > max )); then
+        printf '    %s\n' "$(color "… $(( total - max )) earlier lines" 90)"
+    fi
+    grep . "$1" | tail -n "$max" | while IFS= read -r line; do
+        printf '    %s\n' "$(color "${line//$'\r'/}" 90)"
+    done || true
+}
+
+# run COMMAND... — run a command with its output held back. Its latest line is
+# the status line, and if it fails, its last lines show under the task.
+run() {
+    local log status line
+    log=$(mktemp)
+    set +e
+    "$@" 2>&1 | tee "$log" | while IFS= read -r line; do
+        line=${line//$'\r'/}
+        status_line "    ${line#"${line%%[![:space:]]*}"}"
+    done
+    status=${PIPESTATUS[0]}
+    set -e
+    if (( status )); then
+        result "Failed with exit code $status" error
+        block "$log"
+    fi
+    clear_line
+    rm -f "$log"
+    return "$status"
+}
+
+compose() { docker compose "$@"; }
+
+# Fail early with a useful message when Docker isn't usable.
+check_docker() {
+    command -v docker >/dev/null || fail "Docker isn't installed" "See https://docs.docker.com/engine/install/"
+    # Also tells us which Docker this is, e.g. "Docker Desktop" (see ssh_agent_source).
+    DOCKER_OS=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null) && return
+
+    local sock=/var/run/docker.sock user
+    user=$(id -un)
+    if [[ -S $sock && ! -w $sock ]]; then
+        if id -nG "$user" | grep -qw docker; then
+            fail "This session started before you joined the docker group" "Log out and back in (or reboot), then try again"
+        fi
+        fail "Your user can't use Docker" "Run sudo usermod -aG docker $user, then log out and back in"
+    fi
+    fail "Can't reach the Docker daemon" "Is it running? Try sudo systemctl start docker"
+}
+
+# --- Environment -------------------------------------------------------------
+
+# env_set KEY VALUE — update KEY in .env, appending it if missing.
+env_set() {
+    local key=$1 value=$2 tmp
+    tmp=$(mktemp)
+    awk -v k="$key" -v v="$value" '
+        index($0, k "=") == 1 { print k "=" v; found = 1; next }
+        { print }
+        END { if (!found) print k "=" v }' .env > "$tmp"
+    cat "$tmp" > .env
+    rm -f "$tmp"
+    export "$key=$value"
+}
+
+load_env() {
+    if [[ ! -f .env ]]; then
+        cp .env.example .env
+        env_set NOVACORE_UID "$(id -u)"
+        env_set NOVACORE_GID "$(id -g "$(id -un)")"
+        message Note "Created .env. Edit it to change the ports, the default PHP and more."
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source .env
+    set +a
+
+    NOVACORE_TLD=${NOVACORE_TLD:-localhost}
+    DEFAULT_PHP=${DEFAULT_PHP:-8.4}
+    SITES_DIR=${SITES_DIR:-./sites}
+    XDEBUG_MODE=${XDEBUG_MODE:-develop,debug}
+    DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:-root}
+    DB_USER=${DB_USER:-novacore}
+    DB_PASSWORD=${DB_PASSWORD:-novacore}
+    DB_PORT=${DB_PORT:-3306}
+
+    case $SITES_DIR in
+        /*) SITES_PATH=$SITES_DIR ;;
+        *)  SITES_PATH="$NOVACORE_ROOT/${SITES_DIR#./}" ;;
+    esac
+
+    # The generated overrides are part of the project, and every PHP service
+    # sits behind the "php" profile so `down`/`ps`/`logs` see them all.
+    export COMPOSE_FILE="docker-compose.yml:data/compose.generated.yml"
+    export COMPOSE_PROFILES=php
+
+    mkdir -p "$DATA_DIR/certs" "$DATA_DIR/nginx/sites" "$DATA_DIR/nginx/www" "$LOGS_DIR"
+    [[ -f $DATA_DIR/compose.generated.yml ]] || write_overrides
+}
+
+# --- Sites -------------------------------------------------------------------
+
+# Print "name php root" for each site in sites.conf ("-" means default/auto).
+sites() {
+    [[ -f $SITES_CONF ]] || return 0
+    awk '{ sub(/#.*/, "") } NF { print $1, (NF >= 2 ? $2 : "-"), (NF >= 3 ? $3 : "-") }' "$SITES_CONF"
+}
+
+site_names() { sites | awk '{ print $1 }'; }
+site_exists() { sites | awk -v n="$1" '$1 == n { f = 1 } END { exit !f }'; }
+site_field() { sites | awk -v n="$1" -v i="$2" '$1 == n { print $i }'; }
+
+site_php() {
+    local v
+    v=$(site_field "$1" 2)
+    [[ $v == - ]] && v=$DEFAULT_PHP
+    echo "$v"
+}
+
+# The document root relative to the site folder; "-" auto-detects common layouts.
+site_root() {
+    local name=$1 root d
+    root=$(site_field "$name" 3)
+    if [[ $root == - ]]; then
+        root=.
+        for d in public web public_html htdocs; do
+            if [[ -d $SITES_PATH/$name/$d ]]; then root=$d; break; fi
+        done
+    fi
+    echo "$root"
+}
+
+domain()      { echo "$1.$NOVACORE_TLD"; }
+php_service() { echo "php${1//./}"; }
+db_name()     { echo "${1//[-.]/_}"; }
+
+require_site() { site_exists "$1" || fail "No site called '$1'" "Run novacore site list to see your sites"; }
+
+check_name() {
+    [[ $1 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
+        fail "Site names may only contain lowercase letters, numbers and hyphens"
+    [[ $1 != default ]] || fail "'default' is a reserved name"
+}
+
+check_php() {
+    local v
+    for v in "${SUPPORTED_PHP[@]}"; do [[ $v == "$1" ]] && return 0; done
+    fail "Unsupported PHP version '$1'" "Supported versions: ${SUPPORTED_PHP[*]}"
+}
+
+sites_conf_init() {
+    [[ -f $SITES_CONF ]] && return
+    cat > "$SITES_CONF" <<'EOF'
+# Novacore sites, one per line. Edit by hand and run `novacore reload`, or use
+# `novacore site add` / `novacore php <site> <version>`.
+#
+# php:  PHP version, or "-" for DEFAULT_PHP from .env
+# root: document root inside the site folder, or "-" to auto-detect
+#       (public, web, public_html, htdocs, else the folder itself)
+#
+# name          php     root
+EOF
+}
+
+# sites_conf_set NAME PHP ROOT — replace the site's line, or append one.
+sites_conf_set() {
+    sites_conf_init
+    local line tmp
+    line=$(printf '%-15s %-7s %s' "$1" "$2" "$3")
+    tmp=$(mktemp)
+    awk -v n="$1" -v line="$line" '
+        { s = $0; sub(/#.*/, "", s); split(s, f) }
+        f[1] == n { if (!done) print line; done = 1; next }
+        { print }
+        END { if (!done) print line }' "$SITES_CONF" > "$tmp"
+    cat "$tmp" > "$SITES_CONF"
+    rm -f "$tmp"
+}
+
+sites_conf_remove() {
+    local tmp
+    tmp=$(mktemp)
+    awk -v n="$1" '{ s = $0; sub(/#.*/, "", s); split(s, f) } f[1] != n' "$SITES_CONF" > "$tmp"
+    cat "$tmp" > "$SITES_CONF"
+    rm -f "$tmp"
+}
+
+# --- Generated config --------------------------------------------------------
+
+needed_php() {
+    {
+        echo "$DEFAULT_PHP"
+        local name php root
+        while read -r name php root; do
+            [[ $php == - ]] && php=$DEFAULT_PHP
+            echo "$php"
+        done < <(sites)
+    } | sort -uV
+}
+
+needed_services() {
+    local v
+    for v in $(needed_php); do php_service "$v"; done
+}
+
+# PHP versions no site uses (nor DEFAULT_PHP), e.g. after switching a site.
+unused_php() {
+    local needed v
+    needed=" $(needed_php | tr '\n' ' ') "
+    for v in "${SUPPORTED_PHP[@]}"; do
+        if [[ $needed != *" $v "* ]]; then echo "$v"; fi
+    done
+}
+
+# PHP services with a container, running or not, that no site uses.
+unused_php_containers() {
+    local existing v
+    existing=" $(compose ps -a --services 2>/dev/null | tr '\n' ' ') "
+    for v in $(unused_php); do
+        if [[ $existing == *" $(php_service "$v") "* ]]; then php_service "$v"; fi
+    done
+}
+
+# php80 → 8.0
+service_php() { echo "${1:3:1}.${1:4}"; }
+
+# Stop and remove the containers of PHP versions no site uses any more.
+remove_unused_containers() {
+    local services=() s versions=()
+    for s in $(unused_php_containers); do services+=("$s"); versions+=("$(service_php "$s")"); done
+    (( ${#services[@]} )) || return 0
+    run compose rm -sf "${services[@]}" || fail "Couldn't stop the unused PHP containers"
+    result "Stopped PHP $(join ', ' "${versions[@]}"), which no site uses"
+}
+
+ensure_certs() {
+    local missing=() name d
+    [[ -f $DATA_DIR/certs/localhost.crt ]] || missing+=(localhost)
+    for name in $(site_names); do
+        d=$(domain "$name")
+        [[ -f $DATA_DIR/certs/$d.crt ]] || missing+=("$d")
+    done
+    (( ${#missing[@]} )) || return 0
+    run compose run --rm --no-deps -T --user "$(id -u):$(id -g "$(id -un)")" \
+        --entrypoint novacore-cert nginx "${missing[@]}" ||
+        fail "Couldn't issue certificates"
+    result "Issued $(count ${#missing[@]} certificate certificates): $(join ', ' "${missing[@]}")"
+}
+
+write_vhost() {
+    local name=$1 php root dom docroot
+    php=$(site_php "$name")
+    root=$(site_root "$name")
+    dom=$(domain "$name")
+    docroot="/var/www/sites/$name"
+    [[ $root == . ]] || docroot+="/${root#./}"
+
+    cat > "$DATA_DIR/nginx/sites/$name.conf" <<EOF
+# Generated by novacore from sites.conf. Changes here are overwritten.
+server {
+    listen 80;
+    listen 443 ssl;
+    http2 on;
+    server_name $dom *.$dom;
+
+    ssl_certificate     /etc/novacore/certs/$dom.crt;
+    ssl_certificate_key /etc/novacore/certs/$dom.key;
+
+    root $docroot;
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php(/|\$) {
+        fastcgi_split_path_info ^(.+?\.php)(/.*)\$;
+        set \$path_info \$fastcgi_path_info;
+        try_files \$fastcgi_script_name =404;
+
+        set \$php_upstream $(php_service "$php"):9000;
+        fastcgi_pass \$php_upstream;
+        fastcgi_index index.php;
+
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT \$realpath_root;
+        fastcgi_param PATH_INFO \$path_info;
+        fastcgi_param HTTPS \$https if_not_empty;
+        fastcgi_param PHP_VALUE "error_log=/var/log/novacore/$name.log";
+        fastcgi_param NOVACORE_DB_HOST mariadb;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+}
+EOF
+}
+
+# Where the host's SSH agent can be mounted from, if anywhere.
+#
+# Docker Desktop (macOS, Linux) and OrbStack run containers in a VM, so host
+# sockets can't be mounted directly; they forward the agent to a fixed path
+# instead. Docker Engine on Linux, and Docker Desktop's WSL2 integration on
+# Windows (the VM is WSL's own), can mount $SSH_AUTH_SOCK as it is.
+ssh_agent_source() {
+    if [[ $DOCKER_OS =~ Docker\ Desktop|OrbStack ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
+        echo /run/host-services/ssh-auth.sock
+    elif [[ -S ${SSH_AUTH_SOCK:-} ]]; then
+        echo "$SSH_AUTH_SOCK"
+    fi
+}
+
+# Docker Compose overrides that depend on the sites and on this machine.
+write_overrides() {
+    local name found=0 agent v
+    agent=$(ssh_agent_source)
+    {
+        echo "# Generated by novacore. Do not edit."
+        echo "services:"
+
+        # Network aliases let containers reach sites by domain too (e.g.
+        # WordPress loopback requests), since *.localhost only means 127.0.0.1
+        # on the host.
+        echo "  nginx:"
+        echo "    networks:"
+        echo "      novacore:"
+        echo "        aliases:"
+        for name in $(site_names); do
+            echo "          - $(domain "$name")"
+            found=1
+        done
+        (( found )) || echo "          - novacore.$NOVACORE_TLD"
+
+        # Share the host's SSH agent, known hosts and SSH config with PHP, for
+        # remote work like `wp sync` or private Composer packages. Private keys
+        # stay on the host. SELinux would relabel the host files with :z, so
+        # labelling is turned off for these containers instead.
+        if [[ -n $agent ]]; then
+            for v in "${SUPPORTED_PHP[@]}"; do
+                echo "  $(php_service "$v"):"
+                echo "    security_opt: [\"label=disable\"]"
+                echo "    environment:"
+                echo "      SSH_AUTH_SOCK: /run/novacore/ssh-agent.sock"
+                echo "    volumes:"
+                echo "      - \"$agent:/run/novacore/host-agent.sock\""
+                [[ -f $HOME/.ssh/known_hosts ]] && echo "      - \"$HOME/.ssh/known_hosts:/etc/novacore/ssh/known_hosts:ro\""
+                [[ -f $HOME/.ssh/config ]] && echo "      - \"$HOME/.ssh/config:/etc/novacore/ssh/config:ro\""
+            done
+        fi
+    } > "$DATA_DIR/compose.generated.yml"
+    rm -f "$DATA_DIR/compose.sites.yml"  # Replaced by compose.generated.yml.
+}
+
+# Whether remote SSH commands will have your keys: a summary line, and a hint
+# in SSH_HINT when they won't.
+ssh_agent_status() {
+    local status=0
+    SSH_HINT=''
+    if [[ -z $(ssh_agent_source) ]]; then
+        detail "SSH agent" "none found"
+        SSH_HINT="Without an SSH agent, commands like wp sync can't use your SSH keys"
+        return
+    fi
+    # On Docker Desktop this asks the agent it forwards, which is the host's.
+    ssh-add -l >/dev/null 2>&1 || status=$?
+    if (( status == 1 )); then
+        detail "SSH agent" "shared with PHP, but it has no keys"
+        SSH_HINT="Run ssh-add, or add AddKeysToAgent yes to ~/.ssh/config"
+    else
+        detail "SSH agent" "shared with PHP"
+    fi
+}
+
+# Fill in the dashboard template (dashboard/index.html) served at https://localhost,
+# alongside its icon.
+write_index() {
+    local name dom rows="" page
+    for name in $(site_names); do
+        dom=$(domain "$name")
+        rows+="<tr><td><a href=\"https://$dom\" target=\"_blank\" rel=\"noopener\">$dom</a></td><td>PHP $(site_php "$name")</td><td><code>$(db_name "$name")</code></td><td><code>$(site_root "$name")</code></td></tr>"
+    done
+    [[ -n $rows ]] || rows='<tr><td colspan="4">No sites yet. Run <code>novacore site add &lt;name&gt;</code>.</td></tr>'
+
+    # Bash 5.2+ treats & in a replacement as the matched text; we want it literal.
+    shopt -u patsub_replacement 2>/dev/null || true
+    page=$(<"$NOVACORE_ROOT/dashboard/index.html")
+    page=${page//'{{SITE_ROWS}}'/$rows}
+    page=${page//'{{DB_USER}}'/$DB_USER}
+    page=${page//'{{DB_PASSWORD}}'/$DB_PASSWORD}
+    page=${page//'{{DB_PORT}}'/$DB_PORT}
+    page=${page//'{{NOVACORE_TLD}}'/$NOVACORE_TLD}
+    printf '%s\n' "$page" > "$DATA_DIR/nginx/www/index.html"
+    cp "$NOVACORE_ROOT/dashboard/novacore.svg" "$DATA_DIR/nginx/www/novacore.svg"
+}
+
+check_sites_conf() {
+    local name php root
+    while read -r name php root; do
+        check_name "$name"
+        [[ $php == - ]] || check_php "$php"
+    done < <(sites)
+    [[ -z $(site_names | sort | uniq -d) ]] || fail "sites.conf lists the same site twice"
+}
+
+generate() {
+    check_php "$DEFAULT_PHP"
+    check_sites_conf
+    ensure_certs
+    rm -f "$DATA_DIR"/nginx/sites/*.conf
+    local name n=0
+    for name in $(site_names); do
+        [[ -d $SITES_PATH/$name ]] || warn "$name has no folder at $SITES_PATH/$name"
+        write_vhost "$name"
+        touch "$LOGS_DIR/$name.log"
+        n=$(( n + 1 ))
+    done
+    write_overrides
+    write_index
+    result "Wrote config for $(count "$n" site sites)"
+}
+
+is_running() { [[ -n $(compose ps -q --status running nginx 2>/dev/null) ]]; }
+require_running() { is_running || fail "Novacore isn't running" "Start it with novacore up"; }
+
+start_services() {
+    local services
+    # shellcheck disable=SC2207
+    services=(nginx mariadb $(needed_services))
+    run compose up -d --wait --remove-orphans "${services[@]}" ||
+        fail "Couldn't start the containers" "Run novacore logs to see why"
+    compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    # The reload signal returns before old workers retire; give them a moment.
+    sleep 0.5
+    result "Running $(join ', ' "${services[@]}")"
+    remove_unused_containers
+}
+
+stop_services() {
+    run compose down --remove-orphans || fail "Couldn't stop the containers"
+    result "Stopped"
+}
+
+# Build a PHP version's image before pointing anything at it, so a failed
+# build leaves the current config untouched.
+ensure_php_image() {
+    docker image inspect "novacore/php:$1" >/dev/null 2>&1 && return
+    heading "PHP $1 image"
+    run compose build "$(php_service "$1")" || fail "Couldn't build the PHP $1 image"
+    result "Built novacore/php:$1"
+}
+
+# Regenerate config, and apply it straight away if the stack is running.
+apply() {
+    heading Configuration
+    generate
+    if is_running; then
+        heading Containers
+        start_services
+    fi
+}
+
+# --- Commands ----------------------------------------------------------------
+
+cmd_up() {
+    if [[ ${1:-} == --restart ]]; then
+        header Restarting
+        heading Containers
+        stop_services
+    else
+        header Starting
+    fi
+    mkdir -p "$SITES_PATH"
+    heading Configuration
+    generate
+    heading Containers
+    start_services
+
+    complete Ready
+    echo
+    detail Dashboard https://localhost
+    detail Sites "$(site_names | wc -l | tr -d ' ')"
+    detail Xdebug "$XDEBUG_MODE"
+    ssh_agent_status
+    if [[ -n $SSH_HINT || ! -f $DATA_DIR/.trusted ]]; then
+        echo
+        [[ -z $SSH_HINT ]] || hint "$SSH_HINT"
+        [[ -f $DATA_DIR/.trusted ]] || hint "Run novacore trust once so your browser accepts Novacore's certificates"
+    fi
+    echo
+}
+
+cmd_down() {
+    header Stopping
+    heading Containers
+    stop_services
+    complete Stopped
+    echo
+}
+
+cmd_reload() {
+    header Reloading
+    heading Configuration
+    generate
+    if is_running; then
+        heading Containers
+        start_services
+        complete Reloaded
+    else
+        complete "Config regenerated"
+        echo
+        hint "It applies when you next run novacore up"
+    fi
+    echo
+}
+
+cmd_status() {
+    if [[ ${1:-} == --json ]]; then status_json; return; fi
+    local service state status
+    heading Containers
+    is_running || printf '  %s\n' "$(color "Not running. Start Novacore with novacore up." 90)"
+    while IFS=$'\t' read -r service state status; do
+        if [[ $state == running ]]; then
+            printf '  %s  %s\n' "$(color "✔ $(printf '%-14s' "$service")" 32)" "$(color "$status" 90)"
+        else
+            printf '  %s  %s\n' "$(color "! $(printf '%-14s' "$service")" 33)" "$(color "$status" 90)"
+        fi
+    done < <(compose ps -a --format '{{.Service}}{{"\t"}}{{.State}}{{"\t"}}{{.Status}}' 2>/dev/null)
+    heading Sites
+    site_list
+    echo
+}
+
+json_str() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+# json_list A B C — print ["A","B","C"].
+json_list() {
+    local item sep=""
+    printf '['
+    for item in "$@"; do printf '%s%s' "$sep" "$(json_str "$item")"; sep=,; done
+    printf ']'
+}
+
+# Whether Novacore is running, and its sites, for tools like the Plasma widget.
+status_json() {
+    shopt -u patsub_replacement 2>/dev/null || true
+    local running=false name sep="" built
+    is_running && running=true
+    # shellcheck disable=SC2207
+    built=($(docker image ls novacore/php --format '{{.Tag}}' | sort -V))
+    printf '{"running":%s,"dashboard":"https://localhost","phpVersions":%s,"builtPhp":%s,"sites":[' \
+        "$running" "$(json_list "${SUPPORTED_PHP[@]}")" "$(json_list ${built[@]+"${built[@]}"})"
+    for name in $(site_names); do
+        printf '%s{"name":%s,"url":%s,"php":%s,"root":%s,"path":%s,"database":%s}' "$sep" \
+            "$(json_str "$name")" "$(json_str "https://$(domain "$name")")" \
+            "$(json_str "$(site_php "$name")")" "$(json_str "$(site_root "$name")")" \
+            "$(json_str "$SITES_PATH/$name")" "$(json_str "$(db_name "$name")")"
+        sep=,
+    done
+    printf ']}\n'
+}
+
+cmd_logs() { compose logs -f --tail=100 "$@"; }
+
+# Follow a site's PHP error log, or every site's when no site is given.
+cmd_errors() {
+    local name=${1:-}
+    if [[ -z $name ]]; then
+        local files=("$LOGS_DIR"/*.log)
+        [[ -e ${files[0]} ]] || fail "No error logs yet"
+        tail -n 20 -F "${files[@]}"
+        return
+    fi
+    require_site "$name"
+    local file="$LOGS_DIR/$name.log"
+    case ${2:-} in
+        "")      ;;
+        --clear) : > "$file"; printf '%s\n' "$(color "✔ Cleared $file" 32)"; return ;;
+        *)       fail "Unknown option '$2'" "Usage: novacore errors [site] [--clear]" ;;
+    esac
+    touch "$file"
+    tail -n 50 -F "$file"
+}
+
+cmd_build() {
+    local services
+    if [[ ${1:-} == --all ]]; then
+        services=(nginx)
+        local v
+        for v in "${SUPPORTED_PHP[@]}"; do services+=("$(php_service "$v")"); done
+    else
+        # shellcheck disable=SC2207
+        services=(nginx $(needed_services))
+    fi
+    header "Building images"
+    heading Images
+    run compose build --pull "${services[@]}" || fail "Couldn't build the images"
+    result "Built $(join ', ' "${services[@]}")"
+    if is_running; then
+        heading Containers
+        start_services
+    fi
+    complete Built
+    echo
+}
+
+# Disk space used by Docker's images and build cache, in bytes.
+docker_bytes() {
+    docker system df --format '{{.Type}}{{"\t"}}{{.Size}}' | awk -F'\t' '
+        $1 == "Images" || $1 == "Build Cache" {
+            unit = $2; sub(/^[0-9.]+/, "", unit)
+            total += ($2 + 0) * (unit == "kB" ? 1e3 : unit == "MB" ? 1e6 : unit == "GB" ? 1e9 : unit == "TB" ? 1e12 : 1)
+        }
+        END { printf "%.0f\n", total }'
+}
+
+# bytes N — e.g. "4.1 GB".
+bytes() {
+    awk -v b="$1" 'BEGIN {
+        split("B kB MB GB TB", units); i = 1
+        while (b >= 1000 && i < 5) { b /= 1000; i++ }
+        printf(i == 1 ? "%d %s\n" : "%.1f %s\n", b, units[i])
+    }'
+}
+
+# Remove the images of PHP versions no site uses, and with --cache, Docker's
+# unused build cache. Novacore rebuilds an image when a site needs it again.
+cmd_prune() {
+    local cache=0 before v images=() versions=()
+    case ${1:-} in
+        "")      ;;
+        --cache) cache=1 ;;
+        *)       fail "Unknown option '$1'" "Usage: novacore prune [--cache]" ;;
+    esac
+
+    header Pruning
+    before=$(docker_bytes)
+
+    heading "Unused PHP versions"
+    remove_unused_containers
+    for v in $(unused_php); do
+        if docker image inspect "novacore/php:$v" >/dev/null 2>&1; then
+            images+=("novacore/php:$v")
+            versions+=("$v")
+        fi
+    done
+    if (( ${#images[@]} )); then
+        run docker image rm "${images[@]}" || fail "Couldn't remove the images"
+        # The official images they're built on, unless something else uses them.
+        for v in "${versions[@]}"; do
+            docker image rm "php:$v-fpm" >/dev/null 2>&1 || true
+        done
+        result "Removed the PHP $(join ', ' "${versions[@]}") images"
+    else
+        result "No unused PHP images"
+    fi
+
+    if (( cache )); then
+        heading "Build cache"
+        run docker builder prune -f || fail "Couldn't clear the build cache"
+        result "Cleared Docker's unused build cache"
+    fi
+
+    complete "Freed $(bytes $(( before - $(docker_bytes) )))"
+    echo
+    (( cache )) || hint "novacore prune --cache also clears Docker's unused build cache, which only speeds up rebuilds"
+    echo
+}
+
+placeholder_page() {
+    cat <<'EOF'
+<?php
+// Placeholder created by novacore. Replace it with your site.
+$xdebug = extension_loaded('xdebug') ? 'Xdebug ' . phpversion('xdebug') . ' (' . getenv('XDEBUG_MODE') . ')' : 'Xdebug not loaded';
+?>
+<!doctype html>
+<meta charset="utf-8">
+<title><?= htmlspecialchars($_SERVER['HTTP_HOST']) ?></title>
+<style>body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 64px auto; padding: 0 16px; }</style>
+<h1><?= htmlspecialchars($_SERVER['HTTP_HOST']) ?></h1>
+<p>PHP <?= PHP_VERSION ?> · <?= $xdebug ?> · <?= empty($_SERVER['HTTPS']) ? 'http' : 'https' ?></p>
+<p>Served from <code><?= htmlspecialchars(__DIR__) ?></code></p>
+EOF
+}
+
+site_add() {
+    local name="" php=$DEFAULT_PHP root=- db=1
+    while (( $# )); do
+        case $1 in
+            --php)    php=${2:-}; [[ -n $php ]] || fail "--php needs a version"; shift 2 ;;
+            --php=*)  php=${1#*=}; shift ;;
+            --root)   root=${2:-}; [[ -n $root ]] || fail "--root needs a directory"; shift 2 ;;
+            --root=*) root=${1#*=}; shift ;;
+            --no-db)  db=0; shift ;;
+            -*)       fail "Unknown option '$1'" "Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]" ;;
+            *)        [[ -z $name ]] || fail "Unexpected argument '$1'"; name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]] || fail "Which site?" "Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]"
+    check_name "$name"
+    check_php "$php"
+    ! site_exists "$name" || fail "Site '$name' already exists"
+
+    header "Adding $name"
+    ensure_php_image "$php"
+
+    heading "Site folder"
+    local dir="$SITES_PATH/$name"
+    if [[ ! -d $dir ]]; then
+        local docroot=$dir
+        [[ $root == - ]] || docroot="$dir/$root"
+        mkdir -p "$docroot"
+        placeholder_page > "$docroot/index.php"
+        result "Created $dir"
+    else
+        result "Using the existing folder $dir"
+    fi
+
+    sites_conf_set "$name" "$php" "$root"
+    apply
+
+    local dbname
+    dbname=$(db_name "$name")
+    if (( db )); then
+        heading Database
+        if is_running; then
+            db_create "$dbname"
+        else
+            warn "Novacore isn't running, so no database was created"
+            db=0
+        fi
+    fi
+
+    complete "Added $name"
+    echo
+    detail URL "https://$(domain "$name")"
+    detail PHP "$php"
+    detail "Doc root" "$(site_root "$name")"
+    if (( db )); then
+        detail Database "$dbname"
+    fi
+    echo
+    if is_running; then
+        hint "Run novacore site info $name for its database settings"
+    else
+        hint "Start Novacore with novacore up, then run novacore db create $dbname"
+    fi
+    echo
+}
+
+# The DB_HOST to fall back to outside Novacore, i.e. MariaDB's published port.
+host_db_host() {
+    if [[ $DB_PORT == 3306 ]]; then echo 127.0.0.1; else echo "127.0.0.1:$DB_PORT"; fi
+}
+
+site_info() {
+    local name=${1:-} dbname state=""
+    [[ -n $name ]] || fail "Which site?" "Usage: novacore site info <name>"
+    require_site "$name"
+    dbname=$(db_name "$name")
+    if is_running && [[ -z $(db_sql -N -e "SHOW DATABASES LIKE '$dbname'") ]]; then
+        state=" $(color "(not created yet: novacore db create $dbname)" 33)"
+    fi
+
+    heading "$name"
+    detail URL "https://$(domain "$name")"
+    detail PHP "$(site_php "$name")"
+    detail Folder "$SITES_PATH/$name"
+    detail "Doc root" "$(site_root "$name")"
+    detail "Error log" "$LOGS_DIR/$name.log"
+
+    heading Database
+    detail Name "$dbname$state"
+    detail User "$DB_USER"
+    detail Password "$DB_PASSWORD"
+    detail Host "mariadb (inside Novacore), $(host_db_host) (your machine)"
+
+    heading Connecting
+    echo "  To connect from both Novacore and tools on your machine, such as wp, use:"
+    echo
+    printf '  %s\n' "$(color "wp-config.php" 90)"
+    echo "    define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$(host_db_host)' );"
+    echo
+    printf '  %s\n' "$(color "Bedrock (config/application.php)" 90)"
+    echo "    Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$(host_db_host)' );"
+    echo
+    printf '  %s\n' "$(color "Laravel (config/database.php)" 90)"
+    echo "    'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),"
+    echo
+}
+
+site_rm() {
+    local name="" drop_db=0
+    while (( $# )); do
+        case $1 in
+            --drop-db) drop_db=1; shift ;;
+            -*)        fail "Unknown option '$1'" "Usage: novacore site rm <name> [--drop-db]" ;;
+            *)         name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]] || fail "Which site?" "Usage: novacore site rm <name> [--drop-db]"
+    require_site "$name"
+    # Check before removing anything, so the site isn't left half removed.
+    if (( drop_db )); then require_running; fi
+
+    header "Removing $name"
+    sites_conf_remove "$name"
+    rm -f "$DATA_DIR/certs/$(domain "$name")".{crt,key}
+    apply
+    if (( drop_db )); then
+        heading Database
+        db_drop "$(db_name "$name")"
+    fi
+    complete "Removed $name"
+    echo
+    message Note "Its files are still in $SITES_PATH/$name"
+    echo
+}
+
+site_list() {
+    if [[ -z $(sites) ]]; then
+        printf '  %s\n' "$(color "No sites yet. Add one with novacore site add <name>." 90)"
+        return
+    fi
+    local name php root
+    printf '  %s\n' "$(color "$(printf '%-36s %-6s %s' URL PHP ROOT)" 90)"
+    while read -r name php root; do
+        printf '  %-36s %-6s %s\n' "https://$(domain "$name")" "$(site_php "$name")" "$(site_root "$name")"
+    done < <(sites)
+}
+
+cmd_site() {
+    local sub=${1:-list}
+    shift || true
+    case $sub in
+        add|new)      site_add "$@" ;;
+        rm|remove)    site_rm "$@" ;;
+        ls|list)      site_list ;;
+        info)         site_info "$@" ;;
+        *)            fail "Unknown command 'site $sub'" "Try site add, rm, list or info" ;;
+    esac
+}
+
+cmd_php() {
+    case ${1:-list} in
+        list|ls)
+            local running v marks
+            running=$(compose ps --status running --services 2>/dev/null || true)
+            for v in "${SUPPORTED_PHP[@]}"; do
+                marks=""
+                [[ $v == "$DEFAULT_PHP" ]] && marks+="  $(color default 90)"
+                grep -qx "$(php_service "$v")" <<<"$running" && marks+="  $(color running 32)"
+                echo "  $v$marks"
+            done
+            ;;
+        default)
+            [[ -n ${2:-} ]] || { echo "$DEFAULT_PHP"; return; }
+            check_php "$2"
+            header "Default PHP → $2"
+            ensure_php_image "$2"
+            env_set DEFAULT_PHP "$2"
+            apply
+            complete "Default PHP is now $2"
+            echo
+            ;;
+        *)
+            local name=$1 version=${2:-}
+            require_site "$name"
+            [[ -n $version ]] || { site_php "$name"; return; }
+            check_php "$version"
+            header "$name → PHP $version"
+            ensure_php_image "$version"
+            sites_conf_set "$name" "$version" "$(site_field "$name" 3)"
+            apply
+            complete "$name now runs PHP $version"
+            echo
+            ;;
+    esac
+}
+
+cmd_xdebug() {
+    local mode
+    case ${1:-} in
+        "")      echo "Xdebug mode: $XDEBUG_MODE"; return ;;
+        on)      mode=develop,debug ;;
+        off)     mode=off ;;
+        *)       mode=$1 ;;
+    esac
+    [[ $mode =~ ^[a-z]+(,[a-z]+)*$ ]] || fail "Invalid Xdebug mode '$mode'" "Try on, off, or modes like debug,profile"
+    header "Xdebug → $mode"
+    env_set XDEBUG_MODE "$mode"
+    if is_running; then
+        # Compose recreates the PHP containers because their environment changed.
+        heading Containers
+        start_services
+        complete "Xdebug mode is now $mode"
+    else
+        complete "Xdebug mode is now $mode"
+        echo
+        hint "It applies when you next run novacore up"
+    fi
+    echo
+}
+
+db_sql() {
+    require_running
+    compose exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb mariadb -uroot "$@"
+}
+
+check_db_name() {
+    [[ ${1:-} =~ ^[A-Za-z0-9_]+$ ]] || fail "Database names may only contain letters, numbers and underscores"
+}
+
+db_create() {
+    check_db_name "${1:-}"
+    run db_sql -e "CREATE DATABASE IF NOT EXISTS \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" ||
+        fail "Couldn't create the database $1"
+    result "Database $1 is ready"
+}
+
+db_drop() {
+    check_db_name "${1:-}"
+    run db_sql -e "DROP DATABASE IF EXISTS \`$1\`" || fail "Couldn't drop the database $1"
+    result "Dropped the database $1"
+}
+
+# import_sql NAME FILE — load a .sql or .sql.gz file into a database.
+import_sql() {
+    case $2 in
+        *.gz) gunzip -c "$2" | db_sql "$1" ;;
+        *)    db_sql "$1" < "$2" ;;
+    esac
+}
+
+# export_sql NAME FILE — dump a database to a .sql or .sql.gz file.
+export_sql() {
+    compose exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb \
+        mariadb-dump -uroot --single-transaction --routines --triggers "$1" |
+        if [[ $2 == *.gz ]]; then gzip; else cat; fi > "$2"
+}
+
+file_size() { du -h "$1" | cut -f1; }
+
+cmd_db() {
+    local sub=${1:-list}
+    shift || true
+    case $sub in
+        create|drop)
+            check_db_name "${1:-}"
+            require_running
+            if [[ $sub == create ]]; then header "Creating $1"; else header "Dropping $1"; fi
+            heading Database
+            "db_$sub" "$1"
+            if [[ $sub == create ]]; then complete "Created $1"; else complete "Dropped $1"; fi
+            echo
+            ;;
+        list|ls)
+            db_sql -N -e "SHOW DATABASES" |
+                grep -vxE 'information_schema|mysql|performance_schema|sys' || true
+            ;;
+        import)
+            local name=${1:-} file=${2:-}
+            [[ -n $name && -n $file ]] || fail "Which database and file?" "Usage: novacore db import <name> <file.sql[.gz]>"
+            check_db_name "$name"
+            [[ -f $file ]] || fail "No file at $file"
+            require_running
+            header "Importing $(basename "$file")"
+            heading Database
+            db_create "$name"
+            heading Import
+            run import_sql "$name" "$file" || fail "Couldn't import $file"
+            result "Imported $(file_size "$file") into $name"
+            complete "Imported"
+            echo
+            ;;
+        export)
+            local name=${1:-} file
+            check_db_name "$name"
+            file=${2:-$name-$(date +%Y%m%d-%H%M%S).sql.gz}
+            require_running
+            header "Exporting $name"
+            heading Export
+            run export_sql "$name" "$file" || { rm -f "$file"; fail "Couldn't export $name"; }
+            result "Wrote $file ($(file_size "$file"))"
+            complete "Exported"
+            echo
+            ;;
+        shell)
+            require_running
+            compose exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb mariadb -uroot "$@"
+            ;;
+        *) fail "Unknown command 'db $sub'" "Try db create, drop, list, import, export or shell" ;;
+    esac
+}
+
+# Run a command in a site's PHP container, from the site folder, as your user.
+cmd_exec() {
+    local name=${1:-}
+    [[ -n $name ]] || fail "Which site?" "Usage: novacore exec <site> <command...>"
+    shift
+    require_site "$name"
+    require_running
+    (( $# )) || set -- bash
+    local tty=()
+    [[ -t 0 && -t 1 ]] || tty=(-T)
+    compose exec ${tty[@]+"${tty[@]}"} -u www-data -w "/var/www/sites/$name" \
+        "$(php_service "$(site_php "$name")")" "$@"
+}
+
+cmd_shell() {
+    if [[ -n ${1:-} ]]; then
+        cmd_exec "$1" bash
+    else
+        require_running
+        compose exec -u www-data "$(php_service "$DEFAULT_PHP")" bash
+    fi
+}
+
+cmd_open() {
+    local url=https://localhost
+    if [[ -n ${1:-} ]]; then
+        require_site "$1"
+        url="https://$(domain "$1")"
+    fi
+    if command -v xdg-open >/dev/null; then xdg-open "$url" >/dev/null 2>&1 &
+    elif command -v open >/dev/null; then open "$url"
+    else echo "$url"
+    fi
+}
+
+# Which system trust store to add the CA to, if Novacore knows how.
+trust_store() {
+    if [[ $(uname) == Darwin ]]; then echo macos
+    elif [[ -d /etc/pki/ca-trust/source/anchors ]]; then echo fedora  # Fedora, RHEL
+    elif [[ -d /usr/local/share/ca-certificates ]]; then echo debian  # Debian, Ubuntu
+    elif command -v trust >/dev/null; then echo arch
+    fi
+}
+
+# trust_install STORE CA — add the CA to a system trust store.
+trust_install() {
+    case $1 in
+        macos)  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$2" ;;
+        fedora) sudo cp "$2" /etc/pki/ca-trust/source/anchors/novacore.crt && sudo update-ca-trust ;;
+        debian) sudo cp "$2" /usr/local/share/ca-certificates/novacore.crt && sudo update-ca-certificates ;;
+        arch)   sudo trust anchor --store "$2" ;;
+    esac
+}
+
+cmd_trust() {
+    local ca="$DATA_DIR/certs/ca.crt" store
+    store=$(trust_store)
+    [[ -n $store ]] || fail "Don't know how to update the trust store here" "Import $ca into your browser by hand"
+
+    header "Trusting the local CA"
+    heading "Certificate authority"
+    [[ -f $ca ]] || ensure_certs
+    [[ -f $ca ]] || fail "Couldn't create the CA certificate"
+    result "Novacore Local CA is at $ca"
+
+    heading "System trust store"
+    printf '  %s\n' "$(color "Lets browsers accept https://*.$NOVACORE_TLD without warnings. It needs sudo." 90)"
+    # Ask for the password up front, since run hides the commands' prompts.
+    sudo -v || fail "Couldn't get sudo access"
+    run trust_install "$store" "$ca" || fail "Couldn't update the trust store"
+    result "Added Novacore Local CA"
+
+    # Chrome and Firefox on some distros keep their own NSS database.
+    if command -v certutil >/dev/null && [[ -d $HOME/.pki/nssdb ]]; then
+        heading "Chrome"
+        run certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n "Novacore Local CA" -i "$ca" ||
+            fail "Couldn't add the CA to Chrome's certificate store"
+        result "Added to Chrome's certificate store"
+    fi
+
+    touch "$DATA_DIR/.trusted"
+    complete Trusted
+    echo
+    hint "Restart your browser if it was already open"
+    echo
+}
+
+usage() {
+    cat <<'EOF'
+Usage: novacore <command> [options]
+
+Runs local PHP sites on Docker, with nginx, PHP-FPM (7.4 to 8.5) and MariaDB.
+
+Stack:
+  up                          Start everything (and apply config changes)
+  down                        Stop everything
+  restart                     Stop, then start everything
+  status [--json]             Show containers and sites
+  reload                      Regenerate config from sites.conf and apply it
+  logs [service]              Follow container logs (nginx, mariadb, php84, ...)
+  build [--all]               Rebuild images (--all builds every PHP version)
+  prune [--cache]             Remove images of PHP versions no site uses
+  trust                       Trust Novacore's local CA (one-off, uses sudo)
+
+Sites:
+  site add <name> [--php X.Y] [--root DIR] [--no-db]
+                              Serve sites/<name> at https://<name>.localhost
+  site rm <name> [--drop-db]  Stop serving a site (its files are kept)
+  site list                   List sites
+  site info <name>            Show a site's URL, paths and database settings
+  errors [site] [--clear]     Follow a site's PHP error log (logs/<site>.log), or all of them
+  open [site]                 Open a site (or the dashboard) in your browser
+
+PHP:
+  php list                    Show available PHP versions
+  php <site> [X.Y]            Show or switch a site's PHP version
+  php default [X.Y]           Show or set the default for new sites
+  xdebug [on|off|<mode>]      Show or set the Xdebug mode for all PHP versions
+  shell [site]                Bash in the site's PHP container
+  exec <site> <cmd...>        Run a command there, e.g. composer install, wp plugin list
+
+Databases:
+  db list                     List databases
+  db create|drop <name>       Create or drop a database
+  db import <name> <file>     Import a .sql or .sql.gz file
+  db export <name> [file]     Dump to a .sql.gz file (or .sql)
+  db shell [name]             MariaDB console
+
+Options:
+  -h, --help                  Show this help
+  -V, --version               Show the version
+
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    shift || true
+    case $cmd in
+        help|-h|--help)       usage; return ;;
+        version|-V|--version) echo "Novacore $(version)"; return ;;
+    esac
+
+    check_docker
+    load_env
+
+    case $cmd in
+        up|start)     cmd_up ;;
+        down|stop)    cmd_down ;;
+        restart)      cmd_up --restart ;;
+        status|ps)    cmd_status "$@" ;;
+        reload)       cmd_reload ;;
+        logs)         cmd_logs "$@" ;;
+        errors)       cmd_errors "$@" ;;
+        build)        cmd_build "$@" ;;
+        prune)        cmd_prune "$@" ;;
+        trust)        cmd_trust ;;
+        site)         cmd_site "$@" ;;
+        sites)        site_list ;;
+        open)         cmd_open "$@" ;;
+        php)          cmd_php "$@" ;;
+        xdebug)       cmd_xdebug "$@" ;;
+        shell)        cmd_shell "$@" ;;
+        exec)         cmd_exec "$@" ;;
+        composer|wp)
+            [[ -n ${1:-} ]] || fail "Which site?" "Usage: novacore $cmd <site> <args...>"
+            cmd_exec "$1" "$cmd" "${@:2}"
+            ;;
+        db)           cmd_db "$@" ;;
+        *)            fail "Unknown command '$cmd'" "Run novacore help to see the commands" ;;
+    esac
+}
+
+main "$@"
