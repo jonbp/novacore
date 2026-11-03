@@ -233,6 +233,7 @@ Never edit anything in `data/` by hand. Deleting it is safe, and the next `novac
 ## Troubleshooting
 
 - **Browser still warns about the certificate.** Run `novacore trust` and restart the browser. Firefox on some distros has its own certificate store. If it still complains, import `data/certs/ca.crt` under Settings → Certificates → Authorities.
+- **Browser on Windows warns about the certificate (WSL2).** `novacore trust` adds the CA to your Windows user's certificate store too, and Windows asks you to confirm. Click **Yes**, then fully restart Chrome or Edge. Firefox on Windows uses that store when `security.enterprise_roots.enabled` is on in `about:config`. If you regenerate `data/`, remove the old "Novacore Local CA" in `certmgr.msc` under Trusted Root Certification Authorities.
 - **Xdebug doesn't connect.** Check that your IDE is listening on 9003. Then check that your firewall allows connections from the Docker bridge network. On Fedora with firewalld, Docker's interfaces are normally in the `docker` zone, which accepts them.
 - **SSH from PHP says "Permission denied (publickey)".** Your agent probably has no keys. Run `ssh-add -l` on your machine. If it lists nothing, run `ssh-add`. To see exactly what's happening, run `novacore exec <site> ssh -v user@host` from the site.
 - **SSH from PHP says "Host key verification failed".** The container trusts the hosts in your `~/.ssh/known_hosts`. Connect to the server once from your own terminal to add it there.

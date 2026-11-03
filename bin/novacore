@@ -1204,6 +1204,37 @@ trust_install() {
     esac
 }
 
+# Whether this is WSL with Windows interop, so we can reach the Windows
+# certificate store that Windows browsers use.
+is_wsl() {
+    [[ -n ${WSL_DISTRO_NAME:-} ]] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || return 1
+    command -v certutil.exe >/dev/null && command -v wslpath >/dev/null
+}
+
+# windows_trust CA — add the CA to the Windows user's Trusted Root store.
+# Windows shows a confirmation dialog, so this can't run under run().
+windows_trust() {
+    local ca=$1 sha1 status
+    sha1=$(openssl x509 -in "$ca" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d : | tr 'A-F' 'a-f')
+
+    heading "Windows"
+    printf '  %s\n' "$(color "Lets Chrome and Edge on Windows accept Novacore's certificates." 90)"
+    if certutil.exe -user -verifystore Root "$sha1" >/dev/null 2>&1; then
+        result "Already in the Windows certificate store"
+        return
+    fi
+    printf '  %s\n' "$(color "Windows will ask you to confirm. Check the thumbprint is $sha1, then click Yes." 33)"
+    set +e
+    certutil.exe -user -addstore Root "$(wslpath -w "$ca")" >/dev/null 2>&1
+    status=$?
+    set -e
+    # certutil can exit 0 when the dialog is declined, so check the store itself.
+    if (( status )) || ! certutil.exe -user -verifystore Root "$sha1" >/dev/null 2>&1; then
+        fail "Couldn't add the CA to the Windows certificate store" "Run novacore trust again and click Yes in the Windows dialog"
+    fi
+    result "Added to the Windows certificate store"
+}
+
 cmd_trust() {
     local ca="$DATA_DIR/certs/ca.crt" store
     store=$(trust_store)
@@ -1229,6 +1260,9 @@ cmd_trust() {
             fail "Couldn't add the CA to Chrome's certificate store"
         result "Added to Chrome's certificate store"
     fi
+
+    # On WSL, browsers run on Windows and use its store, not Linux's.
+    is_wsl && windows_trust "$ca"
 
     touch "$DATA_DIR/.trusted"
     complete Trusted
