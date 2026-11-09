@@ -6,6 +6,7 @@
 
     `novacore tray install`, run inside WSL, copies this script to
     %LOCALAPPDATA%\Novacore and starts it from a shortcut in the Startup folder.
+    From then on it keeps that copy up to date with the repo (Update-Self).
     The file is kept ASCII-only, as Windows PowerShell 5.1 reads scripts
     without a BOM as ANSI.
 #>
@@ -14,7 +15,9 @@ param(
     [Parameter(Mandatory = $true)] [string] $Distro,
     # The absolute path of the novacore CLI inside the distro.
     [Parameter(Mandatory = $true)] [string] $Command,
-    [int] $RefreshInterval = 30
+    [int] $RefreshInterval = 30,
+    # Set when an older version restarts into this one.
+    [switch] $Updated
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +56,11 @@ $script:output = New-Object System.Collections.Generic.List[string]
 $script:jobs = New-Object System.Collections.ArrayList
 $script:menuSignature = $null
 $script:balloonShowsOutput = $false
+$script:balloonUrl = ''
+$script:lastUpdateCheck = $null
+$script:skippedUpdate = ''  # the version of the repo's script that had errors
+$script:actionUrl = ''
+$script:infoForms = @{}     # open Info windows, by site name
 $script:outputForm = $null
 $script:outputBox = $null
 $script:outputShown = -1
@@ -267,16 +275,59 @@ function Request-Status {
             }
         }
         Update-View
+        Update-Self
     })
+}
+
+# Replace this script with the repo's copy when that has changed, e.g. after
+# a git pull, and restart into it. It runs after a successful status check,
+# while WSL is up anyway, so reading the repo doesn't start WSL. The repo is
+# where the CLI is: <repo>/bin/novacore.
+function Update-Self {
+    # Only the installed copy, not one run from elsewhere, e.g. the repo itself.
+    $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore\novacore-tray.ps1'
+    if ($PSCommandPath -ne $installed) { return }
+    if ($script:lastUpdateCheck -and ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -lt 60) { return }
+    # Restarting would close the menu or a dialog in use, so wait for a quiet
+    # moment. A running command is fine to leave: it runs on its own in WSL.
+    if ($script:menu.Visible -or [System.Windows.Forms.Application]::OpenForms.Count -gt 0) { return }
+    $script:lastUpdateCheck = Get-Date
+
+    $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/windows/novacore-tray.ps1')
+    if (-not (Test-Path -LiteralPath $source)) { return }
+    $new = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    if ($new -eq (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash) { return }
+    if ($new -eq $script:skippedUpdate) { return }
+
+    # Don't swap in a script that won't run, e.g. one saved mid-edit.
+    $errors = $null
+    [void] [System.Management.Automation.Language.Parser]::ParseFile($source, [ref] $null, [ref] $errors)
+    if ($errors) {
+        $script:skippedUpdate = $new
+        Show-Problem "Not updating the tray icon: windows/novacore-tray.ps1 has errors. $($errors[0])"
+        return
+    }
+
+    Copy-Item -LiteralPath $source -Destination $PSCommandPath -Force
+    # Let the new one take the single-instance lock, then hand over to it.
+    $script:mutex.ReleaseMutex()
+    $script:mutex.Dispose()
+    $arguments = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden " +
+        "-File `"$PSCommandPath`" -Distro `"$Distro`" -Command `"$Command`" -RefreshInterval $RefreshInterval -Updated"
+    Start-Process (Join-Path $env:WINDIR 'System32\conhost.exe') -ArgumentList $arguments
+    $script:notify.Visible = $false
+    $script:notify.Dispose()
+    $script:context.ExitThread()
 }
 
 # Run a novacore command that changes something, such as up or php. It runs
 # detached in WSL (see `novacore tray run`), so it finishes even if this
 # script stops meanwhile, and Update-Action follows it from there.
-function Start-Action([string[]] $Arguments, [string] $Label, [string] $DoneText) {
+function Start-Action([string[]] $Arguments, [string] $Label, [string] $DoneText, [string] $Url = '') {
     if ($script:busy) { return }
     $script:busy = $true
     $script:busyLabel = $Label
+    $script:actionUrl = $Url
     $script:output = @()
     $script:outputShown = -1
     Update-View
@@ -331,7 +382,7 @@ function Update-Action {
         $script:busy = $false
         $script:output = $log
         if ($exit -eq '0') {
-            Show-Balloon 'Novacore' $(if ($done) { $done } else { "Done: $(Get-ActionName $label)" }) 'Info'
+            Show-Balloon 'Novacore' $(if ($done) { $done } else { "Done: $(Get-ActionName $label)" }) 'Info' -Url $script:actionUrl
         } else {
             # novacore's own error message starts with a heavy cross.
             $message = @($log | Where-Object { $_ -match '^\s*\u2716' }) | Select-Object -Last 1
@@ -345,10 +396,12 @@ function Update-Action {
     })
 }
 
-# A notification. Clicking one with SHOWSOUTPUT opens the output window.
-function Show-Balloon([string] $title, [string] $text, [string] $icon, [switch] $ShowsOutput) {
+# A notification. Clicking one with SHOWSOUTPUT opens the output window, and
+# one with a URL opens that.
+function Show-Balloon([string] $title, [string] $text, [string] $icon, [switch] $ShowsOutput, [string] $Url = '') {
     if (-not $text) { $text = ' ' }  # NotifyIcon refuses empty text.
     $script:balloonShowsOutput = [bool] $ShowsOutput
+    $script:balloonUrl = $Url
     $script:notify.ShowBalloonTip(10000, $title, $text, $icon)
 }
 
@@ -415,16 +468,28 @@ function Update-Menu {
             $item = Add-MenuItem $items $site.name
             $sub = $item.DropDownItems
             [void] (Add-MenuItem $sub "Open $($site.url -replace '^https?://', '')" @{ Action = 'url'; Url = $site.url } -Bold)
+            [void] (Add-MenuItem $sub "Info$Ellipsis" @{ Action = 'info'; Site = $site.name })
+            Add-Separator $sub
             [void] (Add-MenuItem $sub 'Open Folder' @{ Action = 'folder'; Path = $site.path })
+            if ($script:code) { [void] (Add-MenuItem $sub 'Open in VS Code' @{ Action = 'code'; Path = $site.path }) }
+            [void] (Add-MenuItem $sub 'Open Terminal' @{ Action = 'terminal'; Path = $site.path; Title = $site.name })
+            [void] (Add-MenuItem $sub 'PHP Shell' @{ Action = 'cli'; Args = @('shell', $site.name); Title = "$($site.name) $MiddleDot PHP shell" } -Enabled $running)
+            [void] (Add-MenuItem $sub 'Follow Error Log' @{ Action = 'cli'; Args = @('errors', $site.name); Title = "$($site.name) $MiddleDot error log" })
             Add-Separator $sub
             foreach ($version in $script:status.phpVersions) {
                 $php = Add-MenuItem $sub "PHP $version" @{ Action = 'php'; Site = $site.name; Version = $version } -Enabled $idle
                 $php.Checked = $version -eq $site.php
             }
+            Add-Separator $sub
+            [void] (Add-MenuItem $sub "Remove$Ellipsis" @{ Action = 'remove'; Site = $site.name } -Enabled $idle)
         }
     } elseif ($script:status -and -not $script:problem) {
         Add-Separator $items
         [void] (Add-MenuItem $items 'No sites yet' -Enabled $false)
+    }
+    if ($script:status -and -not $script:problem) {
+        if (-not $sites.Count) { Add-Separator $items }
+        [void] (Add-MenuItem $items "Add Site$Ellipsis" @{ Action = 'add' } -Enabled $idle)
     }
 
     Add-Separator $items
@@ -433,6 +498,30 @@ function Update-Menu {
         [void] (Add-MenuItem $items 'Restart Novacore' @{ Action = 'restart' } -Enabled $idle)
     } else {
         [void] (Add-MenuItem $items 'Start Novacore' @{ Action = 'up' } -Enabled $idle)
+    }
+
+    if ($script:status -and -not $script:problem) {
+        # novacore xdebug's modes; "on" is develop,debug.
+        $xdebug = Add-MenuItem $items 'Xdebug'
+        $sub = $xdebug.DropDownItems
+        foreach ($mode in @(
+            @('off', 'Off'), @('develop,debug', 'On (develop, debug)'), $null,
+            @('debug', 'Debug only'), @('develop', 'Develop only'), @('profile', 'Profile'), @('trace', 'Trace'), @('coverage', 'Coverage'))) {
+            if (-not $mode) { Add-Separator $sub; continue }
+            $item = Add-MenuItem $sub $mode[1] @{ Action = 'xdebug'; Mode = $mode[0]; Name = $mode[1] } -Enabled $idle
+            $item.Checked = $script:status.xdebug -eq $mode[0]
+        }
+        if (@('off', 'develop,debug', 'debug', 'develop', 'profile', 'trace', 'coverage') -notcontains $script:status.xdebug) {
+            Add-Separator $sub
+            $item = Add-MenuItem $sub $script:status.xdebug -Enabled $false
+            $item.Checked = $true
+        }
+
+        $tools = Add-MenuItem $items 'Tools'
+        $sub = $tools.DropDownItems
+        [void] (Add-MenuItem $sub 'Database Shell' @{ Action = 'cli'; Args = @('db', 'shell'); Title = "Novacore $MiddleDot database" } -Enabled $running)
+        [void] (Add-MenuItem $sub 'Container Logs' @{ Action = 'cli'; Args = @('logs'); Title = "Novacore $MiddleDot logs" })
+        [void] (Add-MenuItem $sub 'Open Sites Folder' @{ Action = 'folder'; Path = $script:status.sitesPath })
     }
     [void] (Add-MenuItem $items "Show Output$Ellipsis" @{ Action = 'output' } -Enabled ($script:output.Count -gt 0))
     [void] (Add-MenuItem $items 'Refresh' @{ Action = 'refresh' } -Enabled $idle)
@@ -464,10 +553,7 @@ function Update-View {
 function Invoke-MenuAction($tag) {
     switch ($tag.Action) {
         'url' { Start-Process $tag.Url }
-        'folder' {
-            $path = "\\wsl.localhost\$Distro" + ($tag.Path -replace '/', '\')
-            Start-Process explorer.exe "`"$path`""
-        }
+        'folder' { Start-Process explorer.exe "`"$(Get-WindowsPath $tag.Path)`"" }
         'up' { Start-Action @('up') "Starting Novacore$Ellipsis" 'Novacore is running' }
         'down' { Start-Action @('down') "Stopping Novacore$Ellipsis" 'Novacore has stopped' }
         'restart' { Start-Action @('restart') "Restarting Novacore$Ellipsis" 'Novacore has restarted' }
@@ -481,6 +567,13 @@ function Invoke-MenuAction($tag) {
             }
             Start-Action @('php', $tag.Site, $tag.Version) $label "$($tag.Site) now uses PHP $($tag.Version)"
         }
+        'xdebug' { Start-Action @('xdebug', $tag.Mode) "Setting Xdebug to $($tag.Name)$Ellipsis" "Xdebug is now $($tag.Name)" }
+        'add' { Show-AddSite }
+        'remove' { Show-RemoveSite $tag.Site }
+        'info' { Show-SiteInfo $tag.Site }
+        'code' { Start-Process $script:code -ArgumentList "--remote wsl+$Distro `"$($tag.Path)`"" -WindowStyle Hidden }
+        'terminal' { Start-Terminal $tag.Title @('--cd', $tag.Path) }
+        'cli' { Start-Terminal $tag.Title (@('-e', $Command) + $tag.Args) }
         'output' { Show-Output }
         'refresh' { Update-Status -Wake }
         'quit' {
@@ -548,6 +641,315 @@ function Update-OutputWindow {
     $box.ScrollToCaret()
 }
 
+# --- Terminals and paths ------------------------------------------------------
+
+# A path in the distro as Windows sees it, e.g. \\wsl.localhost\Ubuntu\home\you.
+function Get-WindowsPath([string] $path) {
+    "\\wsl.localhost\$Distro" + ($path -replace '/', '\')
+}
+
+# Open a terminal running wsl.exe with ARGUMENTS: in Windows Terminal when
+# it's installed, else in a console window.
+function Start-Terminal([string] $Title, [string[]] $Arguments) {
+    $wsl = @('-d', $Distro) + $Arguments
+    if ($script:wt) {
+        # Windows Terminal reads ; as a separator between its own commands.
+        $line = (@('--title', $Title, 'wsl.exe') + $wsl | ForEach-Object { ConvertTo-Arg $_ }) -join ' '
+        Start-Process $script:wt -ArgumentList ($line -replace ';', '\;')
+    } else {
+        Start-Process (Join-Path $env:WINDIR 'System32\wsl.exe') -ArgumentList (($wsl | ForEach-Object { ConvertTo-Arg $_ }) -join ' ')
+    }
+}
+
+$script:wt = (Get-Command wt.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+$script:code = (Get-Command code.cmd -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+
+# --- Dialogs ------------------------------------------------------------------
+
+$g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+$script:scale = $g.DpiX / 96
+$g.Dispose()
+
+# N pixels at 96 DPI, scaled for this screen.
+function S([double] $n) { [int] [Math]::Round($n * $script:scale) }
+
+function New-Dialog([string] $title) {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $title
+    $form.Font = [System.Drawing.SystemFonts]::MessageBoxFont
+    $form.Icon = $script:icons.Running
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.StartPosition = 'CenterScreen'
+    $form.AutoSize = $true
+    $form.AutoSizeMode = 'GrowAndShrink'
+    $form.Padding = New-Object System.Windows.Forms.Padding (S 12)
+    # Started from the tray, a window can open behind others; bring it forward.
+    $form.add_Shown({ $this.TopMost = $true; $this.Activate(); $this.TopMost = $false })
+    $form
+}
+
+# A grid of COLUMNS, each as wide as its widest control.
+function New-Grid([int] $columns) {
+    $grid = New-Object System.Windows.Forms.TableLayoutPanel
+    $grid.ColumnCount = $columns
+    $grid.AutoSize = $true
+    $grid.AutoSizeMode = 'GrowAndShrink'
+    $grid.GrowStyle = 'AddRows'
+    for ($i = 0; $i -lt $columns; $i++) {
+        [void] $grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle ([System.Windows.Forms.SizeType]::AutoSize)))
+    }
+    $grid
+}
+
+function New-Label([string] $text, [switch] $Bold, [switch] $Hint) {
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $text
+    $label.AutoSize = $true
+    $label.Anchor = 'Left'
+    $label.Margin = New-Object System.Windows.Forms.Padding 0, (S 4), (S 8), (S 4)
+    if ($Bold) { $label.Font = New-Object System.Drawing.Font($label.Font, [System.Drawing.FontStyle]::Bold) }
+    if ($Hint) { $label.ForeColor = [System.Drawing.SystemColors]::GrayText }
+    $label
+}
+
+# Add a row of CONTROLS to GRID, with an empty cell for each $null.
+function Add-Row($grid, [object[]] $controls) {
+    $row = $grid.RowCount
+    $grid.RowCount = $row + 1
+    for ($i = 0; $i -lt $controls.Count; $i++) {
+        if ($controls[$i]) { $grid.Controls.Add($controls[$i], $i, $row) }
+    }
+}
+
+# A heading across GRID's columns.
+function Add-Heading($grid, [string] $text) {
+    $label = New-Label $text -Bold
+    $label.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, (S 2)
+    $row = $grid.RowCount
+    $grid.RowCount = $row + 1
+    $grid.Controls.Add($label, 0, $row)
+    $grid.SetColumnSpan($label, $grid.ColumnCount)
+}
+
+# A row of BUTTONS, right-aligned, for the bottom of a dialog.
+function New-ButtonRow([object[]] $buttons) {
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel
+    $row.FlowDirection = 'RightToLeft'
+    $row.AutoSize = $true
+    $row.AutoSizeMode = 'GrowAndShrink'
+    $row.Anchor = 'Right'
+    $row.Margin = New-Object System.Windows.Forms.Padding 0, (S 12), 0, 0
+    foreach ($button in $buttons) { $row.Controls.Add($button) }
+    $row
+}
+
+# Put GRID above a row of BUTTONS in FORM. (Docking them instead would stop
+# the form sizing itself to fit them.)
+function Set-DialogContent($form, $grid, [object[]] $buttons) {
+    $stack = New-Object System.Windows.Forms.FlowLayoutPanel
+    $stack.FlowDirection = 'TopDown'
+    $stack.WrapContents = $false
+    $stack.AutoSize = $true
+    $stack.AutoSizeMode = 'GrowAndShrink'
+    $stack.Controls.Add($grid)
+    $stack.Controls.Add((New-ButtonRow $buttons))
+    $form.Controls.Add($stack)
+}
+
+function New-Button([string] $text, $result = $null) {
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $text
+    $button.AutoSize = $true
+    $button.MinimumSize = New-Object System.Drawing.Size (S 88), 0
+    if ($null -ne $result) { $button.DialogResult = $result }
+    $button
+}
+
+# Under Add Site's PHP version, say if it needs building first.
+function Update-PhpHint {
+    $d = $script:dialog
+    $v = $d.Php.SelectedItem
+    $built = @($script:status.builtPhp) -contains $v
+    $d.PhpHint.Text = "PHP $v needs building first, which takes a few minutes."
+    $d.PhpHint.Visible = -not $built
+}
+
+# Ask for a new site's details, then add it with novacore site add.
+function Show-AddSite {
+    $s = $script:status
+    $form = New-Dialog 'Add Site'
+    $grid = New-Grid 2
+
+    $name = New-Object System.Windows.Forms.TextBox
+    $name.Width = S 260
+    $name.CharacterCasing = 'Lower'
+    $nameHint = New-Label ' ' -Hint
+    Add-Row $grid @((New-Label 'Name'), $name)
+    Add-Row $grid @($null, $nameHint)
+
+    $php = New-Object System.Windows.Forms.ComboBox
+    $php.DropDownStyle = 'DropDownList'
+    $php.Width = S 100
+    foreach ($v in $s.phpVersions) { [void] $php.Items.Add($v) }
+    $php.SelectedItem = $s.defaultPhp
+    $phpHint = New-Label ' ' -Hint
+    Add-Row $grid @((New-Label 'PHP'), $php)
+    Add-Row $grid @($null, $phpHint)
+
+    $root = New-Object System.Windows.Forms.ComboBox
+    $root.Width = S 160
+    foreach ($r in 'Auto-detect', 'public', 'web', 'public_html', 'htdocs') { [void] $root.Items.Add($r) }
+    $root.SelectedIndex = 0
+    Add-Row $grid @((New-Label 'Document root'), $root)
+    Add-Row $grid @($null, (New-Label 'Auto-detect looks for public, web, public_html or htdocs.' -Hint))
+
+    $db = New-Object System.Windows.Forms.CheckBox
+    $db.Text = 'Create a database'
+    $db.AutoSize = $true
+    $db.Checked = $true
+    if (-not (Test-Running)) {
+        $db.Checked = $false
+        $db.Enabled = $false
+        $db.Text = "Create a database (start Novacore first)"
+    }
+    Add-Row $grid @($null, $db)
+
+    $add = New-Button 'Add' ([System.Windows.Forms.DialogResult]::OK)
+    $add.Enabled = $false
+    $cancel = New-Button 'Cancel' ([System.Windows.Forms.DialogResult]::Cancel)
+    Set-DialogContent $form $grid @($cancel, $add)
+    $form.AcceptButton = $add
+    $form.CancelButton = $cancel
+
+    $script:dialog = @{ Name = $name; NameHint = $nameHint; Php = $php; PhpHint = $phpHint; Add = $add }
+    # The same rules as novacore's check_name.
+    $name.add_TextChanged({
+        $d = $script:dialog
+        $n = $d.Name.Text.Trim()
+        $problem = if (-not $n) { '' }
+            elseif ($n -cnotmatch '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$') { 'Use letters, numbers and hyphens, not at the start or end.' }
+            elseif ($n -eq 'default') { "'default' is a reserved name." }
+            elseif (@($script:status.sites | Where-Object { $_.name -eq $n }).Count) { "There's already a site called $n." }
+            else { '' }
+        $d.Add.Enabled = $n -and -not $problem
+        $d.NameHint.ForeColor = if ($problem) { [System.Drawing.Color]::Firebrick } else { [System.Drawing.SystemColors]::GrayText }
+        $d.NameHint.Text = if ($problem) { $problem } elseif ($n) { "https://$n.$($script:status.tld)" } else { ' ' }
+    })
+    $php.add_SelectedIndexChanged({ Update-PhpHint })
+    Update-PhpHint
+    $name.Select()
+
+    $result = $form.ShowDialog()
+    $n = $name.Text.Trim()
+    $arguments = @('site', 'add', $n, '--php', $php.SelectedItem)
+    if ($root.Text.Trim() -and $root.Text -ne 'Auto-detect') { $arguments += @('--root', $root.Text.Trim()) }
+    if (-not $db.Checked) { $arguments += '--no-db' }
+    $form.Dispose()
+    $script:dialog = $null
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $url = "https://$n.$($s.tld)"
+    Start-Action $arguments "Adding $n$Ellipsis" "$n is ready at $url" -Url $url
+}
+
+# Confirm removing a site, then remove it with novacore site rm.
+function Show-RemoveSite([string] $name) {
+    $site = @($script:status.sites | Where-Object { $_.name -eq $name })[0]
+    if (-not $site) { return }
+    $form = New-Dialog "Remove $name"
+    $grid = New-Grid 1
+    Add-Row $grid @((New-Label "Stop serving $($site.url)?" -Bold))
+    $note = New-Label "Its files stay in $($site.path)."
+    $note.MaximumSize = New-Object System.Drawing.Size (S 380), 0
+    Add-Row $grid @($note)
+
+    $db = New-Object System.Windows.Forms.CheckBox
+    $db.Text = "Also delete its database, $($site.database)"
+    $db.AutoSize = $true
+    $db.Margin = New-Object System.Windows.Forms.Padding 0, (S 8), 0, 0
+    if (-not (Test-Running)) {
+        $db.Enabled = $false
+        $db.Text += ' (start Novacore first)'
+    }
+    Add-Row $grid @($db)
+
+    $remove = New-Button 'Remove' ([System.Windows.Forms.DialogResult]::OK)
+    $cancel = New-Button 'Cancel' ([System.Windows.Forms.DialogResult]::Cancel)
+    Set-DialogContent $form $grid @($cancel, $remove)
+    $form.AcceptButton = $remove
+    $form.CancelButton = $cancel
+    $form.add_Shown({ $this.CancelButton.Select() })
+
+    $result = $form.ShowDialog()
+    $dropDb = $db.Checked
+    $form.Dispose()
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $arguments = @('site', 'rm', $name)
+    if ($dropDb) { $arguments += '--drop-db' }
+    Start-Action $arguments "Removing $name$Ellipsis" "Removed $name. Its files are still in $($site.path)"
+}
+
+# A site's details, like novacore site info, each with a Copy button.
+function Show-SiteInfo([string] $name) {
+    if ($script:infoForms[$name]) { $script:infoForms[$name].Activate(); return }
+    $site = @($script:status.sites | Where-Object { $_.name -eq $name })[0]
+    if (-not $site) { return }
+    $db = $script:status.db
+
+    $form = New-Dialog $name
+    $form.Tag = $name
+    $grid = New-Grid 3
+    $rows = @(
+        'Site',
+        @('URL', $site.url),
+        @('PHP', $site.php),
+        @('Folder', $site.path),
+        @('In Windows', (Get-WindowsPath $site.path)),
+        @('Document root', $(if ($site.root -eq '.') { $site.path } else { "$($site.path)/$($site.root)" })),
+        @('Error log', $site.errorLog),
+        'Database',
+        @('Name', $site.database),
+        @('User', $db.user),
+        @('Password', $db.password),
+        @('Host', $db.host),
+        @('Host in Novacore', $db.containerHost),
+        'DB_HOST that works in Novacore and on your machine',
+        @('wp-config.php', "define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$($db.host)' );"),
+        @('Bedrock', "Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$($db.host)' );"),
+        @('Laravel', "'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),")
+    )
+    foreach ($row in $rows) {
+        if ($row -is [string]) { Add-Heading $grid $row; continue }
+        $box = New-Object System.Windows.Forms.TextBox
+        $box.Text = $row[1]
+        $box.ReadOnly = $true
+        $box.Width = S 500
+        $copy = New-Button 'Copy'
+        $copy.MinimumSize = New-Object System.Drawing.Size (S 60), 0
+        $copy.Tag = $row[1]
+        $copy.add_Click({ [System.Windows.Forms.Clipboard]::SetText([string] $this.Tag) })
+        Add-Row $grid @((New-Label $row[0]), $box, $copy)
+    }
+
+    $open = New-Button 'Open Site'
+    $open.Tag = $site.url
+    $open.add_Click({ Start-Process $this.Tag })
+    $folder = New-Button 'Open Folder'
+    $folder.Tag = Get-WindowsPath $site.path
+    $folder.add_Click({ Start-Process explorer.exe "`"$($this.Tag)`"" })
+    $close = New-Button 'Close'
+    $close.add_Click({ $this.FindForm().Close() })
+    Set-DialogContent $form $grid @($close, $folder, $open)
+    $form.CancelButton = $close
+    $form.ActiveControl = $close
+    $form.add_FormClosed({ $script:infoForms.Remove($this.Tag) })
+
+    $script:infoForms[$name] = $form
+    $form.Show()
+}
+
 # --- Main ---------------------------------------------------------------------
 
 # Event handlers that throw would otherwise stop the whole tray icon.
@@ -571,7 +973,12 @@ $script:notify.add_MouseUp({
         [void] $show.Invoke($script:notify, $null)
     }
 })
-$script:notify.add_BalloonTipClicked({ if ($script:balloonShowsOutput) { Invoke-Safely { Show-Output } } })
+$script:notify.add_BalloonTipClicked({
+    Invoke-Safely {
+        if ($script:balloonShowsOutput) { Show-Output }
+        elseif ($script:balloonUrl) { Start-Process $script:balloonUrl }
+    }
+})
 
 $script:pump = New-Object System.Windows.Forms.Timer
 $script:pump.Interval = 200
@@ -590,6 +997,7 @@ $refresh.Start()
 
 Update-View
 $script:notify.Visible = $true
+if ($Updated) { Show-Balloon 'Novacore' 'The tray icon has been updated.' 'Info' }
 Update-Status
 
 $script:context = New-Object System.Windows.Forms.ApplicationContext

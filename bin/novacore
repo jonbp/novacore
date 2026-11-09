@@ -711,13 +711,18 @@ status_json() {
     is_running && running=true
     # shellcheck disable=SC2207
     built=($(docker image ls novacore/php --format '{{.Tag}}' | sort -V))
-    printf '{"running":%s,"dashboard":"https://localhost","phpVersions":%s,"builtPhp":%s,"sites":[' \
+    printf '{"running":%s,"dashboard":"https://localhost","phpVersions":%s,"builtPhp":%s,' \
         "$running" "$(json_list "${SUPPORTED_PHP[@]}")" "$(json_list ${built[@]+"${built[@]}"})"
+    printf '"defaultPhp":%s,"xdebug":%s,"tld":%s,"sitesPath":%s,' \
+        "$(json_str "$DEFAULT_PHP")" "$(json_str "$XDEBUG_MODE")" "$(json_str "$NOVACORE_TLD")" "$(json_str "$SITES_PATH")"
+    printf '"db":{"user":%s,"password":%s,"host":%s,"containerHost":"mariadb"},"sites":[' \
+        "$(json_str "$DB_USER")" "$(json_str "$DB_PASSWORD")" "$(json_str "$(host_db_host)")"
     for name in $(site_names); do
-        printf '%s{"name":%s,"url":%s,"php":%s,"root":%s,"path":%s,"database":%s}' "$sep" \
+        printf '%s{"name":%s,"url":%s,"php":%s,"root":%s,"path":%s,"database":%s,"errorLog":%s}' "$sep" \
             "$(json_str "$name")" "$(json_str "https://$(domain "$name")")" \
             "$(json_str "$(site_php "$name")")" "$(json_str "$(site_root "$name")")" \
-            "$(json_str "$SITES_PATH/$name")" "$(json_str "$(db_name "$name")")"
+            "$(json_str "$SITES_PATH/$name")" "$(json_str "$(db_name "$name")")" \
+            "$(json_str "$LOGS_DIR/$name.log")"
         sep=,
     done
     printf ']}\n'
