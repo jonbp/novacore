@@ -1297,8 +1297,10 @@ TRAY_STOP_PS='
 $ErrorActionPreference = "Stop"
 $dir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Novacore"
 $lnk = Join-Path ([Environment]::GetFolderPath("Startup")) "Novacore.lnk"
-$running = Get-CimInstance Win32_Process -Filter "Name = '"'powershell.exe'"'" |
-    Where-Object { $_.CommandLine -like "*novacore-tray.ps1*" }
+# NovacoreTray.exe, or PowerShell running the script before it hands over.
+$running = @(Get-CimInstance Win32_Process -Filter "Name = '"'NovacoreTray.exe'"'") +
+    @(Get-CimInstance Win32_Process -Filter "Name = '"'powershell.exe'"'" |
+        Where-Object { $_.CommandLine -like "*novacore-tray.ps1*" })
 if ($running) {
     $running | Invoke-CimMethod -MethodName Terminate | Out-Null
     # Let its single-instance mutex go before a new one starts.
@@ -1342,6 +1344,7 @@ tray_uninstall() {
     windows_ps <<<"$TRAY_STOP_PS"'
 Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath "HKCU:\Software\Classes\AppUserModelId\Novacore.Tray" -Recurse -Force -ErrorAction SilentlyContinue
 ' || fail "Couldn't remove the tray icon"
     result "Removed"
     complete Removed

@@ -30,6 +30,7 @@ if (-not $created) { exit }
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace Novacore -Name Native -MemberDefinition '
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("shell32.dll")] public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string id);
 '
 # Otherwise Windows scales a 16px icon up, and it's blurry on high-DPI screens.
 [void] [Novacore.Native]::SetProcessDPIAware()
@@ -69,14 +70,18 @@ $script:outputShown = -1
 
 # The globe from Novacore's link in the Open Source nav on jonbp.co.uk, a
 # 24x24 icon: a circle, and the equator and two meridians tilted like the
-# Earth's axis. The full logo, with its square, is too detailed for 16px.
+# Earth's axis. The full logo, with its square, is too detailed for 16px. The
+# globe is white or black to suit the taskbar, and a badge in its bottom right
+# corner shows the status by its colour.
 #
-# How much of each pixel of a SIZE x SIZE icon the globe covers, from 0 to 1.
-# GDI+ antialiases thin lines poorly, so the globe is drawn 8x larger and
-# averaged down, and faint edge pixels are then strengthened a little so the
-# lines read as solid rather than dotted.
-function Get-GlobeCoverage([int] $size) {
-    $k = 8
+# Shapes are drawn in the icon's 24x24 space by DRAW, given the Graphics, and
+# this returns how much of each pixel of a SIZE x SIZE icon they cover, from 0
+# to 1. GDI+ antialiases thin lines poorly, so they're drawn 8x larger and
+# averaged down, or less for big sizes, where it matters less. Raising coverage
+# to a power below 1 strengthens faint edge pixels, so thin lines read as solid
+# rather than dotted.
+function Get-Coverage([int] $size, [scriptblock] $draw, [double] $power = 1.0) {
+    $k = if ($size -le 32) { 8 } else { [Math]::Max(1, [Math]::Floor(256 / $size)) }
     $n = $size * $k
     $bmp = New-Object System.Drawing.Bitmap $n, $n, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -85,19 +90,7 @@ function Get-GlobeCoverage([int] $size) {
     # by half a pixel.
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
     $g.ScaleTransform($n / 24, $n / 24)
-    # A little bolder than the site's 2, to hold up at 16px. The circle shrinks
-    # to keep its outer edge at the icon's edge.
-    [float] $stroke = 2.5
-    [float] $r = 12 - $stroke / 2
-    [float] $m = 5.5  # the meridians' half-width
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), $stroke
-    # The coordinates must be floats: given doubles, PowerShell picks the Int32
-    # overloads and rounds them, which knocks the globe off centre.
-    $g.DrawEllipse($pen, [float] (12 - $r), [float] (12 - $r), [float] (2 * $r), [float] (2 * $r))
-    $g.TranslateTransform(12, 12)
-    $g.RotateTransform(-23.5)
-    $g.DrawLine($pen, [float] -$r, [float] 0, $r, [float] 0)
-    $g.DrawEllipse($pen, [float] -$m, [float] -$r, [float] (2 * $m), [float] (2 * $r))
+    & $draw $g
     $g.Dispose()
 
     $data = $bmp.LockBits((New-Object System.Drawing.Rectangle 0, 0, $n, $n), 'ReadOnly', $bmp.PixelFormat)
@@ -116,30 +109,342 @@ function Get-GlobeCoverage([int] $size) {
     }
     for ($i = 0; $i -lt $coverage.Length; $i++) {
         # 1.0, not 1: PowerShell would pick Math.Min(int, int) and round.
-        $coverage[$i] = [Math]::Pow([Math]::Min(1.0, $coverage[$i] / (255 * $k * $k)), 0.7)
+        $coverage[$i] = [Math]::Pow([Math]::Min(1.0, $coverage[$i] / (255 * $k * $k)), $power)
     }
     , $coverage
 }
 
-# The globe in COLOR, at the size of the notification area's icons: 16px at
-# 100% scaling, 24px at 150% and so on.
-function New-NovacoreIcon([double[]] $coverage, [string] $hex) {
-    $color = [System.Drawing.ColorTranslator]::FromHtml($hex)
-    $size = [int] [Math]::Sqrt($coverage.Length)
-    $bmp = New-Object System.Drawing.Bitmap $size, $size
-    for ($i = 0; $i -lt $coverage.Length; $i++) {
-        $alpha = [int] [Math]::Round(255 * $coverage[$i])
-        $bmp.SetPixel($i % $size, [Math]::Floor($i / $size), [System.Drawing.Color]::FromArgb($alpha, $color))
+# A round-capped pen for the shapes. The coordinates passed to Graphics must be
+# floats: given doubles, PowerShell picks the Int32 overloads and rounds them,
+# which knocks shapes off centre.
+function New-Pen([float] $width) {
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), $width
+    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $pen
+}
+
+# How far the globe's equator, and the badge, tilt from level, like the Earth's
+# axis.
+$Tilt = 23.5
+
+function Get-GlobeCoverage([int] $size) {
+    Get-Coverage $size {
+        param($g)
+        # Lines 1.25px wide at 100% scaling (16px), 1.875px at 150% and so on:
+        # a touch bolder than the 1px of Windows' own notification area icons,
+        # which are hand-fitted to the pixel grid where this isn't. The circle
+        # shrinks to keep its outer edge at the icon's edge.
+        [float] $stroke = 1.875
+        [float] $r = 12 - $stroke / 2
+        [float] $m = 5.5  # the meridians' half-width
+        $pen = New-Pen $stroke
+        $g.DrawEllipse($pen, [float] (12 - $r), [float] (12 - $r), [float] (2 * $r), [float] (2 * $r))
+        $g.TranslateTransform(12, 12)
+        $g.RotateTransform(-$Tilt)
+        $g.DrawLine($pen, [float] -$r, [float] 0, $r, [float] 0)
+        $g.DrawEllipse($pen, [float] -$m, [float] -$r, [float] (2 * $m), [float] (2 * $r))
+    } 0.7
+}
+
+# The badge: a pill tilted like the equator, touching the icon's bottom and
+# right edges, and a 1px gap around it cut out of the globe so the two don't
+# run together. The gap falls outside the icon on the bottom and right, so it
+# takes up no room there.
+$BadgeW = 9; $BadgeH = 4.5  # 6x3px at 16px
+# The pill grown by GROW on every side: a line with round caps, as thick as
+# the pill is tall, between ends that are HALF apart from its centre on each
+# axis. The centre is placed so the pill's lowest and rightmost points just
+# reach the icon's edges.
+function Get-BadgeCoverage([int] $size, [double] $grow = 0) {
+    $draw = {
+        param($g)
+        $r = $BadgeH / 2
+        $a = $Tilt * [Math]::PI / 180
+        $half = ($BadgeW - $BadgeH) / 2
+        $dx = $half * [Math]::Cos($a)
+        $dy = $half * [Math]::Sin($a)
+        $cx = 24 - $dx - $r
+        $cy = 24 - $dy - $r
+        # Rising to the right, like the equator.
+        $g.DrawLine((New-Pen ($BadgeH + 2 * $grow)), [float] ($cx - $dx), [float] ($cy + $dy), [float] ($cx + $dx), [float] ($cy - $dy))
     }
+    # Get-Coverage runs DRAW from inside itself, so DRAW sees $grow through
+    # PowerShell's dynamic scoping. A closure would hide the script's variables
+    # (such as $BadgeH) when NovacoreTray.exe runs the script.
+    Get-Coverage $size $draw
+}
+
+# The globe's colour, and each status's badge colour, on dark and light
+# taskbars: jonbp.co.uk's palette in its dark and light themes. The globe is
+# the site's text colour; running is Novacore's own accent, neon teal; stopped
+# is the secondary text colour; busy and error are neon yellow and neon red.
+$script:themes = @{
+    Dark = @{
+        Foreground = '#FFFFFF'  # --c-copy
+        Running    = '#17D4A4'  # --c-neon-teal
+        Stopped    = '#768087'  # --c-copy-secondary
+        Busy       = '#FEC82C'  # --c-neon-yellow
+        Error      = '#FE2C62'  # --c-neon-red
+    }
+    Light = @{
+        Foreground = '#0B0B13'
+        Running    = '#009672'
+        Stopped    = '#58626A'
+        Busy       = '#C48C00'
+        Error      = '#DE184C'
+    }
+}
+
+# Whether the taskbar is light, so the globe should be black. Windows 10 before
+# 1903 has no setting, and a dark taskbar.
+function Test-LightTaskbar {
+    try {
+        (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name SystemUsesLightTheme -ErrorAction Stop).SystemUsesLightTheme -eq 1
+    } catch { $false }
+}
+
+# Paint the TOP colour over BOTTOM, both [a, r, g, b] from 0 to 1.
+function Join-Colors([double[]] $bottom, [double[]] $top) {
+    $a = $top[0] + $bottom[0] * (1 - $top[0])
+    if ($a -le 0) { return , [double[]] @(0, 0, 0, 0) }
+    $out = [double[]] @($a, 0, 0, 0)
+    for ($c = 1; $c -le 3; $c++) {
+        $out[$c] = ($top[$c] * $top[0] + $bottom[$c] * $bottom[0] * (1 - $top[0])) / $a
+    }
+    , $out
+}
+
+function Get-Rgb([string] $hex) {
+    $color = [System.Drawing.ColorTranslator]::FromHtml($hex)
+    , [double[]] @(($color.R / 255), ($color.G / 255), ($color.B / 255))
+}
+
+# The globe's and badge's coverage at SIZE, worked out once per size.
+$script:shapes = @{}
+function Get-Shapes([int] $size) {
+    if (-not $script:shapes[$size]) {
+        $script:shapes[$size] = @{
+            Globe = Get-GlobeCoverage $size
+            Badge = Get-BadgeCoverage $size
+            # 24 / size: one pixel, in the icon's 24x24 space.
+            Cut   = Get-BadgeCoverage $size (24 / $size)
+        }
+    }
+    $script:shapes[$size]
+}
+
+# A SIZE x SIZE bitmap of the globe in FOREGROUND, with a badge in BADGECOLOR
+# if given.
+function New-NovacoreBitmap([int] $size, [string] $foreground, [string] $badgeColor = '') {
+    $shapes = Get-Shapes $size
+    $fg = Get-Rgb $foreground
+    $status = [bool] $badgeColor
+    if ($status) { $fill = Get-Rgb $badgeColor }
+    # BGRA, as a 32bpp ARGB bitmap keeps it in memory.
+    $bytes = New-Object byte[] ($size * $size * 4)
+    for ($i = 0; $i -lt $size * $size; $i++) {
+        $globe = $shapes.Globe[$i]
+        if ($status) { $globe *= 1 - $shapes.Cut[$i] }
+        $px = [double[]] @($globe, $fg[0], $fg[1], $fg[2])
+        if ($status) {
+            $px = Join-Colors $px @($shapes.Badge[$i], $fill[0], $fill[1], $fill[2])
+        }
+        $bytes[$i * 4] = [Math]::Round(255 * $px[3])
+        $bytes[$i * 4 + 1] = [Math]::Round(255 * $px[2])
+        $bytes[$i * 4 + 2] = [Math]::Round(255 * $px[1])
+        $bytes[$i * 4 + 3] = [Math]::Round(255 * $px[0])
+    }
+    $bmp = New-Object System.Drawing.Bitmap $size, $size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $data = $bmp.LockBits((New-Object System.Drawing.Rectangle 0, 0, $size, $size), 'WriteOnly', $bmp.PixelFormat)
+    for ($y = 0; $y -lt $size; $y++) {
+        [System.Runtime.InteropServices.Marshal]::Copy($bytes, $y * $size * 4, [IntPtr] ($data.Scan0.ToInt64() + $y * $data.Stride), $size * 4)
+    }
+    $bmp.UnlockBits($data)
+    $bmp
+}
+
+# The same as an icon, at the size of the notification area's icons: 16px at
+# 100% scaling, 24px at 150% and so on.
+$script:iconSize = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
+function New-NovacoreIcon([string] $foreground, [string] $badgeColor = '') {
+    $bmp = New-NovacoreBitmap $script:iconSize $foreground $badgeColor
     [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 
-$globe = Get-GlobeCoverage ([System.Windows.Forms.SystemInformation]::SmallIconSize.Width)
-$script:icons = @{
-    Running = New-NovacoreIcon $globe '#17D4A4'  # the dashboard's teal
-    Stopped = New-NovacoreIcon $globe '#9AA0A6'
-    Busy    = New-NovacoreIcon $globe '#F0B429'
-    Error   = New-NovacoreIcon $globe '#E5534B'
+# Novacore's own icon, the globe in its teal without a badge, as an .ico file
+# with the sizes Windows asks for, each stored as a PNG.
+function Save-NovacoreIco([string] $path) {
+    $sizes = 16, 20, 24, 32, 40, 48, 64, 256
+    $images = foreach ($size in $sizes) {
+        $bmp = New-NovacoreBitmap $size '#17D4A4'
+        $stream = New-Object System.IO.MemoryStream
+        $bmp.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+        , $stream.ToArray()
+    }
+    $out = New-Object System.IO.BinaryWriter ([System.IO.File]::Create($path))
+    try {
+        $out.Write([uint16] 0); $out.Write([uint16] 1); $out.Write([uint16] $sizes.Count)
+        $offset = 6 + 16 * $sizes.Count
+        for ($i = 0; $i -lt $sizes.Count; $i++) {
+            # 0 stands for 256.
+            $side = [byte] ($sizes[$i] % 256)
+            $out.Write($side); $out.Write($side); $out.Write([byte] 0); $out.Write([byte] 0)
+            $out.Write([uint16] 1); $out.Write([uint16] 32)
+            $out.Write([uint32] $images[$i].Length); $out.Write([uint32] $offset)
+            $offset += $images[$i].Length
+        }
+        foreach ($image in $images) { $out.Write($image) }
+    } finally { $out.Dispose() }
+}
+
+# The status icons, redrawn when the taskbar changes between light and dark.
+$script:lightTaskbar = $null
+function Update-Icons {
+    $light = Test-LightTaskbar
+    if ($light -eq $script:lightTaskbar) { return $false }
+    $script:lightTaskbar = $light
+    $theme = $script:themes[$(if ($light) { 'Light' } else { 'Dark' })]
+    $old = $script:icons
+    $script:icons = @{}
+    foreach ($status in 'Running', 'Stopped', 'Busy', 'Error') {
+        $script:icons[$status] = New-NovacoreIcon $theme.Foreground $theme[$status]
+    }
+    if ($script:notify) { Update-View }
+    if ($old) { $old.Values | ForEach-Object { $_.Dispose() } }
+    $true
+}
+[void] (Update-Icons)
+
+# For windows' title bars: the globe in Novacore's teal, without a badge.
+$script:windowIcon = New-NovacoreIcon '#17D4A4'
+
+# --- Launcher -----------------------------------------------------------------
+
+# Without these, Windows calls the tray icon "Windows PowerShell": its
+# notifications are signed as that, and Task Manager lists it under that name.
+#
+# Notifications are named after the process's app ID, so the script gives
+# itself one and registers it with a name and icon.
+#
+# Task Manager shows the description inside the program that's running, so
+# the installed copy runs in NovacoreTray.exe, a small program that hosts
+# PowerShell and runs this script. Windows PowerShell can compile C#, so the
+# script builds it the first time it runs, and again when its source below
+# changes, then hands over to it. If that fails, it carries on in PowerShell.
+
+$AppName = 'Novacore Tray'
+$AppId = 'Novacore.Tray'
+$script:appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore'
+
+function Register-AppId {
+    $png = Join-Path $script:appDir 'novacore.png'
+    if (-not (Test-Path -LiteralPath $png)) {
+        New-Item -ItemType Directory -Force $script:appDir | Out-Null
+        $bmp = New-NovacoreBitmap 64 '#17D4A4'
+        $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    }
+    $key = "HKCU:\Software\Classes\AppUserModelId\$AppId"
+    New-Item -Force $key | Out-Null
+    Set-ItemProperty $key DisplayName $AppName
+    Set-ItemProperty $key IconUri $png
+    [void] [Novacore.Native]::SetCurrentProcessExplicitAppUserModelID($AppId)
+}
+
+$LauncherSource = @"
+using System;
+using System.IO;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+using System.Reflection;
+
+[assembly: AssemblyTitle("$AppName")]
+[assembly: AssemblyProduct("$AppName")]
+
+// Runs novacore-tray.ps1 from this program's folder, passing on its arguments:
+// -Name value, or -Name alone for a switch.
+static class NovacoreTray {
+    [STAThread]
+    static void Main(string[] args) {
+        string dir = AppDomain.CurrentDomain.BaseDirectory;
+        try {
+            InitialSessionState state = InitialSessionState.CreateDefault();
+            state.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+            using (Runspace runspace = RunspaceFactory.CreateRunspace(state)) {
+                // This thread, as WinForms needs it to be STA.
+                runspace.ThreadOptions = PSThreadOptions.UseCurrentThread;
+                runspace.Open();
+                using (PowerShell ps = PowerShell.Create()) {
+                    ps.Runspace = runspace;
+                    ps.AddCommand(Path.Combine(dir, "novacore-tray.ps1"));
+                    for (int i = 0; i < args.Length; i++) {
+                        string name = args[i].TrimStart('-');
+                        if (i + 1 < args.Length && !args[i + 1].StartsWith("-")) ps.AddParameter(name, args[++i]);
+                        else ps.AddParameter(name);
+                    }
+                    ps.Invoke();
+                    foreach (ErrorRecord error in ps.Streams.Error) Log(dir, error.ToString());
+                }
+            }
+        } catch (Exception e) {
+            Log(dir, e.ToString());
+        }
+    }
+
+    static void Log(string dir, string message) {
+        File.AppendAllText(Path.Combine(dir, "tray.log"), DateTime.Now.ToString("s") + " " + message + Environment.NewLine);
+    }
+}
+"@
+
+# Hand over to NovacoreTray.exe, building it first if needed, and point the
+# Startup shortcut at it. Returns whether it did, in which case this copy
+# should quit.
+function Start-Launcher {
+    if ($PSCommandPath -ne (Join-Path $script:appDir 'novacore-tray.ps1')) { return $false }
+    if ([System.Diagnostics.Process]::GetCurrentProcess().ProcessName -eq 'NovacoreTray') { return $false }
+    $exe = Join-Path $script:appDir 'NovacoreTray.exe'
+    $cs = Join-Path $script:appDir 'NovacoreTray.cs'
+    $built = (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cs) -and
+        ([System.IO.File]::ReadAllText($cs) -eq $LauncherSource)
+    if (-not $built) {
+        # The copy this one is updating from may still be shutting down.
+        Get-Process NovacoreTray -ErrorAction SilentlyContinue | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+        $ico = Join-Path $script:appDir 'novacore.ico'
+        Save-NovacoreIco $ico
+        $options = New-Object System.CodeDom.Compiler.CompilerParameters
+        $options.GenerateExecutable = $true
+        $options.OutputAssembly = $exe
+        $options.CompilerOptions = "/target:winexe /optimize /win32icon:`"$ico`""
+        foreach ($assembly in 'System.dll', 'System.Core.dll', [PSObject].Assembly.Location) {
+            [void] $options.ReferencedAssemblies.Add($assembly)
+        }
+        $result = (New-Object Microsoft.CSharp.CSharpCodeProvider).CompileAssemblyFromSource($options, $LauncherSource)
+        if ($result.Errors.HasErrors) {
+            throw "Couldn't build NovacoreTray.exe: $(@($result.Errors | Where-Object { -not $_.IsWarning })[0])"
+        }
+        [System.IO.File]::WriteAllText($cs, $LauncherSource)
+    }
+
+    $arguments = "-Distro $(ConvertTo-Arg $Distro) -Command $(ConvertTo-Arg $Command) -RefreshInterval $RefreshInterval"
+    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Novacore.lnk'
+    if (Test-Path -LiteralPath $lnk) {
+        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        if ($shortcut.TargetPath -ne $exe -or $shortcut.Arguments -ne $arguments) {
+            $shortcut.TargetPath = $exe
+            $shortcut.Arguments = $arguments
+            $shortcut.IconLocation = "$exe,0"
+            $shortcut.Save()
+        }
+    }
+    if ($Updated) { $arguments += ' -Updated' }
+    $script:mutex.ReleaseMutex()
+    $script:mutex.Dispose()
+    Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $script:appDir
+    $true
 }
 
 # --- Running novacore -------------------------------------------------------
@@ -605,7 +910,7 @@ function Show-Output {
 
         $form = New-Object System.Windows.Forms.Form
         $form.Text = 'Novacore'
-        $form.Icon = $script:icons.Running
+        $form.Icon = $script:windowIcon
         $form.StartPosition = 'CenterScreen'
         $form.Size = New-Object System.Drawing.Size ([int] (760 * $scale)), ([int] (440 * $scale))
 
@@ -677,7 +982,7 @@ function New-Dialog([string] $title) {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = $title
     $form.Font = [System.Drawing.SystemFonts]::MessageBoxFont
-    $form.Icon = $script:icons.Running
+    $form.Icon = $script:windowIcon
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
@@ -957,6 +1262,9 @@ function Invoke-Safely([scriptblock] $block) {
     try { & $block } catch { Show-Problem $_ }
 }
 
+Invoke-Safely { Register-AppId }
+Invoke-Safely { if (Start-Launcher) { exit } }
+
 $script:onClick = { param($sender, $e) Invoke-Safely { Invoke-MenuAction $sender.Tag } }
 
 $script:menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -994,6 +1302,12 @@ $refresh = New-Object System.Windows.Forms.Timer
 $refresh.Interval = [Math]::Max(5, $RefreshInterval) * 1000
 $refresh.add_Tick({ Invoke-Safely { Update-Status } })
 $refresh.Start()
+
+# Follow the taskbar between light and dark.
+$theme = New-Object System.Windows.Forms.Timer
+$theme.Interval = 2000
+$theme.add_Tick({ Invoke-Safely { [void] (Update-Icons) } })
+$theme.Start()
 
 Update-View
 $script:notify.Visible = $true

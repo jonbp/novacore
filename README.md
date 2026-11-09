@@ -226,7 +226,7 @@ novacore tray install
 novacore tray uninstall
 ```
 
-It copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. After that it keeps itself up to date: when the script in the repo changes, for example after a `git pull`, the icon copies the new version and restarts. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`.
+It copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. After that it keeps itself up to date: when the script in the repo changes, for example after a `git pull`, the icon copies the new version and restarts. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
 
 The icon checks the status every 30 seconds, but only while your WSL distro is running, so it doesn't stop WSL from shutting down when it's idle. Opening the menu always checks, and that starts WSL if it isn't running.
 
