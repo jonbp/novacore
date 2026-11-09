@@ -1277,6 +1277,127 @@ cmd_trust() {
     echo
 }
 
+# windows_ps — run the PowerShell script on stdin on Windows. Encoding it saves
+# quoting it through WSL's interop, and lets it span lines.
+windows_ps() {
+    local script
+    # Without $ProgressPreference, progress such as "Preparing modules for
+    # first use" comes out as CLIXML.
+    script=$({ echo '$ProgressPreference = "SilentlyContinue"'; cat; } | iconv -f utf-8 -t utf-16le | base64 -w0)
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$script" | tr -d '\r'
+}
+
+# PowerShell that stops the tray icon if it's running.
+TRAY_STOP_PS='
+$ErrorActionPreference = "Stop"
+$dir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Novacore"
+$lnk = Join-Path ([Environment]::GetFolderPath("Startup")) "Novacore.lnk"
+$running = Get-CimInstance Win32_Process -Filter "Name = '"'powershell.exe'"'" |
+    Where-Object { $_.CommandLine -like "*novacore-tray.ps1*" }
+if ($running) {
+    $running | Invoke-CimMethod -MethodName Terminate | Out-Null
+    # Let its single-instance mutex go before a new one starts.
+    Start-Sleep -Milliseconds 500
+}
+'
+
+# Install the tray icon on Windows: copy the script to %LOCALAPPDATA%\Novacore,
+# start it from a shortcut in the Startup folder, and start it now. Run again
+# to update it after pulling a new version.
+tray_install() {
+    header "Installing the tray icon"
+    heading "Windows tray icon"
+    NC_SCRIPT=$(wslpath -w "$NOVACORE_ROOT/windows/novacore-tray.ps1") \
+    NC_DISTRO=$WSL_DISTRO_NAME \
+    NC_COMMAND="$NOVACORE_ROOT/bin/novacore" \
+    WSLENV=NC_SCRIPT:NC_DISTRO:NC_COMMAND \
+    windows_ps <<<"$TRAY_STOP_PS"'
+New-Item -ItemType Directory -Force $dir | Out-Null
+$ps1 = Join-Path $dir "novacore-tray.ps1"
+Copy-Item -LiteralPath $env:NC_SCRIPT -Destination $ps1 -Force
+
+# A headless console, so no window flashes up as PowerShell starts.
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$shortcut.TargetPath = Join-Path $env:WINDIR "System32\conhost.exe"
+$shortcut.Arguments = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden " +
+    "-File `"$ps1`" -Distro `"$env:NC_DISTRO`" -Command `"$env:NC_COMMAND`""
+$shortcut.WorkingDirectory = $dir
+$shortcut.Description = "Novacore tray icon"
+$shortcut.Save()
+Start-Process -FilePath $lnk
+' || fail "Couldn't install the tray icon"
+    result "Installed for the $WSL_DISTRO_NAME distro. It starts when you sign in to Windows"
+    complete Installed
+    echo
+}
+
+tray_uninstall() {
+    header "Removing the tray icon"
+    heading "Windows tray icon"
+    windows_ps <<<"$TRAY_STOP_PS"'
+Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+' || fail "Couldn't remove the tray icon"
+    result "Removed"
+    complete Removed
+    echo
+}
+
+# Where the tray icon's running command keeps its state: $L.log for its output,
+# $L.pid, $L.label and $L.done for the tray's messages, and $L.exit once done.
+tray_state() { echo "${TMPDIR:-/tmp}/novacore-tray-$(id -u)"; }
+
+# tray run LABEL DONE ARGS... — for the tray icon: run novacore ARGS detached,
+# so it finishes even if the tray icon stops or is reinstalled meanwhile.
+# WSL ends a wsl.exe call's processes when it exits, unless they're in a
+# session of their own, hence setsid -f.
+tray_run() {
+    (( $# >= 3 )) || fail "Usage: novacore tray run <label> <done> <command...>"
+    local L i
+    L=$(tray_state)
+    if [[ ! -f $L.exit && -f $L.pid ]] && kill -0 "$(cat "$L.pid")" 2>/dev/null; then
+        fail "Another novacore command from the tray icon is still running"
+    fi
+    rm -f "$L.exit" "$L.pid"
+    printf '%s' "$1" > "$L.label"
+    printf '%s' "$2" > "$L.done"
+    shift 2
+    # shellcheck disable=SC2016
+    setsid -f bash -c 'L=$1; shift; echo $$ > "$L.pid"; "$0" "$@" > "$L.log" 2>&1; echo $? > "$L.exit"' \
+        "$NOVACORE_ROOT/bin/novacore" "$L" "$@" < /dev/null > /dev/null 2>&1
+    # Wait for its PID, so a poll straight after this sees it running.
+    for (( i = 0; i < 50; i++ )); do [[ -s $L.pid ]] && return; sleep 0.1; done
+}
+
+# tray poll — for the tray icon: the command's exit code (blank while it
+# runs), "alive" or "dead", its label and done message, then its output.
+tray_poll() {
+    local L p
+    L=$(tray_state)
+    cat "$L.exit" 2>/dev/null || echo
+    p=$(cat "$L.pid" 2>/dev/null) || true
+    # Check the PID isn't empty: kill -0 "" would signal our own process group.
+    if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi
+    cat "$L.label" 2>/dev/null; echo
+    cat "$L.done" 2>/dev/null; echo
+    tail -n 200 "$L.log" 2>/dev/null || true
+}
+
+cmd_tray() {
+    case ${1:-} in
+        run)  shift; tray_run "$@"; return ;;
+        poll) tray_poll; return ;;
+    esac
+    is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]] || fail "The tray icon is for Windows, with Novacore in WSL" \
+        "On KDE Plasma, use the widget in plasmoid/ instead"
+    command -v powershell.exe >/dev/null || fail "Can't find powershell.exe" "Is Windows interop turned on in WSL?"
+    case ${1:-install} in
+        install)   tray_install ;;
+        uninstall) tray_uninstall ;;
+        *)         fail "Unknown option '$1'" "Usage: novacore tray [install|uninstall]" ;;
+    esac
+}
+
 usage() {
     cat <<'EOF'
 Usage: novacore <command> [options]
@@ -1293,6 +1414,7 @@ Stack:
   build [--all]               Rebuild images (--all builds every PHP version)
   prune [--cache]             Remove images of PHP versions no site uses
   trust                       Trust Novacore's local CA (one-off, uses sudo)
+  tray [install|uninstall]    Windows (WSL): add Novacore to the notification area
 
 Sites:
   site add <name> [--php X.Y] [--root DIR] [--no-db]
@@ -1331,6 +1453,7 @@ main() {
     case $cmd in
         help|-h|--help)       usage; return ;;
         version|-V|--version) echo "Novacore $(version)"; return ;;
+        tray)                 cmd_tray "$@"; return ;;
     esac
 
     check_docker

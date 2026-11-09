@@ -210,6 +210,21 @@ kpackagetool6 -t Plasma/Applet -i plasmoid   # use -u instead of -i to update it
 
 Then add **Novacore** to a panel or the desktop. The widget runs `novacore`, and it also looks in `~/.local/bin`. If the CLI is somewhere else, set the full path in the widget's settings.
 
+## Windows tray icon
+
+On Windows, with Novacore in WSL, you can add an icon to the taskbar's notification area. It does what the KDE widget does: it shows whether Novacore is running, lists your sites to open or switch PHP version, and starts, stops or restarts Novacore. Run this inside WSL:
+
+```sh
+novacore tray install     # run it again to update the icon after you pull
+novacore tray uninstall
+```
+
+It copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`.
+
+The icon checks the status every 30 seconds, but only while your WSL distro is running, so it doesn't stop WSL from shutting down when it's idle. Opening the menu always checks, and that starts WSL if it isn't running.
+
+Commands you start from the icon, like a PHP switch that builds a new image, run in WSL on their own, so they finish even if you quit or reinstall the icon. A notification tells you when one is done, and clicking a failure's notification shows its output. If the icon itself runs into a problem, it logs it to `%LOCALAPPDATA%\Novacore\tray.log`.
+
 ## How it works
 
 ```
@@ -222,6 +237,7 @@ sites.conf                 your sites (created on first `site add`)
 data/                      generated: vhosts, certificates, dashboard, compose overrides
 logs/                      PHP error log per site
 plasmoid/                  KDE Plasma widget
+windows/                   Windows tray icon (for WSL)
 ```
 
 The CLI reads `sites.conf` and generates three things in `data/`: an nginx vhost for each site, a certificate for each site, and a Compose override (`compose.generated.yml`). The override gives nginx a network alias for each domain, and shares your SSH agent with PHP. nginx reaches PHP through Docker's DNS when a request comes in, so a vhost that points at a PHP version that isn't running gives a 502 instead of stopping nginx from starting.
