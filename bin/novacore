@@ -1357,8 +1357,9 @@ cmd_trust() {
 # them what to show and what each item does, `tray run` and `tray poll` run a
 # command for them, and `tray submit` turns a dialog's answers into a command.
 # So a new menu item or dialog only needs adding here, in tray_menu. The JSON
-# is described in tray/PROTOCOL.md. The Plasma widget (tray/plasmoid/) lists the
-# sites itself, from `status --json`, but runs its commands the same way.
+# is described in tray/PROTOCOL.md. The Plasma widget (tray/plasmoid/), the
+# tray icon in KDE Plasma, draws the same menu as a panel, as macOS and Windows
+# do.
 #
 # Like the JSON functions they build on, these set REPLY.
 
@@ -2005,13 +2006,50 @@ pyside_hint() {
 # Add the tray icon to the app launcher and the autostart folder, and start it
 # now. It runs from the repo, so there's nothing to update after a git pull: it
 # restarts itself when its source changes.
+#
+# In KDE Plasma, the tray icon is the Plasma widget instead, in the system
+# tray, so a click opens the same panel as on macOS and Windows. The Python
+# icon is still set up for other desktops you log in to, but not for Plasma.
 linux_tray_install() {
     header "Installing the tray icon"
+    local python script="$NOVACORE_ROOT/tray/linux/novacore-tray.py" entry in_plasma=0 updated=0
+
+    if is_plasma; then
+        heading "KDE Plasma widget"
+        if kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
+            run kpackagetool6 -t Plasma/Applet -u "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't update the Plasma widget"
+            updated=1
+        else
+            run kpackagetool6 -t Plasma/Applet -i "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't install the Plasma widget"
+        fi
+        mkdir -p "$(dirname "$PLASMOID_ICON")"
+        cp "$NOVACORE_ROOT/tray/novacore.svg" "$PLASMOID_ICON"
+        # Plasma's system tray drops a widget that's uninstalled, which an
+        # update looks like to it, so give it a moment before adding it back.
+        (( ! updated )) || sleep 1
+        if plasma_tray add; then
+            in_plasma=1
+            result "In the system tray. Click it to open Novacore's panel"
+            # plasmashell keeps the QML it has loaded.
+            (( ! updated )) || hint "If it was already running, it picks up the update when Plasma restarts: systemctl --user restart plasma-plasmashell"
+        else
+            result "Installed. There's no system tray to put it in, so the tray icon below stands in for it"
+        fi
+    fi
+
     heading "Linux tray icon"
-    local python script="$NOVACORE_ROOT/tray/linux/novacore-tray.py" entry
-    command -v python3 >/dev/null || fail "The tray icon needs Python 3" "$(pyside_hint)"
-    python3 -c 'import PySide6.QtWidgets' 2>/dev/null || python3 -c 'import PyQt6.QtWidgets' 2>/dev/null ||
+    if ! command -v python3 >/dev/null ||
+        ! { python3 -c 'import PySide6.QtWidgets' 2>/dev/null || python3 -c 'import PyQt6.QtWidgets' 2>/dev/null; }; then
+        if (( in_plasma )); then
+            result "Skipped: it's for other desktops, and needs Qt for Python (PySide6 or PyQt6)"
+            hint "$(pyside_hint)"
+            complete Installed
+            echo
+            return
+        fi
+        command -v python3 >/dev/null || fail "The tray icon needs Python 3" "$(pyside_hint)"
         fail "The tray icon needs Qt for Python (PySide6 or PyQt6)" "$(pyside_hint)"
+    fi
     # The real interpreter, not a wrapper such as pyenv's, which can pick
     # another at login.
     python=$(python3 -c 'import sys; print(sys.executable)')
@@ -2027,11 +2065,17 @@ Terminal=false
 Categories=Development;
 StartupNotify=false
 X-GNOME-Autostart-enabled=true"
+    # Plasma has the widget instead.
+    (( ! in_plasma )) || entry+=$'\nNotShowIn=KDE;'
     mkdir -p "$(dirname "$LINUX_TRAY_APP")" "$(dirname "$LINUX_TRAY_AUTOSTART")"
     printf '%s\n' "$entry" > "$LINUX_TRAY_APP"
     printf '%s\n' "$entry" > "$LINUX_TRAY_AUTOSTART"
 
-    if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+    if (( in_plasma )); then
+        # One from before would show a second icon.
+        stop_linux_tray
+        result "Set up for other desktops. In Plasma, the widget takes its place"
+    elif [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
         result "Installed. It starts next time you log in to your desktop"
     else
         # It replaces one that's already running.
@@ -2041,42 +2085,69 @@ X-GNOME-Autostart-enabled=true"
     case ${XDG_CURRENT_DESKTOP:-} in
         *GNOME*) hint "GNOME shows it with the AppIndicator extension (gnome-shell-extension-appindicator)" ;;
     esac
-    if is_plasma; then
-        heading "KDE Plasma widget"
-        if kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
-            run kpackagetool6 -t Plasma/Applet -u "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't update the Plasma widget"
-            result "Updated. One already on a panel picks it up when Plasma restarts"
-        else
-            run kpackagetool6 -t Plasma/Applet -i "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't install the Plasma widget"
-            result "Installed. Add Novacore to a panel or the desktop from Add Widgets"
-        fi
-    fi
     complete Installed
     echo
 }
 
+# Stop the Linux tray icon, if it's running.
+stop_linux_tray() {
+    local pid
+    if pid=$(cat "$LINUX_TRAY_PID" 2>/dev/null) && [[ $pid =~ ^[0-9]+$ ]] &&
+        grep -q novacore-tray "/proc/$pid/cmdline" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+}
+
 PLASMOID_ID=com.github.jonbp.novacore
+# Novacore's icon in your icon theme, named after the widget, for Add Widgets
+# and the system tray's settings, which only take an icon's name.
+PLASMOID_ICON="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/$PLASMOID_ID.svg"
 
 # Whether this is a KDE Plasma session that can install the widget.
 is_plasma() {
     [[ :${XDG_CURRENT_DESKTOP:-}: == *:KDE:* ]] && command -v kpackagetool6 >/dev/null
 }
 
+# plasma_tray add|remove — add the widget to every system tray in Plasma's
+# panels, or take it out, through plasmashell's scripting. Adding fails if
+# there's no system tray, or plasmashell can't be reached.
+plasma_tray() {
+    local js reply
+    command -v dbus-send >/dev/null || return 1
+    js='var id = "'"$PLASMOID_ID"'", add = '"$([[ $1 == add ]] && echo true || echo false)"', n = 0;
+panels().forEach(function (panel) {
+    panel.widgets("org.kde.plasma.systemtray").forEach(function (tray) {
+        tray.currentConfigGroup = ["General"];
+        ["extraItems", "knownItems"].forEach(function (key) {
+            var value = String(tray.readConfig(key, "") || "");
+            var items = value ? value.split(",") : [];
+            var others = items.filter(function (item) { return item !== id; });
+            if (add) others.push(id);
+            if (others.join(",") !== items.join(",")) tray.writeConfig(key, others);
+        });
+        tray.reloadConfig();
+        n++;
+    });
+});
+print(n);'
+    reply=$(dbus-send --session --print-reply --dest=org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "string:$js" 2>/dev/null) || return 1
+    [[ $1 == remove || $reply =~ \"[1-9][0-9]*\" ]]
+}
+
 linux_tray_uninstall() {
     header "Removing the tray icon"
     heading "Linux tray icon"
-    local pid
-    if pid=$(cat "$LINUX_TRAY_PID" 2>/dev/null) && [[ $pid =~ ^[0-9]+$ ]] &&
-        grep -q novacore-tray "/proc/$pid/cmdline" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-    fi
+    stop_linux_tray
     rm -f "$LINUX_TRAY_APP" "$LINUX_TRAY_AUTOSTART" "$LINUX_TRAY_PID" \
         "$LINUX_TRAY_STATE/tray.log" "$LINUX_TRAY_STATE/tray.hash"
     rmdir "$LINUX_TRAY_STATE" 2>/dev/null || true
     result "Removed"
     if is_plasma && kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
         heading "KDE Plasma widget"
+        plasma_tray remove || true
         run kpackagetool6 -t Plasma/Applet -r "$PLASMOID_ID" || fail "Couldn't remove the Plasma widget"
+        rm -f "$PLASMOID_ICON"
         result "Removed"
     fi
     complete Removed

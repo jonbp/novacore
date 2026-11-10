@@ -10,7 +10,9 @@
 #
 # It's Python with Qt (PySide6, or PyQt6), whose tray icon is a
 # StatusNotifierItem: KDE Plasma, XFCE, Cinnamon and others show it, and GNOME
-# does with the AppIndicator extension. `novacore tray install` starts it from
+# does with the AppIndicator extension. In KDE Plasma, the Plasma widget in
+# tray/plasmoid/ sits in the system tray instead, and this steps aside
+# (widget_in_tray). `novacore tray install` starts it from
 # an autostart entry, straight from the repo, so there's nothing to build. It
 # restarts itself when this file changes, e.g. after a git pull
 # (check_for_update).
@@ -1098,6 +1100,24 @@ def replace_running():
         f.write(str(os.getpid()))
 
 
+PLASMOID_ID = "com.github.jonbp.novacore"
+
+
+def widget_in_tray():
+    """Whether this is KDE Plasma with Novacore's widget in its system tray,
+    as `novacore tray install` puts it there, so this would be a second icon."""
+    if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":"):
+        return False
+    config = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "plasma-org.kde.plasma.desktop-appletsrc")
+    try:
+        with open(config, encoding="utf-8", errors="replace") as f:
+            return any(line.startswith("extraItems=") and PLASMOID_ID in line.split("=", 1)[1].split(",")
+                       for line in f.read().splitlines())
+    except OSError:
+        return False
+
+
 def forget_pid():
     try:
         with open(PID_FILE) as f:
@@ -1111,6 +1131,9 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s %(message)s")
     sys.excepthook = lambda *exc: log.error("Unexpected error", exc_info=exc)
+    if widget_in_tray():
+        log.info("Novacore's Plasma widget is in the system tray, so not showing another icon")
+        return
     replace_running()
 
     QtGui.QGuiApplication.setDesktopFileName(APP_ID)

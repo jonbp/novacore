@@ -202,19 +202,19 @@ novacore help
 
 ## KDE Plasma widget
 
-`tray/plasmoid/` holds a Plasma 6 widget. It lists your sites, and you click one to open it. It can also switch a site's PHP version, open the dashboard or a site's folder, and start or stop Novacore.
+In KDE Plasma, Novacore's tray icon is a Plasma 6 widget, `tray/plasmoid/`, in the system tray. Clicking it opens the same panel as the [tray icons](#tray-icons) on macOS and Windows: Novacore's status, your sites, which expand to show what you can do with each, the server's controls, Xdebug and Tools. Dialogs such as **Add Site…** and **Info…**, and the output of the last command, open in the panel. A middle click opens the dashboard.
+
+`novacore tray install` installs the widget and puts it in the system tray, and adds Novacore's icon to your icon theme for it. You can also add **Novacore** to a panel or the desktop from Add Widgets, or install it by hand:
 
 ```sh
 kpackagetool6 -t Plasma/Applet -i tray/plasmoid   # use -u instead of -i to update it
 ```
 
-Then add **Novacore** to a panel or the desktop. The widget runs `novacore`, and it also looks in `~/.local/bin`. If the CLI is somewhere else, set the full path in the widget's settings.
-
-`novacore tray install` also installs or updates the widget when you run it in Plasma, alongside the [tray icon](#linux).
+The widget runs `novacore`, and it also looks in `~/.local/bin`. If the CLI is somewhere else, set the full path in the widget's settings. Plasma loads a widget's code when it starts, so after an update, restart it with `systemctl --user restart plasma-plasmashell` or log in again.
 
 ## Tray icons
 
-On Linux, macOS and Windows, Novacore can add an icon to the system tray or the menu bar. Like the KDE widget, it shows whether Novacore is running, and it starts, stops or restarts it. The colour of the small pill on the globe shows the status: green while running, grey when stopped, yellow while busy and red when something's wrong. The icon also covers most of the CLI:
+On Linux, macOS and Windows, Novacore can add an icon to the system tray or the menu bar (in KDE Plasma, that's the [Plasma widget](#kde-plasma-widget)). It shows whether Novacore is running, and it starts, stops or restarts it. The colour of the small pill on the globe shows the status: green while running, grey when stopped, yellow while busy and red when something's wrong. The icon also covers most of the CLI:
 
 - **Add Site…** asks for a name, PHP version and document root, and whether to create a database.
 - Each site's menu opens the site, its repository on GitHub, GitLab and the like (if it has a git remote), its folder, a terminal there, a shell in its PHP container, or its error log. It also switches the site's PHP version, and removes the site, optionally with its database.
@@ -234,9 +234,11 @@ Commands you start from the icon, like a PHP switch that builds a new image, run
 
 ### Linux
 
-The icon is a Python script, `tray/linux/novacore-tray.py`, using Qt for Python. Install PySide6 (or PyQt6) from your distro first, e.g. `sudo dnf install python3-pyside6`, `sudo apt install python3-pyside6.qtwidgets` or `sudo pacman -S pyside6`. `novacore tray install` adds **Novacore Tray** to your app launcher and to `~/.config/autostart`, so it starts when you log in, and starts it now. It runs straight from the repo, and restarts itself when the script changes. If you quit it, open **Novacore Tray** from your app launcher to start it again. In KDE Plasma, `tray install` also installs or updates the [Plasma widget](#kde-plasma-widget), and `tray uninstall` removes it.
+The icon is a Python script, `tray/linux/novacore-tray.py`, using Qt for Python. Install PySide6 (or PyQt6) from your distro first, e.g. `sudo dnf install python3-pyside6`, `sudo apt install python3-pyside6.qtwidgets` or `sudo pacman -S pyside6`. `novacore tray install` adds **Novacore Tray** to your app launcher and to `~/.config/autostart`, so it starts when you log in, and starts it now. It runs straight from the repo, and restarts itself when the script changes. If you quit it, open **Novacore Tray** from your app launcher to start it again.
 
-The icon shows up in KDE Plasma, XFCE, Cinnamon, LXQt and other desktops with a system tray. GNOME needs the AppIndicator extension, which Ubuntu includes. The menu opens with a left or right click. Terminals open in your desktop's own terminal, or the one in `$TERMINAL`. Notifications use `notify-send`, and clicking one opens the site or a failed command's output. Problems are logged to `~/.local/state/novacore/tray.log`.
+In KDE Plasma, `tray install` puts the [Plasma widget](#kde-plasma-widget) in the system tray instead, and sets up the Python icon only for other desktops you log in to. If Plasma has no system tray, it falls back to the Python icon. `tray uninstall` removes both.
+
+The icon shows up in XFCE, Cinnamon, LXQt and other desktops with a system tray. GNOME needs the AppIndicator extension, which Ubuntu includes. The menu opens with a left or right click. Terminals open in your desktop's own terminal, or the one in `$TERMINAL`. Notifications use `notify-send`, and clicking one opens the site or a failed command's output. Problems are logged to `~/.local/state/novacore/tray.log`.
 
 ### macOS
 
@@ -275,7 +277,7 @@ tray/                      the tray icons: their protocol, icons and build scrip
 tray/linux/                Linux tray icon
 tray/macos/                macOS menu bar icon
 tray/windows/              Windows tray icon (for WSL)
-tray/plasmoid/             KDE Plasma widget
+tray/plasmoid/             KDE Plasma widget (the tray icon in Plasma)
 ```
 
 The CLI reads `sites.conf` and generates three things in `data/`: an nginx vhost for each site, a certificate for each site, and a Compose override (`compose.generated.yml`). The override gives nginx a network alias for each domain, and shares your SSH agent with PHP. nginx reaches PHP through Docker's DNS when a request comes in, so a vhost that points at a PHP version that isn't running gives a 502 instead of stopping nginx from starting.

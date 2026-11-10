@@ -1,17 +1,21 @@
 {
     "KPlugin": {
         "Authors": [
-            { "Name": "Jon Beaumont-Pike" }
+            {
+                "Name": "Jon Beaumont-Pike"
+            }
         ],
         "Category": "System Information",
-        "Description": "List your Novacore sites and start or stop the stack",
-        "Icon": "network-server",
+        "Description": "Novacore's tray icon on KDE: start and stop Novacore, and open and manage your sites",
+        "Icon": "com.github.jonbp.novacore",
         "Id": "com.github.jonbp.novacore",
         "License": "MIT",
         "Name": "Novacore",
-        "Version": "1.0",
+        "Version": "2.0",
         "Website": "https://github.com/jonbp/novacore"
     },
     "KPackageStructure": "Plasma/Applet",
-    "X-Plasma-API-Minimum-Version": "6.0"
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
 }

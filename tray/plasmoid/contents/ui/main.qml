@@ -3,180 +3,425 @@ import QtQuick.Layouts
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents3
-import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as P5Support
 import org.kde.kirigami as Kirigami
 
+// Novacore's Plasma widget. In the system tray it's Novacore's tray icon on
+// KDE, in place of tray/linux/novacore-tray.py, and its popup is the panel the
+// macOS and Windows tray icons open. It can also sit on a panel or the desktop.
+//
+// Like the tray icons, it draws what the CLI describes: `novacore tray menu`
+// gives every item and what it does (see tray/PROTOCOL.md), so new features
+// belong in the CLI, not here. Commands that change something run through
+// `novacore tray run`, detached from plasmashell so a long build survives a
+// Plasma restart, and `novacore tray poll` says how one is doing.
 PlasmoidItem {
     id: root
 
     // metadata.json can only name a theme icon, so set Novacore's own here.
     Plasmoid.icon: Qt.resolvedUrl("../icons/novacore.svg")
+    // Shown in the tray, not tucked away with the inactive icons.
+    Plasmoid.status: PlasmaCore.Types.ActiveStatus
 
-    property bool loaded: false
-    property bool running: false
-    property bool busy: false
-    property bool watching: false
+    // The system tray draws its widgets' headings and keeps their icons square.
+    readonly property bool inTray: (Plasmoid.containmentDisplayHints
+        & (PlasmaCore.Types.ContainmentDrawsPlasmoidHeading | PlasmaCore.Types.ContainmentForcesSquarePlasmoids)) !== 0
+
+    property var model: null          // novacore tray menu, parsed
+    property string modelJson: ""
+    property string problem: ""       // why novacore tray menu failed
+    property bool refreshing: false
+    property bool polling: false
+    property var checkedAt: null      // when the menu last came in
+    property bool busy: false         // a command such as novacore up is running
+    property bool watching: false     // it has started, so poll it
     property string busyLabel: ""
-    property bool showLog: false
-    property bool logExpanded: false
-    property var logLines: []
-    property string error: ""
-    property string actionError: ""
-    property string dashboard: "https://localhost"
-    property var sites: []
-    property var phpVersions: []
-    property var builtPhp: []
+    property string actionUrl: ""
+    property var output: []           // the last command's output, as lines
+    property string unseen: ""        // output not yet looked at: done or failed
+    property string actionError: ""   // why the last command failed, while the popup's open
+    property var editors: ({})        // vscode and zed: the command for each, if installed
 
-    // Shown under the panel icon's title and in the popup's header.
+    // What the popup shows: the panel, or a page in front of it.
+    property string page: "main"      // main, form, info or output
+    property var pageSpec: null
+    property string expandedRow: ""   // the title of the row that's open
+
+    // Shown under the title on a horizontal panel, and in the popup's header.
     readonly property string statusText: busy ? busyLabel
-        : error ? i18n("Can't run novacore")
-        : !loaded ? ""
-        : running ? i18n("Running") : i18n("Stopped")
-    readonly property color statusColor: busy ? Kirigami.Theme.textColor
-        : error ? Kirigami.Theme.negativeTextColor
-        : running ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.disabledTextColor
+        : problem ? i18n("Can't run novacore")
+        : model === null ? i18n("Checking…")
+        : (model.status || "")
+    readonly property string problemText: problem || (model && model.problem) || ""
+    readonly property string iconState: busy ? "busy"
+        : problem ? "error"
+        : ["running", "stopped", "busy", "error"].includes(model && model.state) ? model.state : "stopped"
 
     // plasmashell's PATH often lacks ~/.local/bin, where the README links the CLI.
-    readonly property string novacore: 'PATH="$HOME/.local/bin:$PATH" ' + (Plasmoid.configuration.command || "novacore")
-    readonly property string statusCommand: novacore + " status --json"
+    readonly property string env: 'PATH="$HOME/.local/bin:$PATH"; export PATH; '
+    readonly property string cli: Plasmoid.configuration.command || "novacore"
+    readonly property string novacore: env + cli
 
-    // Actions run through `novacore tray run`, as the tray icons' do: detached
-    // from plasmashell, so a long build survives a Plasma restart. `novacore
-    // tray poll` then says how the action is doing (see tray/PROTOCOL.md).
-    readonly property string pollCommand: novacore + " tray poll"
+    // Runs in a terminal: set its title, go to the folder, then run the
+    // command, keeping the window open if it fails so its error can be read.
+    readonly property string terminalScript: `
+printf '\\033]0;%s\\007' "$1"
+cd -- "$2" || exit
+shift 2
+if [ $# -eq 0 ]; then exec "\${SHELL:-bash}"; fi
+"$@" || { echo; read -rp "Press Enter to close. "; }
+`
+
+    // --- Running commands ------------------------------------------------
+
+    property var pending: ({})
+    property int serial: 0
 
     function shellQuote(s) {
-        return "'" + s.replace(/'/g, "'\\''") + "'"
+        return "'" + String(s).replace(/'/g, "'\\''") + "'"
+    }
+
+    function clean(text) {
+        return text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "")
+    }
+
+    function withoutSymbols(line) {
+        return line.replace(/^[^\p{L}\p{N}]+/u, "").trim()
+    }
+
+    function withoutEllipsis(label) {
+        return label.endsWith("…") ? label.slice(0, -1) : label
+    }
+
+    // Run CMD in a shell, then call DONE(code, stdout, stderr). Each call gets
+    // its own source, so the same command can run twice.
+    function exec(cmd, done) {
+        serial += 1
+        const source = cmd + " #" + serial
+        pending[source] = done || null
+        executable.connectSource(source)
+    }
+
+    // The line that best explains a failure: the first on stderr, where
+    // novacore's errors go, else the first on stdout.
+    function errorLine(code, out, err) {
+        for (const text of [err, out]) {
+            const line = clean(text).split("\n").find(l => l.trim() !== "")
+            if (line) return withoutSymbols(line)
+        }
+        return i18n("novacore exited with code %1", code)
     }
 
     function refresh() {
-        executable.exec(statusCommand)
+        if (refreshing || busy) return
+        refreshing = true
+        exec(novacore + " tray menu", (code, out, err) => {
+            refreshing = false
+            if (code !== 0) {
+                problem = errorLine(code, out, err)
+                return
+            }
+            try {
+                const parsed = JSON.parse(out)
+                problem = ""
+                checkedAt = new Date()
+                // A new model rebuilds the panel, so only on a change.
+                if (out !== modelJson) {
+                    modelJson = out
+                    model = parsed
+                }
+            } catch (e) {
+                problem = i18n("Couldn't read novacore's output. Is the CLI up to date?")
+            }
+        })
     }
 
-    // Run a novacore command that changes something, showing its output as it goes.
-    function run(args, label) {
+    // Run a novacore command that changes something, such as up or php,
+    // through `novacore tray run`, and follow it with poll().
+    function startAction(args, label, done, url) {
+        if (busy) return
         busy = true
         watching = false
         busyLabel = label
+        actionUrl = url || ""
         actionError = ""
-        logLines = []
-        showLog = true
-        // No done message: the widget shows the outcome itself.
-        executable.exec(novacore + " tray run " + shellQuote(label) + " '' " + args)
+        output = []
+        unseen = ""
+        exec(novacore + " tray run " + [label, done || ""].concat(args).map(shellQuote).join(" "), (code, out, err) => {
+            if (code === 0) {
+                watching = true
+                return
+            }
+            // It didn't start, e.g. as another command is still running.
+            busy = false
+            notify(i18n("Couldn't start: %1", withoutEllipsis(label)), errorLine(code, out, err), "", false)
+        })
     }
 
-    function setRunning(up) {
-        run(up ? "up" : "down", up ? i18n("Starting Novacore…") : i18n("Stopping Novacore…"))
+    // Check on the running command: its output so far, or how it ended.
+    function poll() {
+        if (polling) return
+        polling = true
+        exec(novacore + " tray poll", (code, out) => {
+            polling = false
+            if (code !== 0) return  // Try again on the next tick.
+            const lines = clean(out).split("\n")
+            while (lines.length < 4) lines.push("")
+            const exit = lines[0].trim(), alive = lines[1] === "alive", label = lines[2], doneText = lines[3]
+            const log = lines.slice(4)
+            while (log.length && log[log.length - 1].trim() === "") log.pop()
+
+            if (exit === "" && alive) {
+                // Running, perhaps started before Plasma was.
+                busy = true
+                watching = true
+                if (label) busyLabel = label
+                output = log
+                return
+            }
+            // Finished. Only report it if we saw it running; otherwise it's an old one.
+            if (!busy) return
+            busy = false
+            watching = false
+            output = log
+            const looking = root.expanded && page === "output"
+            if (exit === "0") {
+                if (!looking) unseen = "done"
+                notify(i18n("Novacore"), doneText || i18n("Done: %1", withoutEllipsis(label)), actionUrl, false)
+            } else {
+                if (!looking) unseen = "failed"
+                let message = log.slice().reverse().find(l => l.trim().startsWith("✖"))
+                    || log.slice().reverse().find(l => l.trim() !== "")
+                if (exit === "") message = i18n("novacore stopped before it finished.")
+                notify(i18n("Couldn't finish: %1", withoutEllipsis(label)),
+                       message ? withoutSymbols(message) : i18n("novacore exited with code %1", exit), "", true)
+            }
+            refresh()
+        })
     }
 
-    function setPhp(site, version) {
-        run("php " + site + " " + version, builtPhp.includes(version)
-            ? i18n("Switching %1 to PHP %2…", site, version)
-            : i18n("Building PHP %1…", version))
-    }
-
-    function onPoll(out) {
-        const lines = out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split("\n")
-        const exit = lines[0].trim()
-        const alive = lines[1] === "alive"
-        const label = lines[2]
-        // lines[3] is the done message, which is for the tray icons.
-        const log = lines.slice(4)
-        while (log.length && log[log.length - 1].trim() === "") log.pop()
-
-        if (exit === "" && alive) {
-            // Running, perhaps started before Plasma restarted.
-            busy = true
-            watching = true
-            busyLabel = label
-            showLog = true
-            logLines = log
+    // A notification. Clicking one that SHOWS_OUTPUT shows the output, and
+    // one with a URL opens it. While the popup's open, a failure shows in it
+    // instead.
+    function notify(title, body, url, showsOutput) {
+        if (root.expanded) {
+            if (showsOutput) actionError = title + ": " + body
             return
         }
-        if (!busy || !watching) return
-
-        busy = false
-        watching = false
-        logLines = log
-        if (exit === "0") {
-            showLog = false
-        } else {
-            logExpanded = true
-            actionError = exit === "" ? i18n("novacore stopped before it finished.")
-                : (log.length ? log[log.length - 1] : i18n("novacore exited with code %1", exit))
-        }
-        refresh()
+        const icon = Qt.resolvedUrl("../icons/novacore.svg").toString().replace(/^file:\/\//, "")
+        let cmd = "notify-send --app-name=Novacore " + shellQuote("--icon=" + decodeURIComponent(icon))
+        if (url || showsOutput) cmd += " " + shellQuote("--action=default=" + (showsOutput ? i18n("Show Output") : i18n("Open")))
+        exec(cmd + " -- " + shellQuote(title) + " " + shellQuote(body), (code, out) => {
+            if (out.trim() === "default") {
+                if (showsOutput) showOutput()
+                else if (url) Qt.openUrlExternally(url)
+            } else if (code !== 0 && showsOutput) {
+                // No notifications, so don't let the failure go unseen.
+                actionError = title + ": " + body
+            }
+        })
     }
 
-    Component.onCompleted: executable.exec(pollCommand)
+    // --- Actions (see "Actions" in tray/PROTOCOL.md) ---------------------
+
+    // The name of an item's icon: its own, else one for what it does.
+    function itemIcon(spec) {
+        if (spec.icon) return spec.icon
+        const a = spec.action
+        if (!a) return ""
+        if (a.open !== undefined) return "site"
+        if (a.folder !== undefined) return "folder"
+        if (a.editor !== undefined) return "code"
+        if (a.terminal !== undefined || a.console !== undefined) return "terminal"
+        if (a.dialog === "info") return "info"
+        if (a.dialog === "form") return a.destructive ? "remove" : "add"
+        return a.tray || ""
+    }
+
+    // Breeze icons for the names in tray/PROTOCOL.md, and the panel's own.
+    readonly property var iconNames: ({
+        dashboard: "go-home", site: "globe", open: "open-link-symbolic", git: "vcs-branch",
+        info: "help-about", folder: "document-open-folder", code: "document-edit",
+        terminal: "utilities-terminal", log: "view-list-text", remove: "edit-delete", add: "list-add",
+        start: "media-playback-start", stop: "media-playback-stop", restart: "view-refresh",
+        bug: "tools-report-bug", tools: "tools", database: "server-database", output: "dialog-scripts",
+        refresh: "view-refresh", quit: "application-exit",
+    })
+
+    function themeIcon(name) {
+        return iconNames[name] || ""
+    }
+
+    function isShown(spec) {
+        const a = spec.action
+        if (a && a.editor !== undefined && !editors[a.app || "vscode"]) return false
+        // The widget lives in Plasma, so there's nothing to quit.
+        if (a && a.tray === "quit") return false
+        return true
+    }
+
+    function isEnabled(spec) {
+        if (spec.enabled === false) return false
+        if (busy && spec.idle) return false
+        if (spec.action && spec.action.tray === "output" && output.length === 0) return false
+        return true
+    }
+
+    function isDestructive(spec) {
+        return itemIcon(spec) === "remove" || !!(spec.action && spec.action.destructive)
+    }
+
+    function perform(action) {
+        if (!action) return
+        const title = action.title || "Novacore"
+        if (action.open !== undefined) {
+            Qt.openUrlExternally(action.open)
+            root.expanded = false
+        } else if (action.folder !== undefined) {
+            Qt.openUrlExternally("file://" + encodeURI(action.folder))
+            root.expanded = false
+        } else if (action.editor !== undefined) {
+            const editor = editors[action.app || "vscode"]
+            if (editor) launch([editor, action.editor])
+        } else if (action.terminal !== undefined) {
+            openTerminal(title, action.terminal, [])
+        } else if (action.console !== undefined) {
+            openTerminal(title, "$HOME", [cli].concat(action.console))
+        } else if (action.run !== undefined) {
+            startAction(action.run, action.label || i18n("Working…"), action.done || "", action.url || "")
+        } else if (action.dialog === "form" || action.dialog === "info") {
+            openPage(action.dialog, action)
+        } else if (action.tray === "output") {
+            showOutput()
+        } else if (action.tray === "refresh") {
+            refresh()
+        }
+    }
+
+    // Start ARGS on their own, so they outlive plasmashell.
+    function launch(args) {
+        exec(env + "setsid -f " + args.map(shellQuote).join(" ") + " </dev/null >/dev/null 2>&1", code => {
+            if (code !== 0) notify(i18n("Couldn't open %1", args[0].split("/").pop()), args.join(" "), "", false)
+        })
+        root.expanded = false
+    }
+
+    // A terminal in FOLDER, running ARGS if there are any: Konsole, or the
+    // one xdg-terminal-exec picks. FOLDER is $HOME for that.
+    function openTerminal(title, folder, args) {
+        const dir = folder === "$HOME" ? '"$HOME"' : shellQuote(folder)
+        exec(env + 't=$(command -v konsole || command -v xdg-terminal-exec || command -v x-terminal-emulator) || exit 3; '
+             + 'case $t in */konsole) set -- "$t" --workdir ' + dir + ' -e ;; */xdg-terminal-exec) set -- "$t" ;; *) set -- "$t" -e ;; esac; '
+             + 'setsid -f "$@" bash -c ' + shellQuote(terminalScript) + ' novacore ' + shellQuote(title) + ' ' + dir + ' '
+             + args.map(shellQuote).join(" ") + ' </dev/null >/dev/null 2>&1', code => {
+            if (code !== 0) notify(i18n("Couldn't open a terminal"), i18n("Install one, such as Konsole."), "", false)
+        })
+        root.expanded = false
+    }
+
+    // Find the editors the editor actions can name, as the tray icons do:
+    // on the PATH, or installed as a Flatpak.
+    function findEditors() {
+        exec(env + 'f() { for n; do case $n in *.*) for d in /var/lib/flatpak/exports/bin "$HOME/.local/share/flatpak/exports/bin"; do '
+             + '[ -x "$d/$n" ] && { echo "$d/$n"; return; }; done ;; *) p=$(command -v "$n") && case $p in */sbin/*) ;; '
+             + '*) echo "$p"; return ;; esac ;; esac; done; }; '
+             + 'echo "vscode=$(f code com.visualstudio.code)"; echo "zed=$(f zeditor zed dev.zed.Zed)"', (code, out) => {
+            const found = {}
+            for (const line of out.split("\n")) {
+                const at = line.indexOf("=")
+                if (at > 0 && line.slice(at + 1)) found[line.slice(0, at)] = line.slice(at + 1)
+            }
+            editors = found
+        })
+    }
+
+    function openPage(name, spec) {
+        pageSpec = spec
+        page = name
+        root.expanded = true
+    }
+
+    function showOutput() {
+        unseen = ""
+        openPage("output", null)
+    }
+
+    function closePage() {
+        page = "main"
+        pageSpec = null
+    }
+
+    // The first of the menu's items with ICON that's shown, for the
+    // right-click menu.
+    function findItem(icon) {
+        const items = (model && model.items) || []
+        return items.find(i => i.icon === icon && i.action && isShown(i)) || null
+    }
+
+    Component.onCompleted: {
+        findEditors()
+        poll()
+    }
+
+    onExpandedChanged: () => {
+        if (expanded) {
+            refresh()
+            if (page === "output") unseen = ""
+        } else {
+            // Start afresh next time, unless a command's output is up.
+            if (page !== "output") closePage()
+            actionError = ""
+        }
+    }
 
     toolTipMainText: "Novacore"
-    toolTipSubText: {
-        if (busy) return busyLabel
-        if (error) return i18n("Can't run novacore")
-        if (!loaded) return ""
-        if (!running) return i18n("Stopped")
-        return i18np("Running, %1 site", "Running, %1 sites", sites.length)
-    }
+    toolTipSubText: problemText ? statusText + "\n" + problemText : statusText
 
     Plasmoid.contextualActions: [
         PlasmaCore.Action {
-            text: root.running ? i18n("Stop Novacore") : i18n("Start Novacore")
-            icon.name: root.running ? "media-playback-stop" : "media-playback-start"
-            enabled: root.loaded && !root.busy
-            onTriggered: root.setRunning(!root.running)
+            readonly property var spec: root.findItem("start")
+            text: spec ? spec.label : ""
+            icon.name: "media-playback-start"
+            visible: spec !== null
+            enabled: spec !== null && root.isEnabled(spec)
+            onTriggered: root.perform(spec.action)
         },
         PlasmaCore.Action {
-            text: i18n("Open Dashboard")
-            icon.name: "internet-web-browser"
-            enabled: root.running
-            onTriggered: Qt.openUrlExternally(root.dashboard)
+            readonly property var spec: root.findItem("stop")
+            text: spec ? spec.label : ""
+            icon.name: "media-playback-stop"
+            visible: spec !== null
+            enabled: spec !== null && root.isEnabled(spec)
+            onTriggered: root.perform(spec.action)
+        },
+        PlasmaCore.Action {
+            readonly property var spec: root.findItem("restart")
+            text: spec ? spec.label : ""
+            icon.name: "view-refresh"
+            visible: spec !== null
+            enabled: spec !== null && root.isEnabled(spec)
+            onTriggered: root.perform(spec.action)
+        },
+        PlasmaCore.Action {
+            readonly property var spec: root.findItem("dashboard")
+            text: spec ? spec.label : ""
+            icon.name: "go-home"
+            visible: spec !== null
+            enabled: spec !== null && root.isEnabled(spec)
+            onTriggered: root.perform(spec.action)
         }
     ]
-
-    onExpandedChanged: if (root.expanded) refresh()
 
     P5Support.DataSource {
         id: executable
         engine: "executable"
         connectedSources: []
 
-        function exec(cmd) {
-            connectSource(cmd)
-        }
-
-        onNewData: (sourceName, data) => {
-            disconnectSource(sourceName)
-            const out = data["stdout"] || ""
-            const failed = data["exit code"] !== 0
-
-            if (sourceName === root.pollCommand) {
-                root.onPoll(out)
-                return
-            }
-            if (sourceName !== root.statusCommand) {
-                // run() has started its job; follow it from here.
-                root.watching = true
-                return
-            }
-
-            if (failed) {
-                root.error = (data["stderr"] || out).trim() || i18n("novacore exited with code %1", data["exit code"])
-                return
-            }
-            try {
-                const status = JSON.parse(out)
-                root.running = status.running
-                root.dashboard = status.dashboard
-                root.phpVersions = status.phpVersions || []
-                root.builtPhp = status.builtPhp || []
-                root.sites = status.sites
-                root.error = ""
-                root.loaded = true
-            } catch (e) {
-                root.error = i18n("Couldn't read novacore's output. Is the CLI up to date?")
-            }
+        onNewData: (source, data) => {
+            disconnectSource(source)
+            const done = root.pending[source]
+            delete root.pending[source]
+            if (done) done(data["exit code"], data["stdout"] || "", data["stderr"] || "")
         }
     }
 
@@ -192,48 +437,47 @@ PlasmoidItem {
         interval: 1000
         running: root.busy && root.watching
         repeat: true
-        onTriggered: executable.exec(root.pollCommand)
+        onTriggered: root.poll()
     }
 
-    // Novacore's icon. A horizontal panel also shows the title with the status
-    // (or the running action) under it; elsewhere there's no room for text, so
-    // a spinner sits in the icon's corner while an action runs.
+    // In the tray, the status icon the other tray icons show. On a horizontal
+    // panel, the title with the status under it, too.
     compactRepresentation: MouseArea {
         id: compact
 
-        readonly property bool horizontal: Plasmoid.formFactor === PlasmaCore.Types.Horizontal
+        readonly property bool horizontal: Plasmoid.formFactor === PlasmaCore.Types.Horizontal && !root.inTray
         property bool wasExpanded: false
 
         Layout.minimumWidth: horizontal ? row.implicitWidth
-            : Plasmoid.formFactor === PlasmaCore.Types.Vertical ? 0 : Kirigami.Units.gridUnit * 3
+            : Plasmoid.formFactor === PlasmaCore.Types.Vertical || root.inTray ? 0 : Kirigami.Units.gridUnit * 3
         Layout.minimumHeight: Plasmoid.formFactor === PlasmaCore.Types.Vertical ? width
-            : horizontal ? 0 : Kirigami.Units.gridUnit * 3
+            : horizontal || root.inTray ? 0 : Kirigami.Units.gridUnit * 3
 
         hoverEnabled: true
+        acceptedButtons: Qt.LeftButton | Qt.MiddleButton
         onPressed: wasExpanded = root.expanded
-        onClicked: root.expanded = !wasExpanded
+        onClicked: mouse => {
+            // A middle click opens the dashboard, as on other tray icons.
+            if (mouse.button === Qt.MiddleButton) {
+                const dashboard = root.findItem("dashboard")
+                if (dashboard && root.isEnabled(dashboard)) root.perform(dashboard.action)
+                return
+            }
+            root.expanded = !wasExpanded
+        }
 
         RowLayout {
             id: row
             anchors.fill: parent
             spacing: Kirigami.Units.smallSpacing
 
-            Kirigami.Icon {
-                source: Plasmoid.icon
-                active: compact.containsMouse
+            StatusIcon {
+                status: root.iconState
+                // On a panel or the desktop there's room for it to be bigger.
+                fill: root.inTray || compact.horizontal ? 16 / 22 : 0.8
                 Layout.fillHeight: true
                 Layout.fillWidth: !compact.horizontal
                 Layout.preferredWidth: compact.horizontal ? compact.height : -1
-
-                PlasmaComponents3.BusyIndicator {
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
-                    width: Math.round(parent.width * 0.6)
-                    height: width
-                    padding: 0
-                    visible: root.busy && !compact.horizontal
-                    running: visible
-                }
             }
 
             ColumnLayout {
@@ -251,7 +495,7 @@ PlasmoidItem {
                 PlasmaComponents3.Label {
                     visible: text !== ""
                     text: root.statusText
-                    color: root.statusColor
+                    opacity: 0.7
                     font: Kirigami.Theme.smallFont
                     elide: Text.ElideRight
                     Layout.fillWidth: true
@@ -260,260 +504,7 @@ PlasmoidItem {
         }
     }
 
-    fullRepresentation: PlasmaExtras.Representation {
-        Layout.minimumWidth: Kirigami.Units.gridUnit * 18
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 12
-        Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 20
-        collapseMarginsHint: true
-
-        header: PlasmaExtras.PlasmoidHeading {
-            RowLayout {
-                anchors.fill: parent
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Icon {
-                    source: Plasmoid.icon
-                    Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
-                    Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
-                    Layout.leftMargin: Kirigami.Units.smallSpacing
-                }
-
-                Kirigami.Heading {
-                    level: 2
-                    text: "Novacore"
-                }
-
-                PlasmaComponents3.Label {
-                    visible: root.loaded && !root.error
-                    text: root.statusText
-                    color: root.statusColor
-                    elide: Text.ElideRight
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                }
-
-                PlasmaComponents3.BusyIndicator {
-                    visible: root.busy
-                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
-                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
-                }
-
-                PlasmaComponents3.ToolButton {
-                    icon.name: "internet-web-browser"
-                    enabled: root.running
-                    onClicked: Qt.openUrlExternally(root.dashboard)
-                    PlasmaComponents3.ToolTip { text: i18n("Open dashboard") }
-                }
-
-                PlasmaComponents3.ToolButton {
-                    icon.name: root.running ? "media-playback-stop" : "media-playback-start"
-                    enabled: root.loaded && !root.busy
-                    onClicked: root.setRunning(!root.running)
-                    PlasmaComponents3.ToolTip { text: root.running ? i18n("Stop Novacore") : i18n("Start Novacore") }
-                }
-
-                PlasmaComponents3.ToolButton {
-                    icon.name: "view-refresh"
-                    enabled: !root.busy
-                    onClicked: root.refresh()
-                    PlasmaComponents3.ToolTip { text: i18n("Refresh") }
-                }
-            }
-        }
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
-
-            Kirigami.InlineMessage {
-                Layout.fillWidth: true
-                Layout.margins: Kirigami.Units.smallSpacing
-                visible: root.actionError !== ""
-                type: Kirigami.MessageType.Error
-                text: root.actionError
-                showCloseButton: true
-                onVisibleChanged: if (!visible) root.actionError = ""
-            }
-
-            PlasmaComponents3.ScrollView {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-
-                ListView {
-                    id: list
-                    model: root.error ? [] : root.sites
-                    clip: true
-                    spacing: Kirigami.Units.smallSpacing
-                    topMargin: Kirigami.Units.smallSpacing
-                    bottomMargin: Kirigami.Units.smallSpacing
-
-                    delegate: PlasmaComponents3.ItemDelegate {
-                        id: row
-                        required property var modelData
-                        width: ListView.view.width
-                        onClicked: Qt.openUrlExternally(modelData.url)
-
-                        PlasmaComponents3.ToolTip { text: i18n("Open %1", row.modelData.url) }
-
-                        contentItem: RowLayout {
-                            spacing: Kirigami.Units.largeSpacing
-
-                            Kirigami.Icon {
-                                source: "applications-internet"
-                                Layout.preferredWidth: Kirigami.Units.iconSizes.medium
-                                Layout.preferredHeight: Kirigami.Units.iconSizes.medium
-                            }
-
-                            ColumnLayout {
-                                spacing: 0
-                                Layout.fillWidth: true
-
-                                PlasmaComponents3.Label {
-                                    text: row.modelData.name
-                                    font.weight: Font.Bold
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                }
-                                PlasmaComponents3.Label {
-                                    text: row.modelData.url.replace("https://", "")
-                                    font: Kirigami.Theme.smallFont
-                                    opacity: 0.7
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                }
-                            }
-
-                            PlasmaComponents3.ComboBox {
-                                model: root.phpVersions
-                                currentIndex: root.phpVersions.indexOf(row.modelData.php)
-                                displayText: "PHP " + currentText
-                                enabled: !root.busy && root.phpVersions.length > 0
-                                onActivated: index => {
-                                    const version = root.phpVersions[index]
-                                    if (version !== row.modelData.php) root.setPhp(row.modelData.name, version)
-                                }
-                                PlasmaComponents3.ToolTip { text: i18n("PHP version") }
-                            }
-
-                            PlasmaComponents3.ToolButton {
-                                icon.name: "folder-open"
-                                onClicked: Qt.openUrlExternally("file://" + row.modelData.path)
-                                PlasmaComponents3.ToolTip { text: i18n("Open site folder") }
-                            }
-                        }
-                    }
-
-                    PlasmaExtras.PlaceholderMessage {
-                        anchors.centerIn: parent
-                        width: parent.width - Kirigami.Units.gridUnit * 4
-                        visible: list.count === 0 && (root.loaded || root.error)
-                        iconName: root.error ? "dialog-error" : Plasmoid.icon
-                        text: root.error ? i18n("Can't run novacore") : i18n("No sites yet")
-                        explanation: root.error
-                            ? root.error + "\n\n" + i18n("Check the command in the widget's settings.")
-                            : i18n("Add one with: novacore site add <name>")
-                    }
-                }
-            }
-
-            // Live output of the running action, like a small terminal. Collapsed,
-            // it shows just the latest line.
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: root.logExpanded ? Kirigami.Units.gridUnit * 10
-                    : output.implicitHeight + Kirigami.Units.smallSpacing * 2
-                Layout.margins: Kirigami.Units.smallSpacing
-                visible: root.showLog
-                color: "#1b1e20"
-                radius: Kirigami.Units.cornerRadius
-
-                ColumnLayout {
-                    id: output
-                    anchors.fill: parent
-                    anchors.margins: Kirigami.Units.smallSpacing
-                    spacing: Kirigami.Units.smallSpacing
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
-                            spacing: 0
-                            Layout.fillWidth: true
-
-                            PlasmaComponents3.Label {
-                                text: root.busy ? root.busyLabel : i18n("Output")
-                                color: "#fcfcfc"
-                                font: Kirigami.Theme.smallFont
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-
-                            Text {
-                                visible: !root.logExpanded
-                                text: root.logLines.length ? root.logLines[root.logLines.length - 1] : i18n("Waiting for output…")
-                                color: "#a0a4a7"
-                                font.family: Kirigami.Theme.fixedWidthFont.family
-                                font.pointSize: Kirigami.Theme.smallFont.pointSize
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-
-                            TapHandler {
-                                onTapped: root.logExpanded = !root.logExpanded
-                            }
-                        }
-
-                        PlasmaComponents3.ToolButton {
-                            icon.name: root.logExpanded ? "arrow-down" : "arrow-up"
-                            icon.color: "#fcfcfc"
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small + Kirigami.Units.smallSpacing * 2
-                            Layout.preferredWidth: Layout.preferredHeight
-                            onClicked: root.logExpanded = !root.logExpanded
-                            PlasmaComponents3.ToolTip { text: root.logExpanded ? i18n("Collapse output") : i18n("Expand output") }
-                        }
-
-                        PlasmaComponents3.ToolButton {
-                            visible: !root.busy
-                            icon.name: "window-close"
-                            icon.color: "#fcfcfc"
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small + Kirigami.Units.smallSpacing * 2
-                            Layout.preferredWidth: Layout.preferredHeight
-                            onClicked: root.showLog = false
-                            PlasmaComponents3.ToolTip { text: i18n("Hide output") }
-                        }
-                    }
-
-                    ListView {
-                        id: log
-                        visible: root.logExpanded
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-                        model: root.logLines
-                        onModelChanged: Qt.callLater(positionViewAtEnd)
-                        onVisibleChanged: if (visible) Qt.callLater(positionViewAtEnd)
-
-                        delegate: Text {
-                            required property string modelData
-                            width: ListView.view.width
-                            text: modelData
-                            color: "#d0d4d7"
-                            font.family: Kirigami.Theme.fixedWidthFont.family
-                            font.pointSize: Kirigami.Theme.smallFont.pointSize
-                            wrapMode: Text.WrapAnywhere
-                        }
-
-                        PlasmaComponents3.Label {
-                            anchors.centerIn: parent
-                            visible: log.count === 0
-                            text: i18n("Waiting for output…")
-                            color: "#a0a4a7"
-                            font: Kirigami.Theme.smallFont
-                        }
-                    }
-                }
-            }
-        }
+    fullRepresentation: FullRepresentation {
+        tray: root
     }
 }

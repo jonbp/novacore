@@ -1,6 +1,6 @@
 # Tray icon protocol
 
-Novacore has three tray icons: the Linux tray icon (`tray/linux/novacore-tray.py`), the macOS menu bar icon (`tray/macos/NovacoreTray.swift`) and the Windows tray icon (`tray/windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
+Novacore has four tray icons: the Linux tray icon (`tray/linux/novacore-tray.py`), the KDE Plasma widget, which takes its place in Plasma's system tray (`tray/plasmoid/`), the macOS menu bar icon (`tray/macos/NovacoreTray.swift`) and the Windows tray icon (`tray/windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
 
 ## Adding a feature
 
@@ -15,7 +15,7 @@ To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
 | Command | Output |
 |---|---|
 | `tray menu` | The menu, as JSON (see below). It exits 0 even when Docker is unreachable, and says why in `problem`. |
-| `tray run LABEL DONE ARGS…` | Runs `novacore ARGS…` detached, so it finishes even if the icon quits. It fails if another command from the tray is still running. The Plasma widget runs its commands this way too. |
+| `tray run LABEL DONE ARGS…` | Runs `novacore ARGS…` detached, so it finishes even if the icon quits. It fails if another command from the tray is still running. |
 | `tray poll` | The running command's state, one item per line: the exit code (blank while it runs), `alive` or `dead`, LABEL, DONE, then its output. |
 | `tray submit FORM ID=VALUE…` | Runs the command that a form stands for, with the form's answers. |
 
@@ -51,7 +51,7 @@ An item has these keys:
 | `icon` | The name of a picture to show beside it (see below). |
 | `detail` | A second line of text under the label, such as a site's URL and PHP version. |
 
-`icon` and `detail` are for icons that draw a panel rather than a menu: the Windows and macOS ones. The Linux one leaves them out. Without an `icon`, a panel picks a picture from the item's action. The names are `dashboard`, `site` (a submenu for a site, shown with its initials), `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
+`icon` and `detail` are for icons that draw a panel rather than a menu: the Plasma widget, and the Windows and macOS ones. The Linux one leaves them out. Without an `icon`, a panel picks a picture from the item's action. The names are `dashboard`, `site` (a submenu for a site, shown with its initials), `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
 
 The panels lay the menu out like this, so it suits any menu that follows these conventions: if the first item is bold and has an action, clicking the panel's heading does it, instead of it having a row; commands that run (`run`) next to each other become a row of buttons; the icon's own commands (`tray`) go along the bottom; a submenu's bold item becomes a button on its row. A group of options, one of them checked and none with an `icon`, such as PHP versions, is a box to pick from (a pop-up button on macOS), captioned with the label of the separator before it. A submenu that is only options, such as Xdebug's, opens them as a menu. Any other submenu is a row that expands to show its items as links, two to a line, each group that its separators make starting a new line. A destructive item, one whose `icon` is `remove` or whose form is `destructive`, is a button at the bottom instead.
 
@@ -69,7 +69,7 @@ An action has one of these keys:
 | `{"run": [ARGS…], "label": L, "done": D, "url": U}` | Runs `novacore ARGS…` through `tray run`. L shows while it runs, and D is the notification when it's done. Clicking that notification opens U, if it's set. If the command fails, the notification shows its error, and clicking it shows the output. |
 | `{"dialog": "form", …}` | Shows a form (see below). |
 | `{"dialog": "info", …}` | Shows details to copy (see below). |
-| `{"tray": "output" \| "refresh" \| "quit"}` | The icon's own commands. `output` is greyed out until there's some output to show. |
+| `{"tray": "output" \| "refresh" \| "quit"}` | The icon's own commands. `output` is greyed out until there's some output to show. The Plasma widget leaves out `quit`, as it's part of Plasma. |
 
 ## Form dialogs
 
