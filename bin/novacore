@@ -588,6 +588,10 @@ start_services() {
     run compose up -d --wait --remove-orphans "${services[@]}" ||
         fail "Couldn't start the containers" "Run novacore logs to see why"
     compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    # The init script grants this on first run, but it can fail silently (e.g. a
+    # bind mount Docker Desktop won't let the entrypoint read), so ensure it here.
+    db_sql -e "GRANT ALL PRIVILEGES ON *.* TO \`$DB_USER\`@'%' WITH GRANT OPTION" ||
+        warn "Couldn't give $DB_USER access to all databases"
     # The reload signal returns before old workers retire; give them a moment.
     sleep 0.5
     result "Running $(join ', ' "${services[@]}")"
