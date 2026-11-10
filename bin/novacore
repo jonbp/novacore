@@ -4,6 +4,9 @@
 # Run `novacore help` for usage.
 
 set -euo pipefail
+# Bash 5.2+ treats & in a ${var//pattern/replacement} as the matched text; we
+# want it literal.
+shopt -u patsub_replacement 2>/dev/null || true
 
 NOVACORE_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 cd "$NOVACORE_ROOT"
@@ -105,10 +108,13 @@ result() {
     printf '  %s%s\n' "$(color "$symbol $1" "$c")" "$time"
 }
 
+# note TEXT [SGR] — an indented line, gray unless given a colour.
+note() { printf '  %s\n' "$(color "$1" "${2:-90}")"; }
+
 # A warning within a task.
 warn() {
     clear_line
-    printf '  %s\n' "$(color "! $*" 33)"
+    note "! $*" 33
 }
 
 # message TITLE MESSAGE [COLOR] — a standalone note.
@@ -182,11 +188,21 @@ run() {
 
 compose() { docker compose "$@"; }
 
+# has_line LINES LINE — whether LINE is one of LINES.
+has_line() { [[ $'\n'$1$'\n' == *$'\n'$2$'\n'* ]]; }
+
+# services [DOCKER PS OPTION...] — the services with a running container, one
+# per line, or with -a, with any container. This asks Docker rather than
+# Compose, which takes three times as long to read its files and answer.
+services() {
+    docker ps "$@" --filter label=com.docker.compose.project=novacore \
+        --format '{{.Label "com.docker.compose.service"}}'
+}
+
 # Fail early with a useful message when Docker isn't usable.
 check_docker() {
     command -v docker >/dev/null || fail "Docker isn't installed" "See https://docs.docker.com/engine/install/"
-    # Also tells us which Docker this is, e.g. "Docker Desktop" (see ssh_agent_source).
-    DOCKER_OS=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null) && return
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1 && return
 
     local sock=/var/run/docker.sock user
     user=$(id -un)
@@ -204,24 +220,31 @@ check_docker() {
 
 # --- Environment -------------------------------------------------------------
 
+# rewrite FILE AWK-ARGUMENT... — pass FILE through awk, in place. The file is
+# written over rather than replaced, so it keeps its owner, mode and links.
+rewrite() {
+    local file=$1 tmp
+    shift
+    tmp=$(mktemp)
+    awk "$@" "$file" > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
 # env_set KEY VALUE — update KEY in .env, appending it if missing.
 env_set() {
-    local key=$1 value=$2 tmp
-    tmp=$(mktemp)
-    awk -v k="$key" -v v="$value" '
+    rewrite .env -v k="$1" -v v="$2" '
         index($0, k "=") == 1 { print k "=" v; found = 1; next }
         { print }
-        END { if (!found) print k "=" v }' .env > "$tmp"
-    cat "$tmp" > .env
-    rm -f "$tmp"
-    export "$key=$value"
+        END { if (!found) print k "=" v }'
+    export "$1=$2"
 }
 
 load_env() {
     if [[ ! -f .env ]]; then
         cp .env.example .env
         env_set NOVACORE_UID "$(id -u)"
-        env_set NOVACORE_GID "$(id -g "$(id -un)")"
+        env_set NOVACORE_GID "$(id -g)"
         message Note "Created .env. Edit it to change the ports, the default PHP and more."
     fi
     set -a
@@ -237,6 +260,9 @@ load_env() {
     DB_USER=${DB_USER:-novacore}
     DB_PASSWORD=${DB_PASSWORD:-novacore}
     DB_PORT=${DB_PORT:-3306}
+    # What DB_HOST is outside Novacore: MariaDB's published port.
+    HOST_DB_HOST=127.0.0.1
+    [[ $DB_PORT == 3306 ]] || HOST_DB_HOST+=":$DB_PORT"
 
     case $SITES_DIR in
         /*) SITES_PATH=$SITES_DIR ;;
@@ -248,47 +274,58 @@ load_env() {
     export COMPOSE_FILE="docker-compose.yml:data/compose.generated.yml"
     export COMPOSE_PROFILES=php
 
-    mkdir -p "$DATA_DIR/certs" "$DATA_DIR/nginx/sites" "$DATA_DIR/nginx/www" "$LOGS_DIR"
+    [[ -d $DATA_DIR/certs && -d $DATA_DIR/nginx/sites && -d $DATA_DIR/nginx/www && -d $LOGS_DIR ]] ||
+        mkdir -p "$DATA_DIR/certs" "$DATA_DIR/nginx/sites" "$DATA_DIR/nginx/www" "$LOGS_DIR"
+    load_sites
     [[ -f $DATA_DIR/compose.generated.yml ]] || write_overrides
 }
 
 # --- Sites -------------------------------------------------------------------
 
-# Print "name php root" for each site in sites.conf ("-" means default/auto).
-sites() {
+# Read sites.conf into arrays with an entry per site: SITE_NAMES, SITE_PHP (its
+# PHP version), SITE_ROOT (its document root, relative to its folder),
+# SITE_ROOT_CONF (the root as sites.conf has it, where "-" auto-detects),
+# SITE_DOMAIN and SITE_DB (its database). They're read once, rather than each
+# time something asks about a site, so run this again after changing
+# sites.conf or DEFAULT_PHP.
+load_sites() {
+    SITE_NAMES=() SITE_PHP=() SITE_ROOT=() SITE_ROOT_CONF=() SITE_DOMAIN=() SITE_DB=()
     [[ -f $SITES_CONF ]] || return 0
-    awk '{ sub(/#.*/, "") } NF { print $1, (NF >= 2 ? $2 : "-"), (NF >= 3 ? $3 : "-") }' "$SITES_CONF"
+    local line name php conf root d rest
+    while IFS= read -r line || [[ -n $line ]]; do
+        read -r name php conf rest <<<"${line%%#*}" || true
+        [[ -n $name ]] || continue
+        [[ ${php:--} != - ]] || php=$DEFAULT_PHP
+        # "-" auto-detects common layouts, else the folder itself.
+        root=${conf:=-}
+        if [[ $root == - ]]; then
+            root=.
+            for d in public web public_html htdocs; do
+                if [[ -d $SITES_PATH/$name/$d ]]; then root=$d; break; fi
+            done
+        fi
+        SITE_NAMES+=("$name")
+        SITE_PHP+=("$php")
+        SITE_ROOT+=("$root")
+        SITE_ROOT_CONF+=("$conf")
+        SITE_DOMAIN+=("$name.$NOVACORE_TLD")
+        SITE_DB+=("${name//[-.]/_}")
+    done < "$SITES_CONF"
 }
 
-site_names() { sites | awk '{ print $1 }'; }
-site_exists() { sites | awk -v n="$1" '$1 == n { f = 1 } END { exit !f }'; }
-site_field() { sites | awk -v n="$1" -v i="$2" '$1 == n { print $i }'; }
-
-site_php() {
-    local v
-    v=$(site_field "$1" 2)
-    [[ $v == - ]] && v=$DEFAULT_PHP
-    echo "$v"
+# site_index NAME — SITE = the site's index in the SITE_ arrays. Fails if
+# there's no such site.
+site_index() {
+    for (( SITE = 0; SITE < ${#SITE_NAMES[@]}; SITE++ )); do
+        [[ ${SITE_NAMES[SITE]} != "$1" ]] || return 0
+    done
+    return 1
 }
 
-# The document root relative to the site folder; "-" auto-detects common layouts.
-site_root() {
-    local name=$1 root d
-    root=$(site_field "$name" 3)
-    if [[ $root == - ]]; then
-        root=.
-        for d in public web public_html htdocs; do
-            if [[ -d $SITES_PATH/$name/$d ]]; then root=$d; break; fi
-        done
-    fi
-    echo "$root"
-}
-
-domain()      { echo "$1.$NOVACORE_TLD"; }
 php_service() { echo "php${1//./}"; }
-db_name()     { echo "${1//[-.]/_}"; }
 
-require_site() { site_exists "$1" || fail "No site called '$1'" "Run novacore site list to see your sites"; }
+# require_site NAME — fail unless the site exists. Sets SITE, like site_index.
+require_site() { site_index "$1" || fail "No site called '$1'" "Run novacore site list to see your sites"; }
 
 check_name() {
     [[ $1 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
@@ -319,37 +356,24 @@ EOF
 # sites_conf_set NAME PHP ROOT — replace the site's line, or append one.
 sites_conf_set() {
     sites_conf_init
-    local line tmp
-    line=$(printf '%-15s %-7s %s' "$1" "$2" "$3")
-    tmp=$(mktemp)
-    awk -v n="$1" -v line="$line" '
+    rewrite "$SITES_CONF" -v n="$1" -v line="$(printf '%-15s %-7s %s' "$1" "$2" "$3")" '
         { s = $0; sub(/#.*/, "", s); split(s, f) }
         f[1] == n { if (!done) print line; done = 1; next }
         { print }
-        END { if (!done) print line }' "$SITES_CONF" > "$tmp"
-    cat "$tmp" > "$SITES_CONF"
-    rm -f "$tmp"
+        END { if (!done) print line }'
+    load_sites
 }
 
 sites_conf_remove() {
-    local tmp
-    tmp=$(mktemp)
-    awk -v n="$1" '{ s = $0; sub(/#.*/, "", s); split(s, f) } f[1] != n' "$SITES_CONF" > "$tmp"
-    cat "$tmp" > "$SITES_CONF"
-    rm -f "$tmp"
+    rewrite "$SITES_CONF" -v n="$1" '{ s = $0; sub(/#.*/, "", s); split(s, f) } f[1] != n'
+    load_sites
 }
 
 # --- Generated config --------------------------------------------------------
 
+# The PHP versions in use: each site's, and DEFAULT_PHP.
 needed_php() {
-    {
-        echo "$DEFAULT_PHP"
-        local name php root
-        while read -r name php root; do
-            [[ $php == - ]] && php=$DEFAULT_PHP
-            echo "$php"
-        done < <(sites)
-    } | sort -uV
+    printf '%s\n' "$DEFAULT_PHP" ${SITE_PHP[@]+"${SITE_PHP[@]}"} | sort -uV
 }
 
 needed_services() {
@@ -360,18 +384,18 @@ needed_services() {
 # PHP versions no site uses (nor DEFAULT_PHP), e.g. after switching a site.
 unused_php() {
     local needed v
-    needed=" $(needed_php | tr '\n' ' ') "
+    needed=$(needed_php)
     for v in "${SUPPORTED_PHP[@]}"; do
-        if [[ $needed != *" $v "* ]]; then echo "$v"; fi
+        has_line "$needed" "$v" || echo "$v"
     done
 }
 
 # PHP services with a container, running or not, that no site uses.
 unused_php_containers() {
     local existing v
-    existing=" $(compose ps -a --services 2>/dev/null | tr '\n' ' ') "
+    existing=$(services -a 2>/dev/null) || true
     for v in $(unused_php); do
-        if [[ $existing == *" $(php_service "$v") "* ]]; then php_service "$v"; fi
+        if has_line "$existing" "$(php_service "$v")"; then php_service "$v"; fi
     done
 }
 
@@ -388,24 +412,20 @@ remove_unused_containers() {
 }
 
 ensure_certs() {
-    local missing=() name d
-    [[ -f $DATA_DIR/certs/localhost.crt ]] || missing+=(localhost)
-    for name in $(site_names); do
-        d=$(domain "$name")
+    local missing=() d
+    for d in localhost ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"}; do
         [[ -f $DATA_DIR/certs/$d.crt ]] || missing+=("$d")
     done
     (( ${#missing[@]} )) || return 0
-    run compose run --rm --no-deps -T --user "$(id -u):$(id -g "$(id -un)")" \
+    run compose run --rm --no-deps -T --user "$(id -u):$(id -g)" \
         --entrypoint novacore-cert nginx "${missing[@]}" ||
         fail "Couldn't issue certificates"
     result "Issued $(count ${#missing[@]} certificate certificates): $(join ', ' "${missing[@]}")"
 }
 
+# write_vhost INDEX — a site's nginx config.
 write_vhost() {
-    local name=$1 php root dom docroot
-    php=$(site_php "$name")
-    root=$(site_root "$name")
-    dom=$(domain "$name")
+    local name=${SITE_NAMES[$1]} php=${SITE_PHP[$1]} root=${SITE_ROOT[$1]} dom=${SITE_DOMAIN[$1]} docroot
     docroot="/var/www/sites/$name"
     [[ $root == . ]] || docroot+="/${root#./}"
 
@@ -464,18 +484,25 @@ EOF
 # sockets can't be mounted directly; they forward the agent to a fixed path
 # instead. Docker Engine on Linux, and Docker Desktop's WSL2 integration on
 # Windows (the VM is WSL's own), can mount $SSH_AUTH_SOCK as it is.
+#
+# Sets SSH_AGENT, empty for nowhere. It's worked out once, as asking which
+# Docker this is takes a moment.
 ssh_agent_source() {
-    if [[ $DOCKER_OS =~ Docker\ Desktop|OrbStack ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
-        echo /run/host-services/ssh-auth.sock
+    [[ -z ${SSH_AGENT+set} ]] || return 0
+    local os
+    os=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null) || true
+    SSH_AGENT=''
+    if [[ $os =~ Docker\ Desktop|OrbStack ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
+        SSH_AGENT=/run/host-services/ssh-auth.sock
     elif [[ -S ${SSH_AUTH_SOCK:-} ]]; then
-        echo "$SSH_AUTH_SOCK"
+        SSH_AGENT=$SSH_AUTH_SOCK
     fi
 }
 
 # Docker Compose overrides that depend on the sites and on this machine.
 write_overrides() {
-    local name found=0 agent v
-    agent=$(ssh_agent_source)
+    local d v
+    ssh_agent_source
     {
         echo "# Generated by novacore. Do not edit."
         echo "services:"
@@ -487,24 +514,21 @@ write_overrides() {
         echo "    networks:"
         echo "      novacore:"
         echo "        aliases:"
-        for name in $(site_names); do
-            echo "          - $(domain "$name")"
-            found=1
-        done
-        (( found )) || echo "          - novacore.$NOVACORE_TLD"
+        for d in ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"}; do echo "          - $d"; done
+        (( ${#SITE_DOMAIN[@]} )) || echo "          - novacore.$NOVACORE_TLD"
 
         # Share the host's SSH agent, known hosts and SSH config with PHP, for
         # remote work like `wp sync` or private Composer packages. Private keys
         # stay on the host. SELinux would relabel the host files with :z, so
         # labelling is turned off for these containers instead.
-        if [[ -n $agent ]]; then
+        if [[ -n $SSH_AGENT ]]; then
             for v in "${SUPPORTED_PHP[@]}"; do
                 echo "  $(php_service "$v"):"
                 echo "    security_opt: [\"label=disable\"]"
                 echo "    environment:"
                 echo "      SSH_AUTH_SOCK: /run/novacore/ssh-agent.sock"
                 echo "    volumes:"
-                echo "      - \"$agent:/run/novacore/host-agent.sock\""
+                echo "      - \"$SSH_AGENT:/run/novacore/host-agent.sock\""
                 [[ -f $HOME/.ssh/known_hosts ]] && echo "      - \"$HOME/.ssh/known_hosts:/etc/novacore/ssh/known_hosts:ro\""
                 [[ -f $HOME/.ssh/config ]] && echo "      - \"$HOME/.ssh/config:/etc/novacore/ssh/config:ro\""
             done
@@ -518,7 +542,8 @@ write_overrides() {
 ssh_agent_status() {
     local status=0
     SSH_HINT=''
-    if [[ -z $(ssh_agent_source) ]]; then
+    ssh_agent_source
+    if [[ -z $SSH_AGENT ]]; then
         detail "SSH agent" "none found"
         SSH_HINT="Without an SSH agent, commands like wp sync can't use your SSH keys"
         return
@@ -536,15 +561,13 @@ ssh_agent_status() {
 # Fill in the dashboard template (dashboard/index.html) served at https://localhost,
 # alongside its icon.
 write_index() {
-    local name dom rows="" page
-    for name in $(site_names); do
-        dom=$(domain "$name")
-        rows+="<tr><td><a href=\"https://$dom\" target=\"_blank\" rel=\"noopener\">$dom</a></td><td>PHP $(site_php "$name")</td><td><code>$(db_name "$name")</code></td><td><code>$(site_root "$name")</code></td></tr>"
+    local i dom rows="" page
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        dom=${SITE_DOMAIN[i]}
+        rows+="<tr><td><a href=\"https://$dom\" target=\"_blank\" rel=\"noopener\">$dom</a></td><td>PHP ${SITE_PHP[i]}</td><td><code>${SITE_DB[i]}</code></td><td><code>${SITE_ROOT[i]}</code></td></tr>"
     done
     [[ -n $rows ]] || rows='<tr><td colspan="4">No sites yet. Run <code>novacore site add &lt;name&gt;</code>.</td></tr>'
 
-    # Bash 5.2+ treats & in a replacement as the matched text; we want it literal.
-    shopt -u patsub_replacement 2>/dev/null || true
     page=$(<"$NOVACORE_ROOT/dashboard/index.html")
     page=${page//'{{SITE_ROWS}}'/$rows}
     page=${page//'{{DB_USER}}'/$DB_USER}
@@ -556,12 +579,13 @@ write_index() {
 }
 
 check_sites_conf() {
-    local name php root
-    while read -r name php root; do
-        check_name "$name"
-        [[ $php == - ]] || check_php "$php"
-    done < <(sites)
-    [[ -z $(site_names | sort | uniq -d) ]] || fail "sites.conf lists the same site twice"
+    local i
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        check_name "${SITE_NAMES[i]}"
+        check_php "${SITE_PHP[i]}"
+    done
+    [[ -z $(printf '%s\n' ${SITE_NAMES[@]+"${SITE_NAMES[@]}"} | sort | uniq -d) ]] ||
+        fail "sites.conf lists the same site twice"
 }
 
 generate() {
@@ -569,19 +593,22 @@ generate() {
     check_sites_conf
     ensure_certs
     rm -f "$DATA_DIR"/nginx/sites/*.conf
-    local name n=0
-    for name in $(site_names); do
+    local i name
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        name=${SITE_NAMES[i]}
         [[ -d $SITES_PATH/$name ]] || warn "$name has no folder at $SITES_PATH/$name"
-        write_vhost "$name"
-        touch "$LOGS_DIR/$name.log"
-        n=$(( n + 1 ))
+        write_vhost "$i"
+        : >> "$LOGS_DIR/$name.log"
     done
     write_overrides
     write_index
-    result "Wrote config for $(count "$n" site sites)"
+    result "Wrote config for $(count ${#SITE_NAMES[@]} site sites)"
 }
 
-is_running() { [[ -n $(compose ps -q --status running nginx 2>/dev/null) ]]; }
+is_running() {
+    local running
+    running=$(services --filter status=running 2>/dev/null) && has_line "$running" nginx
+}
 require_running() { is_running || fail "Novacore isn't running" "Start it with novacore up"; }
 
 start_services() {
@@ -593,7 +620,7 @@ start_services() {
     compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
     # The init script grants this on first run, but it can fail silently (e.g. a
     # bind mount Docker Desktop won't let the entrypoint read), so ensure it here.
-    db_sql -e "GRANT ALL PRIVILEGES ON *.* TO \`$DB_USER\`@'%' WITH GRANT OPTION" ||
+    db_sql -e "GRANT ALL PRIVILEGES ON *.* TO \`$DB_USER\`@'%' WITH GRANT OPTION" >/dev/null 2>&1 ||
         warn "Couldn't give $DB_USER access to all databases"
     # The reload signal returns before old workers retire; give them a moment.
     sleep 0.5
@@ -609,20 +636,47 @@ stop_services() {
 # Build a PHP version's image before pointing anything at it, so a failed
 # build leaves the current config untouched.
 ensure_php_image() {
-    docker image inspect "novacore/php:$1" >/dev/null 2>&1 && return
+    load_built_php
+    ! php_built "$1" || return 0
     heading "PHP $1 image"
     run compose build "$(php_service "$1")" || fail "Couldn't build the PHP $1 image"
     result "Built novacore/php:$1"
+}
+
+# The PHP versions with an image, in BUILT_PHP, e.g. " 8.2 8.4 ".
+load_built_php() {
+    BUILT_PHP=" $(docker image ls novacore/php --format '{{.Tag}}' 2>/dev/null | sort -V | tr '\n' ' ')" || true
+}
+
+# php_built X.Y — whether PHP X.Y's image exists. Needs load_built_php first.
+php_built() { [[ $BUILT_PHP == *" $1 "* ]]; }
+
+# Bring the containers in line with the config, if the stack is running.
+# APPLIED says whether it was; if not, the change waits for novacore up.
+apply_containers() {
+    APPLIED=0
+    is_running || return 0
+    heading Containers
+    start_services
+    APPLIED=1
 }
 
 # Regenerate config, and apply it straight away if the stack is running.
 apply() {
     heading Configuration
     generate
-    if is_running; then
-        heading Containers
-        start_services
+    apply_containers
+}
+
+# finish MESSAGE — the closing line of a command that changed the config,
+# with a hint if the change is still to be applied.
+finish() {
+    complete "$1"
+    if (( ! APPLIED )); then
+        echo
+        hint "It applies when you next run novacore up"
     fi
+    echo
 }
 
 # --- Commands ----------------------------------------------------------------
@@ -644,7 +698,7 @@ cmd_up() {
     complete Ready
     echo
     detail Dashboard https://localhost
-    detail Sites "$(site_names | wc -l | tr -d ' ')"
+    detail Sites "${#SITE_NAMES[@]}"
     detail Xdebug "$XDEBUG_MODE"
     ssh_agent_status
     if [[ -n $SSH_HINT || ! -f $DATA_DIR/.trusted ]]; then
@@ -665,71 +719,77 @@ cmd_down() {
 
 cmd_reload() {
     header Reloading
-    heading Configuration
-    generate
-    if is_running; then
-        heading Containers
-        start_services
-        complete Reloaded
-    else
-        complete "Config regenerated"
-        echo
-        hint "It applies when you next run novacore up"
-    fi
-    echo
+    apply
+    if (( APPLIED )); then finish Reloaded; else finish "Config regenerated"; fi
 }
 
 cmd_status() {
     if [[ ${1:-} == --json ]]; then status_json; return; fi
-    local service state status
+    local service state status mark
     heading Containers
-    is_running || printf '  %s\n' "$(color "Not running. Start Novacore with novacore up." 90)"
+    is_running || note "Not running. Start Novacore with novacore up."
     while IFS=$'\t' read -r service state status; do
-        if [[ $state == running ]]; then
-            printf '  %s  %s\n' "$(color "✔ $(printf '%-14s' "$service")" 32)" "$(color "$status" 90)"
-        else
-            printf '  %s  %s\n' "$(color "! $(printf '%-14s' "$service")" 33)" "$(color "$status" 90)"
+        if [[ $state == running ]]; then mark=$(color "✔ $(printf '%-14s' "$service")" 32)
+        else mark=$(color "! $(printf '%-14s' "$service")" 33)
         fi
+        printf '  %s  %s\n' "$mark" "$(color "$status" 90)"
     done < <(compose ps -a --format '{{.Service}}{{"\t"}}{{.State}}{{"\t"}}{{.Status}}' 2>/dev/null)
     heading Sites
     site_list
     echo
 }
 
-json_str() {
-    local s=$1
-    s=${s//\\/\\\\}
+# --- JSON ---
+#
+# These set REPLY rather than printing, as the tray menu builds hundreds of
+# values and a subshell for each would be slow.
+
+# js STRING — REPLY = STRING as a JSON string.
+js() {
+    local s=${1//\\/\\\\}
     s=${s//\"/\\\"}
-    printf '"%s"' "$s"
+    REPLY="\"$s\""
 }
 
-# json_list A B C — print ["A","B","C"].
-json_list() {
-    local item sep=""
-    printf '['
-    for item in "$@"; do printf '%s%s' "$sep" "$(json_str "$item")"; sep=,; done
-    printf ']'
+# jlist JSON... — REPLY = a JSON array of values that are JSON already.
+jlist() { local IFS=,; REPLY="[$*]"; }
+
+# jstrs STRING... — REPLY = a JSON array of strings.
+jstrs() {
+    local out=() s
+    for s in "$@"; do js "$s"; out+=("$REPLY"); done
+    jlist ${out[@]+"${out[@]}"}
 }
+
+# jpairs KEY STRING... — REPLY = the members of a JSON object whose values are
+# strings: "KEY":"STRING",...
+jpairs() {
+    local out=()
+    while (( $# >= 2 )); do js "$2"; out+=("\"$1\":$REPLY"); shift 2; done
+    local IFS=,
+    REPLY="${out[*]}"
+}
+
+# jobj KEY STRING... — REPLY = a JSON object whose values are strings.
+jobj() { jpairs "$@"; REPLY="{$REPLY}"; }
 
 # Whether Novacore is running, and its sites, for tools like the Plasma widget.
 status_json() {
-    shopt -u patsub_replacement 2>/dev/null || true
-    local running=false name sep="" built
+    local running=false i sep=""
     is_running && running=true
-    # shellcheck disable=SC2207
-    built=($(docker image ls novacore/php --format '{{.Tag}}' | sort -V))
-    printf '{"running":%s,"dashboard":"https://localhost","phpVersions":%s,"builtPhp":%s,' \
-        "$running" "$(json_list "${SUPPORTED_PHP[@]}")" "$(json_list ${built[@]+"${built[@]}"})"
-    printf '"defaultPhp":%s,"xdebug":%s,"tld":%s,"sitesPath":%s,' \
-        "$(json_str "$DEFAULT_PHP")" "$(json_str "$XDEBUG_MODE")" "$(json_str "$NOVACORE_TLD")" "$(json_str "$SITES_PATH")"
-    printf '"db":{"user":%s,"password":%s,"host":%s,"containerHost":"mariadb"},"sites":[' \
-        "$(json_str "$DB_USER")" "$(json_str "$DB_PASSWORD")" "$(json_str "$(host_db_host)")"
-    for name in $(site_names); do
-        printf '%s{"name":%s,"url":%s,"php":%s,"root":%s,"path":%s,"database":%s,"errorLog":%s}' "$sep" \
-            "$(json_str "$name")" "$(json_str "https://$(domain "$name")")" \
-            "$(json_str "$(site_php "$name")")" "$(json_str "$(site_root "$name")")" \
-            "$(json_str "$SITES_PATH/$name")" "$(json_str "$(db_name "$name")")" \
-            "$(json_str "$LOGS_DIR/$name.log")"
+    load_built_php
+    printf '{"running":%s,"dashboard":"https://localhost",' "$running"
+    jstrs "${SUPPORTED_PHP[@]}"; printf '"phpVersions":%s,' "$REPLY"
+    # shellcheck disable=SC2086
+    jstrs $BUILT_PHP; printf '"builtPhp":%s,' "$REPLY"
+    jpairs defaultPhp "$DEFAULT_PHP" xdebug "$XDEBUG_MODE" tld "$NOVACORE_TLD" sitesPath "$SITES_PATH"
+    printf '%s,' "$REPLY"
+    jobj user "$DB_USER" password "$DB_PASSWORD" host "$HOST_DB_HOST" containerHost mariadb
+    printf '"db":%s,"sites":[' "$REPLY"
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        jobj name "${SITE_NAMES[i]}" url "https://${SITE_DOMAIN[i]}" php "${SITE_PHP[i]}" root "${SITE_ROOT[i]}" \
+            path "$SITES_PATH/${SITE_NAMES[i]}" database "${SITE_DB[i]}" errorLog "$LOGS_DIR/${SITE_NAMES[i]}.log"
+        printf '%s%s' "$sep" "$REPLY"
         sep=,
     done
     printf ']}\n'
@@ -750,10 +810,10 @@ cmd_errors() {
     local file="$LOGS_DIR/$name.log"
     case ${2:-} in
         "")      ;;
-        --clear) : > "$file"; printf '%s\n' "$(color "✔ Cleared $file" 32)"; return ;;
+        --clear) : > "$file"; color "✔ Cleared $file" 32; echo; return ;;
         *)       fail "Unknown option '$2'" "Usage: novacore errors [site] [--clear]" ;;
     esac
-    touch "$file"
+    : >> "$file"
     tail -n 50 -F "$file"
 }
 
@@ -771,10 +831,7 @@ cmd_build() {
     heading Images
     run compose build --pull "${services[@]}" || fail "Couldn't build the images"
     result "Built $(join ', ' "${services[@]}")"
-    if is_running; then
-        heading Containers
-        start_services
-    fi
+    apply_containers
     complete Built
     echo
 }
@@ -813,8 +870,9 @@ cmd_prune() {
 
     heading "Unused PHP versions"
     remove_unused_containers
+    load_built_php
     for v in $(unused_php); do
-        if docker image inspect "novacore/php:$v" >/dev/null 2>&1; then
+        if php_built "$v"; then
             images+=("novacore/php:$v")
             versions+=("$v")
         fi
@@ -860,6 +918,7 @@ EOF
 
 site_add() {
     local name="" php=$DEFAULT_PHP root=- db=1
+    local usage="Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]"
     while (( $# )); do
         case $1 in
             --php)    php=${2:-}; [[ -n $php ]] || fail "--php needs a version"; shift 2 ;;
@@ -867,14 +926,14 @@ site_add() {
             --root)   root=${2:-}; [[ -n $root ]] || fail "--root needs a directory"; shift 2 ;;
             --root=*) root=${1#*=}; shift ;;
             --no-db)  db=0; shift ;;
-            -*)       fail "Unknown option '$1'" "Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]" ;;
+            -*)       fail "Unknown option '$1'" "$usage" ;;
             *)        [[ -z $name ]] || fail "Unexpected argument '$1'"; name=$1; shift ;;
         esac
     done
-    [[ -n $name ]] || fail "Which site?" "Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]"
+    [[ -n $name ]] || fail "Which site?" "$usage"
     check_name "$name"
     check_php "$php"
-    ! site_exists "$name" || fail "Site '$name' already exists"
+    ! site_index "$name" || fail "Site '$name' already exists"
 
     header "Adding $name"
     ensure_php_image "$php"
@@ -893,12 +952,12 @@ site_add() {
 
     sites_conf_set "$name" "$php" "$root"
     apply
+    site_index "$name"
 
-    local dbname
-    dbname=$(db_name "$name")
+    local dbname=${SITE_DB[SITE]}
     if (( db )); then
         heading Database
-        if is_running; then
+        if (( APPLIED )); then
             db_create "$dbname"
         else
             warn "Novacore isn't running, so no database was created"
@@ -908,14 +967,14 @@ site_add() {
 
     complete "Added $name"
     echo
-    detail URL "https://$(domain "$name")"
+    detail URL "https://${SITE_DOMAIN[SITE]}"
     detail PHP "$php"
-    detail "Doc root" "$(site_root "$name")"
+    detail "Doc root" "${SITE_ROOT[SITE]}"
     if (( db )); then
         detail Database "$dbname"
     fi
     echo
-    if is_running; then
+    if (( APPLIED )); then
         hint "Run novacore site info $name for its database settings"
     else
         hint "Start Novacore with novacore up, then run novacore db create $dbname"
@@ -923,45 +982,50 @@ site_add() {
     echo
 }
 
-# The DB_HOST to fall back to outside Novacore, i.e. MariaDB's published port.
-host_db_host() {
-    if [[ $DB_PORT == 3306 ]]; then echo 127.0.0.1; else echo "127.0.0.1:$DB_PORT"; fi
+# Ways to set DB_HOST that work both in Novacore and on your machine, in
+# SNIPPETS: a label, then its code, for each.
+db_host_snippets() {
+    SNIPPETS=(
+        "wp-config.php"
+        "define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$HOST_DB_HOST' );"
+        "Bedrock (config/application.php)"
+        "Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$HOST_DB_HOST' );"
+        "Laravel (config/database.php)"
+        "'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),"
+    )
 }
 
 site_info() {
-    local name=${1:-} dbname state=""
+    local name=${1:-} dbname state="" i
     [[ -n $name ]] || fail "Which site?" "Usage: novacore site info <name>"
     require_site "$name"
-    dbname=$(db_name "$name")
+    dbname=${SITE_DB[SITE]}
     if is_running && [[ -z $(db_sql -N -e "SHOW DATABASES LIKE '$dbname'") ]]; then
         state=" $(color "(not created yet: novacore db create $dbname)" 33)"
     fi
 
     heading "$name"
-    detail URL "https://$(domain "$name")"
-    detail PHP "$(site_php "$name")"
+    detail URL "https://${SITE_DOMAIN[SITE]}"
+    detail PHP "${SITE_PHP[SITE]}"
     detail Folder "$SITES_PATH/$name"
-    detail "Doc root" "$(site_root "$name")"
+    detail "Doc root" "${SITE_ROOT[SITE]}"
     detail "Error log" "$LOGS_DIR/$name.log"
 
     heading Database
     detail Name "$dbname$state"
     detail User "$DB_USER"
     detail Password "$DB_PASSWORD"
-    detail Host "mariadb (inside Novacore), $(host_db_host) (your machine)"
+    detail Host "mariadb (inside Novacore), $HOST_DB_HOST (your machine)"
 
     heading Connecting
     echo "  To connect from both Novacore and tools on your machine, such as wp, use:"
     echo
-    printf '  %s\n' "$(color "wp-config.php" 90)"
-    echo "    define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$(host_db_host)' );"
-    echo
-    printf '  %s\n' "$(color "Bedrock (config/application.php)" 90)"
-    echo "    Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$(host_db_host)' );"
-    echo
-    printf '  %s\n' "$(color "Laravel (config/database.php)" 90)"
-    echo "    'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),"
-    echo
+    db_host_snippets
+    for (( i = 0; i < ${#SNIPPETS[@]}; i += 2 )); do
+        note "${SNIPPETS[i]}"
+        echo "    ${SNIPPETS[i + 1]}"
+        echo
+    done
 }
 
 site_rm() {
@@ -979,12 +1043,13 @@ site_rm() {
     if (( drop_db )); then require_running; fi
 
     header "Removing $name"
+    local dbname=${SITE_DB[SITE]}
+    rm -f "$DATA_DIR/certs/${SITE_DOMAIN[SITE]}".{crt,key}
     sites_conf_remove "$name"
-    rm -f "$DATA_DIR/certs/$(domain "$name")".{crt,key}
     apply
     if (( drop_db )); then
         heading Database
-        db_drop "$(db_name "$name")"
+        db_drop "$dbname"
     fi
     complete "Removed $name"
     echo
@@ -993,15 +1058,15 @@ site_rm() {
 }
 
 site_list() {
-    if [[ -z $(sites) ]]; then
-        printf '  %s\n' "$(color "No sites yet. Add one with novacore site add <name>." 90)"
+    if (( ! ${#SITE_NAMES[@]} )); then
+        note "No sites yet. Add one with novacore site add <name>."
         return
     fi
-    local name php root
-    printf '  %s\n' "$(color "$(printf '%-36s %-6s %s' URL PHP ROOT)" 90)"
-    while read -r name php root; do
-        printf '  %-36s %-6s %s\n' "https://$(domain "$name")" "$(site_php "$name")" "$(site_root "$name")"
-    done < <(sites)
+    local i
+    note "$(printf '%-36s %-6s %s' URL PHP ROOT)"
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        printf '  %-36s %-6s %s\n' "https://${SITE_DOMAIN[i]}" "${SITE_PHP[i]}" "${SITE_ROOT[i]}"
+    done
 }
 
 cmd_site() {
@@ -1020,11 +1085,11 @@ cmd_php() {
     case ${1:-list} in
         list|ls)
             local running v marks
-            running=$(compose ps --status running --services 2>/dev/null || true)
+            running=$(services --filter status=running 2>/dev/null) || true
             for v in "${SUPPORTED_PHP[@]}"; do
                 marks=""
                 [[ $v == "$DEFAULT_PHP" ]] && marks+="  $(color default 90)"
-                grep -qx "$(php_service "$v")" <<<"$running" && marks+="  $(color running 32)"
+                has_line "$running" "$(php_service "$v")" && marks+="  $(color running 32)"
                 echo "  $v$marks"
             done
             ;;
@@ -1034,6 +1099,7 @@ cmd_php() {
             header "Default PHP → $2"
             ensure_php_image "$2"
             env_set DEFAULT_PHP "$2"
+            load_sites
             apply
             complete "Default PHP is now $2"
             echo
@@ -1041,11 +1107,11 @@ cmd_php() {
         *)
             local name=$1 version=${2:-}
             require_site "$name"
-            [[ -n $version ]] || { site_php "$name"; return; }
+            [[ -n $version ]] || { echo "${SITE_PHP[SITE]}"; return; }
             check_php "$version"
             header "$name → PHP $version"
             ensure_php_image "$version"
-            sites_conf_set "$name" "$version" "$(site_field "$name" 3)"
+            sites_conf_set "$name" "$version" "${SITE_ROOT_CONF[SITE]}"
             apply
             complete "$name now runs PHP $version"
             echo
@@ -1064,23 +1130,17 @@ cmd_xdebug() {
     [[ $mode =~ ^[a-z]+(,[a-z]+)*$ ]] || fail "Invalid Xdebug mode '$mode'" "Try on, off, or modes like debug,profile"
     header "Xdebug → $mode"
     env_set XDEBUG_MODE "$mode"
-    if is_running; then
-        # Compose recreates the PHP containers because their environment changed.
-        heading Containers
-        start_services
-        complete "Xdebug mode is now $mode"
-    else
-        complete "Xdebug mode is now $mode"
-        echo
-        hint "It applies when you next run novacore up"
-    fi
-    echo
+    # Compose recreates the PHP containers because their environment changed.
+    apply_containers
+    finish "Xdebug mode is now $mode"
 }
 
-db_sql() {
-    require_running
-    compose exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb mariadb -uroot "$@"
-}
+# db_exec [-T] mariadb PROGRAM... — run one of MariaDB's programs in its
+# container, with root's password.
+db_exec() { compose exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$@"; }
+
+# db_sql OPTION... — run SQL from stdin or -e. Needs Novacore running.
+db_sql() { db_exec -T mariadb mariadb -uroot "$@"; }
 
 check_db_name() {
     [[ ${1:-} =~ ^[A-Za-z0-9_]+$ ]] || fail "Database names may only contain letters, numbers and underscores"
@@ -1109,8 +1169,7 @@ import_sql() {
 
 # export_sql NAME FILE — dump a database to a .sql or .sql.gz file.
 export_sql() {
-    compose exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb \
-        mariadb-dump -uroot --single-transaction --routines --triggers "$1" |
+    db_exec -T mariadb mariadb-dump -uroot --single-transaction --routines --triggers "$1" |
         if [[ $2 == *.gz ]]; then gzip; else cat; fi > "$2"
 }
 
@@ -1130,6 +1189,7 @@ cmd_db() {
             echo
             ;;
         list|ls)
+            require_running
             db_sql -N -e "SHOW DATABASES" |
                 grep -vxE 'information_schema|mysql|performance_schema|sys' || true
             ;;
@@ -1162,7 +1222,7 @@ cmd_db() {
             ;;
         shell)
             require_running
-            compose exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb mariadb -uroot "$@"
+            db_exec mariadb mariadb -uroot "$@"
             ;;
         *) fail "Unknown command 'db $sub'" "Try db create, drop, list, import, export or shell" ;;
     esac
@@ -1179,7 +1239,7 @@ cmd_exec() {
     local tty=()
     [[ -t 0 && -t 1 ]] || tty=(-T)
     compose exec ${tty[@]+"${tty[@]}"} -u www-data -w "/var/www/sites/$name" \
-        "$(php_service "$(site_php "$name")")" "$@"
+        "$(php_service "${SITE_PHP[SITE]}")" "$@"
 }
 
 cmd_shell() {
@@ -1195,7 +1255,7 @@ cmd_open() {
     local url=https://localhost
     if [[ -n ${1:-} ]]; then
         require_site "$1"
-        url="https://$(domain "$1")"
+        url="https://${SITE_DOMAIN[SITE]}"
     fi
     if command -v xdg-open >/dev/null; then xdg-open "$url" >/dev/null 2>&1 &
     elif command -v open >/dev/null; then open "$url"
@@ -1236,12 +1296,12 @@ windows_trust() {
     sha1=$(openssl x509 -in "$ca" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d : | tr 'A-F' 'a-f')
 
     heading "Windows"
-    printf '  %s\n' "$(color "Lets Chrome and Edge on Windows accept Novacore's certificates." 90)"
+    note "Lets Chrome and Edge on Windows accept Novacore's certificates."
     if certutil.exe -user -verifystore Root "$sha1" >/dev/null 2>&1; then
         result "Already in the Windows certificate store"
         return
     fi
-    printf '  %s\n' "$(color "Windows will ask you to confirm. Check the thumbprint is $sha1, then click Yes." 33)"
+    note "Windows will ask you to confirm. Check the thumbprint is $sha1, then click Yes." 33
     set +e
     certutil.exe -user -addstore Root "$(wslpath -w "$ca")" >/dev/null 2>&1
     status=$?
@@ -1265,7 +1325,7 @@ cmd_trust() {
     result "Novacore Local CA is at $ca"
 
     heading "System trust store"
-    printf '  %s\n' "$(color "Lets browsers accept https://*.$NOVACORE_TLD without warnings. It needs sudo." 90)"
+    note "Lets browsers accept https://*.$NOVACORE_TLD without warnings. It needs sudo."
     # Ask for the password up front, since run hides the commands' prompts.
     sudo -v || fail "Couldn't get sudo access"
     run trust_install "$store" "$ca" || fail "Couldn't update the trust store"
@@ -1296,25 +1356,10 @@ cmd_trust() {
 # them what to show and what each item does, `tray run` and `tray poll` run a
 # command for them, and `tray submit` turns a dialog's answers into a command.
 # So a new menu item or dialog only needs adding here, in tray_menu. The JSON
-# is described in tray/PROTOCOL.md.
-
-# js STRING — REPLY = STRING as a JSON string. It sets REPLY rather than
-# printing, as the menu builds hundreds of these and subshells are slow.
-js() {
-    local s=${1//\\/\\\\}
-    s=${s//\"/\\\"}
-    REPLY="\"$s\""
-}
-
-# jlist JSON... — REPLY = a JSON array of values that are JSON already.
-jlist() { local IFS=,; REPLY="[$*]"; }
-
-# jstrs STRING... — REPLY = a JSON array of strings.
-jstrs() {
-    local out=() s
-    for s in "$@"; do js "$s"; out+=("$REPLY"); done
-    jlist ${out[@]+"${out[@]}"}
-}
+# is described in tray/PROTOCOL.md. The Plasma widget (plasmoid/) lists the
+# sites itself, from `status --json`, but runs its commands the same way.
+#
+# Like the JSON functions they build on, these set REPLY.
 
 # mitem LABEL ACTION FLAG... — REPLY = a menu item, with ACTION (JSON, or
 # empty for none). FLAGs are bold, checked, idle (greyed out while a command
@@ -1335,28 +1380,19 @@ mitem() {
 
 # msub LABEL ITEM... — REPLY = a submenu of ITEMs.
 msub() {
-    local label=$1
+    local label
+    js "$1"; label=$REPLY
     shift
     jlist "$@"
-    local items=$REPLY
-    js "$label"
-    REPLY="{\"label\":$REPLY,\"items\":$items}"
+    REPLY="{\"label\":$label,\"items\":$REPLY}"
 }
 
 MSEP='{"separator":true}'
 
-# act TYPE VALUE — REPLY = an action with one string, e.g. act open URL. The
-# types are open (a URL), folder, editor (a path) and tray (the tray's own:
-# output, refresh or quit).
-act() { js "$2"; REPLY="{\"$1\":$REPLY}"; }
-
-# act_terminal PATH TITLE — open a terminal in PATH.
-act_terminal() {
-    local path title
-    js "$1"; path=$REPLY
-    js "$2"; title=$REPLY
-    REPLY="{\"terminal\":$path,\"title\":$title}"
-}
+# act TYPE VALUE [KEY VALUE]... — REPLY = an action made of strings, e.g.
+# act open URL, act folder PATH, act editor PATH app zed, act terminal PATH
+# title TITLE, or act tray output (the tray's own: output, refresh or quit).
+act() { jobj "$@"; }
 
 # act_console TITLE ARGS... — run novacore ARGS in a terminal.
 act_console() {
@@ -1371,29 +1407,27 @@ act_console() {
 # showing LABEL meanwhile and DONE after. URL, if set, opens when the
 # notification is clicked.
 act_run() {
-    local label done url=""
-    js "$1"; label=$REPLY
-    js "$2"; done=$REPLY
-    if [[ -n $3 ]]; then js "$3"; url=",\"url\":$REPLY"; fi
+    local rest
+    jpairs label "$1" done "$2" ${3:+url "$3"}; rest=$REPLY
     shift 3
     jstrs "$@"
-    REPLY="{\"run\":$REPLY,\"label\":$label,\"done\":$done$url}"
-}
-
-# act_editor PATH APP — open PATH in an editor: vscode or zed.
-act_editor() {
-    js "$1"
-    REPLY="{\"editor\":$REPLY,\"app\":\"$2\"}"
+    REPLY="{\"run\":$REPLY,$rest}"
 }
 
 # repo_web PATH — the web page of the git repo at PATH, from its origin
-# remote (or its first, without one), as "LABEL URL", e.g. "GitHub
-# https://github.com/me/blog". Fails if there's no repo or remote.
+# remote (or its first, without one): REPO_LABEL and REPO_URL, e.g. GitHub and
+# https://github.com/me/blog. Fails if there's no repo or remote.
 repo_web() {
-    local remotes url host rest label
+    local remotes key value url="" first="" host rest
+    # Only a repo of the site's own, not one its folder happens to be inside,
+    # such as Novacore's.
+    [[ -e $1/.git ]] || return 1
     remotes=$(git -C "$1" config --get-regexp '^remote\..*\.url$' 2>/dev/null) || return 1
-    url=$(printf '%s\n' "$remotes" | awk '$1 == "remote.origin.url" { print $2; exit }')
-    [[ -n $url ]] || url=$(printf '%s\n' "$remotes" | awk 'NR == 1 { print $2 }')
+    while read -r key value; do
+        [[ -n $first ]] || first=$value
+        if [[ $key == remote.origin.url ]]; then url=$value; break; fi
+    done <<<"$remotes"
+    url=${url:-$first}
     [[ -n $url ]] || return 1
 
     # Split into host and path: https://user@host:port/path, ssh://git@host:port/path
@@ -1415,56 +1449,55 @@ repo_web() {
     rest=${rest%/}
     rest=${rest%.git}
     case $host in
-        github.com|*.github.com) label=GitHub ;;
-        gitlab.com|gitlab.*)     label=GitLab ;;
-        bitbucket.org)           label=Bitbucket ;;
-        codeberg.org)            label=Codeberg ;;
+        github.com|*.github.com) REPO_LABEL=GitHub ;;
+        gitlab.com|gitlab.*)     REPO_LABEL=GitLab ;;
+        bitbucket.org)           REPO_LABEL=Bitbucket ;;
+        codeberg.org)            REPO_LABEL=Codeberg ;;
         ssh.dev.azure.com|vs-ssh.visualstudio.com|dev.azure.com)
             # v3/org/project/repo over SSH, org/project/_git/repo over HTTPS.
-            label="Azure DevOps"
+            REPO_LABEL="Azure DevOps"
             [[ $rest =~ ^v3/([^/]+)/([^/]+)/([^/]+)$ ]] && rest="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/_git/${BASH_REMATCH[3]}"
             host=dev.azure.com
             ;;
-        *) label=$host ;;
+        *) REPO_LABEL=$host ;;
     esac
-    REPLY="$label https://$host/$rest"
+    REPO_URL="https://$host/$rest"
 }
 
-# A site's details for its Info dialog, like `novacore site info`.
+# The dialogs and menus below read what tray_menu worked out: TRAY_RUNNING, 1
+# if Novacore is running, and WSL_ROOT, where Windows sees this distro's files
+# (empty outside WSL).
+
+# info_section HEADING LABEL VALUE... — REPLY = a section of an Info dialog.
+info_section() {
+    local heading rows=()
+    js "$1"; heading=$REPLY
+    shift
+    while (( $# >= 2 )); do jstrs "$1" "$2"; rows+=("$REPLY"); shift 2; done
+    jlist "${rows[@]}"
+    REPLY="{\"heading\":$heading,\"rows\":$REPLY}"
+}
+
+# info_dialog INDEX — a site's details for its Info dialog, like `novacore
+# site info`.
 info_dialog() {
-    local name=$1 url path root db_host sections=() rows=() row
-    url="https://$(domain "$name")"
-    path="$SITES_PATH/$name"
-    root=$(site_root "$name")
+    local name=${SITE_NAMES[$1]} url="https://${SITE_DOMAIN[$1]}" root=${SITE_ROOT[$1]}
+    local path="$SITES_PATH/$name" sections=() buttons=() wsl=() i
     [[ $root == . ]] && root=$path || root="$path/$root"
-    db_host=$(host_db_host)
+    [[ -z $WSL_ROOT ]] || wsl=("In Windows" "$WSL_ROOT${path//\//\\}")
 
-    # section HEADING LABEL VALUE ... — add a section of rows.
-    section() {
-        local heading=$1
-        rows=()
-        shift
-        while (( $# >= 2 )); do jstrs "$1" "$2"; rows+=("$REPLY"); shift 2; done
-        jlist "${rows[@]}"
-        row=$REPLY
-        js "$heading"
-        sections+=("{\"heading\":$REPLY,\"rows\":$row}")
-    }
-    local wsl=()
-    if is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then
-        wsl=("In Windows" "\\\\wsl.localhost\\$WSL_DISTRO_NAME${path//\//\\}")
-    fi
-    section Site URL "$url" PHP "$(site_php "$name")" Folder "$path" ${wsl[@]+"${wsl[@]}"} \
+    info_section Site URL "$url" PHP "${SITE_PHP[$1]}" Folder "$path" ${wsl[@]+"${wsl[@]}"} \
         "Document root" "$root" "Error log" "$LOGS_DIR/$name.log"
-    section Database Name "$(db_name "$name")" User "$DB_USER" Password "$DB_PASSWORD" \
-        Host "$db_host" "Host in Novacore" mariadb
-    section "DB_HOST that works in Novacore and on your machine" \
-        wp-config.php "define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$db_host' );" \
-        Bedrock "Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$db_host' );" \
-        Laravel "'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),"
-    unset -f section
+    sections+=("$REPLY")
+    info_section Database Name "${SITE_DB[$1]}" User "$DB_USER" Password "$DB_PASSWORD" \
+        Host "$HOST_DB_HOST" "Host in Novacore" mariadb
+    sections+=("$REPLY")
+    db_host_snippets
+    # Their labels without the file each goes in, e.g. "(config/database.php)".
+    for (( i = 0; i < ${#SNIPPETS[@]}; i += 2 )); do SNIPPETS[i]=${SNIPPETS[i]%% (*}; done
+    info_section "DB_HOST that works in Novacore and on your machine" "${SNIPPETS[@]}"
+    sections+=("$REPLY")
 
-    local buttons=()
     act open "$url"; mitem "Open Site" "$REPLY"; buttons+=("$REPLY")
     act folder "$path"; mitem "Open Folder" "$REPLY"; buttons+=("$REPLY")
     jlist "${buttons[@]}"; local b=$REPLY
@@ -1473,11 +1506,23 @@ info_dialog() {
     REPLY="{\"dialog\":\"info\",\"title\":$REPLY,\"sections\":$s,\"buttons\":$b}"
 }
 
-# The Add Site dialog. RUNNING is 1 if Novacore is running.
+# db_check ID LABEL VALUE — REPLY = a form's checkbox for something done to a
+# database, so it's greyed out unless Novacore is running.
+db_check() {
+    if (( TRAY_RUNNING )); then
+        js "$2"
+        REPLY="{\"id\":\"$1\",\"type\":\"check\",\"label\":$REPLY,\"value\":$3}"
+    else
+        js "$2 (start Novacore first)"
+        REPLY="{\"id\":\"$1\",\"type\":\"check\",\"label\":$REPLY,\"value\":false,\"enabled\":false}"
+    fi
+}
+
+# The Add Site dialog.
 add_site_dialog() {
-    local running=$1 v hints="" names php root db action
+    local v hints="" names php root db action
     # The same rules as check_name, and the names that are taken.
-    jstrs default $(site_names)
+    jstrs default ${SITE_NAMES[@]+"${SITE_NAMES[@]}"}
     names=$REPLY
     for v in "${SUPPORTED_PHP[@]}"; do
         php_built "$v" && continue
@@ -1487,11 +1532,8 @@ add_site_dialog() {
     jstrs "${SUPPORTED_PHP[@]}"
     php="{\"id\":\"php\",\"type\":\"choice\",\"label\":\"PHP\",\"options\":$REPLY,\"value\":\"$DEFAULT_PHP\",\"hints\":{$hints}}"
     root='{"id":"root","type":"combo","label":"Document root","options":["Auto-detect","public","web","public_html","htdocs"],"value":"Auto-detect","note":"Auto-detect looks for public, web, public_html or htdocs."}'
-    if (( running )); then
-        db='{"id":"db","type":"check","label":"Create a database","value":true}'
-    else
-        db='{"id":"db","type":"check","label":"Create a database (start Novacore first)","value":false,"enabled":false}'
-    fi
+    db_check db "Create a database" true
+    db=$REPLY
     act_run "Adding {name}…" "{name} is ready at https://{name}.$NOVACORE_TLD" "https://{name}.$NOVACORE_TLD" tray submit add-site
     action=$REPLY
     REPLY='{"dialog":"form","title":"Add Site","submit":"Add","fields":[
@@ -1501,104 +1543,54 @@ add_site_dialog() {
 '"$php,$root,$db"'],"action":'"$action"'}'
 }
 
-# The Remove dialog for site NAME. RUNNING is 1 if Novacore is running.
+# remove_site_dialog INDEX — the Remove dialog for a site.
 remove_site_dialog() {
-    local name=$1 running=$2 path=$SITES_PATH/$1 heading message title db action
-    js "Remove $name"; title=$REPLY
-    js "Stop serving https://$(domain "$name")?"; heading=$REPLY
-    js "Its files stay in $path."; message=$REPLY
-    if (( running )); then
-        js "Also delete its database, $(db_name "$name")"
-        db="{\"id\":\"drop-db\",\"type\":\"check\",\"label\":$REPLY,\"value\":false}"
-    else
-        js "Also delete its database, $(db_name "$name") (start Novacore first)"
-        db="{\"id\":\"drop-db\",\"type\":\"check\",\"label\":$REPLY,\"value\":false,\"enabled\":false}"
-    fi
+    local name=${SITE_NAMES[$1]} path="$SITES_PATH/${SITE_NAMES[$1]}" text db action
+    jpairs title "Remove $name" heading "Stop serving https://${SITE_DOMAIN[$1]}?" message "Its files stay in $path."
+    text=$REPLY
+    db_check drop-db "Also delete its database, ${SITE_DB[$1]}" false
+    db=$REPLY
     act_run "Removing ${name}…" "Removed $name. Its files are still in $path" "" tray submit remove-site "site=$name"
     action=$REPLY
-    REPLY="{\"dialog\":\"form\",\"title\":$title,\"heading\":$heading,\"message\":$message,\"submit\":\"Remove\",\"destructive\":true,\"fields\":[$db],\"action\":$action}"
+    REPLY="{\"dialog\":\"form\",$text,\"submit\":\"Remove\",\"destructive\":true,\"fields\":[$db],\"action\":$action}"
 }
 
-# php_built X.Y — whether PHP X.Y's image exists. Needs BUILT_PHP set.
-php_built() { [[ " $BUILT_PHP " == *" $1 "* ]]; }
+# site_menu INDEX — REPLY = a site's submenu.
+site_menu() {
+    local name=${SITE_NAMES[$1]} url="https://${SITE_DOMAIN[$1]}" php=${SITE_PHP[$1]}
+    local path="$SITES_PATH/$name" sub=() v label off=""
+    (( TRAY_RUNNING )) || off=off
 
-# tray menu — the tray icon's menu as JSON (see tray/PROTOCOL.md).
-tray_menu() {
-    shopt -u patsub_replacement 2>/dev/null || true
-    local problem hint running=0 items=() sub=() name url path php v label flag
-    local state status
-
-    # The menu still works when Docker doesn't, so say why rather than fail.
-    if ! problem=$( (check_docker) 2>&1 >/dev/null ); then
-        hint=$(printf '%s\n' "$problem" | sed -n 's/^  Hint: //p' | head -n 1)
-        problem=$(printf '%s\n' "$problem" | sed -n 's/^✖ //p' | head -n 1)
-        [[ -z $hint ]] || problem+=". $hint"
-        act open https://localhost; mitem "Open Dashboard" "$REPLY" bold off; items+=("$REPLY" "$MSEP")
-        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
-        act tray output; mitem "Show Output…" "$REPLY"; items+=("$REPLY")
-        act tray refresh; mitem Refresh "$REPLY" idle; items+=("$REPLY" "$MSEP")
-        act tray quit; mitem Quit "$REPLY"; items+=("$REPLY")
-        jlist "${items[@]}"; local list=$REPLY
-        js "$problem"
-        printf '{"version":1,"state":"error","status":"Can'"'"'t reach Docker","problem":%s,"items":%s}\n' "$REPLY" "$list"
-        return
+    act open "$url"; mitem "Open ${url#https://}" "$REPLY" bold; sub+=("$REPLY")
+    if repo_web "$path"; then
+        act open "$REPO_URL"; mitem "Open on $REPO_LABEL" "$REPLY"; sub+=("$REPLY")
     fi
-    load_env >/dev/null
-    is_running && running=1
-    BUILT_PHP=$(docker image ls novacore/php --format '{{.Tag}}' | tr '\n' ' ')
-
-    act open https://localhost
-    if (( running )); then mitem "Open Dashboard" "$REPLY" bold; else mitem "Open Dashboard" "$REPLY" bold off; fi
-    items+=("$REPLY" "$MSEP")
-
-    local n=0
-    for name in $(site_names); do
-        n=$(( n + 1 ))
-        url="https://$(domain "$name")"
-        path="$SITES_PATH/$name"
-        php=$(site_php "$name")
-        sub=()
-        act open "$url"; mitem "Open ${url#https://}" "$REPLY" bold; sub+=("$REPLY")
-        if repo_web "$path"; then
-            label=${REPLY% *}
-            act open "${REPLY##* }"; mitem "Open on $label" "$REPLY"; sub+=("$REPLY")
+    info_dialog "$1"; mitem "Info…" "$REPLY"; sub+=("$REPLY" "$MSEP")
+    act folder "$path"; mitem "Open Folder" "$REPLY"; sub+=("$REPLY")
+    act editor "$path" app vscode; mitem "Open in VS Code" "$REPLY"; sub+=("$REPLY")
+    act editor "$path" app zed; mitem "Open in Zed" "$REPLY"; sub+=("$REPLY")
+    act terminal "$path" title "$name"; mitem "Open Terminal" "$REPLY"; sub+=("$REPLY")
+    act_console "$name · PHP shell" shell "$name"; mitem "PHP Shell" "$REPLY" "$off"; sub+=("$REPLY")
+    act_console "$name · error log" errors "$name"; mitem "Follow Error Log" "$REPLY"; sub+=("$REPLY" "$MSEP")
+    for v in "${SUPPORTED_PHP[@]}"; do
+        if [[ $v == "$php" ]]; then
+            mitem "PHP $v" "" checked idle
+        else
+            if php_built "$v"; then label="Switching $name to PHP ${v}…"; else label="Building PHP ${v}…"; fi
+            act_run "$label" "$name now uses PHP $v" "" php "$name" "$v"
+            mitem "PHP $v" "$REPLY" idle
         fi
-        info_dialog "$name"; mitem "Info…" "$REPLY"; sub+=("$REPLY" "$MSEP")
-        act folder "$path"; mitem "Open Folder" "$REPLY"; sub+=("$REPLY")
-        act_editor "$path" vscode; mitem "Open in VS Code" "$REPLY"; sub+=("$REPLY")
-        act_editor "$path" zed; mitem "Open in Zed" "$REPLY"; sub+=("$REPLY")
-        act_terminal "$path" "$name"; mitem "Open Terminal" "$REPLY"; sub+=("$REPLY")
-        flag=""; (( running )) || flag=off
-        act_console "$name · PHP shell" shell "$name"; mitem "PHP Shell" "$REPLY" "$flag"; sub+=("$REPLY")
-        act_console "$name · error log" errors "$name"; mitem "Follow Error Log" "$REPLY"; sub+=("$REPLY" "$MSEP")
-        for v in "${SUPPORTED_PHP[@]}"; do
-            if [[ $v == "$php" ]]; then
-                mitem "PHP $v" "" checked idle
-            else
-                if php_built "$v"; then label="Switching $name to PHP ${v}…"; else label="Building PHP ${v}…"; fi
-                act_run "$label" "$name now uses PHP $v" "" php "$name" "$v"
-                mitem "PHP $v" "$REPLY" idle
-            fi
-            sub+=("$REPLY")
-        done
-        sub+=("$MSEP")
-        remove_site_dialog "$name" "$running"; mitem "Remove…" "$REPLY" idle; sub+=("$REPLY")
-        msub "$name" "${sub[@]}"
-        items+=("$REPLY")
+        sub+=("$REPLY")
     done
-    if (( n == 0 )); then mitem "No sites yet" "" off; items+=("$REPLY"); fi
-    add_site_dialog "$running"; mitem "Add Site…" "$REPLY" idle; items+=("$REPLY" "$MSEP")
+    sub+=("$MSEP")
+    remove_site_dialog "$1"; mitem "Remove…" "$REPLY" idle; sub+=("$REPLY")
+    msub "$name" "${sub[@]}"
+}
 
-    if (( running )); then
-        act_run "Stopping Novacore…" "Novacore has stopped" "" down; mitem "Stop Novacore" "$REPLY" idle; items+=("$REPLY")
-        act_run "Restarting Novacore…" "Novacore has restarted" "" restart; mitem "Restart Novacore" "$REPLY" idle; items+=("$REPLY")
-    else
-        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
-    fi
-
-    # novacore xdebug's modes; "on" is develop,debug.
-    sub=()
-    local known=0 mode
+# REPLY = the Xdebug submenu: novacore xdebug's modes, where "on" is
+# develop,debug.
+xdebug_menu() {
+    local sub=() known=0 mode label
     for mode in off:Off "develop,debug:On (develop, debug)" - debug:"Debug only" develop:"Develop only" \
         profile:Profile trace:Trace coverage:Coverage; do
         if [[ $mode == - ]]; then sub+=("$MSEP"); continue; fi
@@ -1614,28 +1606,61 @@ tray_menu() {
         sub+=("$REPLY")
     done
     if (( ! known )); then mitem "$XDEBUG_MODE" "" checked off; sub+=("$MSEP" "$REPLY"); fi
-    msub Xdebug "${sub[@]}"; items+=("$REPLY")
+    msub Xdebug "${sub[@]}"
+}
 
-    sub=()
-    flag=""; (( running )) || flag=off
-    act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$flag"; sub+=("$REPLY")
-    act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY"; sub+=("$REPLY")
-    act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub+=("$REPLY")
-    msub Tools "${sub[@]}"; items+=("$REPLY")
+# tray menu — the tray icon's menu as JSON (see tray/PROTOCOL.md).
+tray_menu() {
+    local running problem="" hint items=() sub=() i off=off state=stopped status=Stopped
+    TRAY_RUNNING=0
+    WSL_ROOT=''
+
+    # Asking for the running containers also shows whether Docker is there.
+    # The menu still works when it isn't, so say why rather than fail.
+    if ! running=$(services --filter status=running 2>/dev/null) && ! problem=$( (check_docker) 2>&1 >/dev/null ); then
+        hint=$(printf '%s\n' "$problem" | sed -n 's/^  Hint: //p' | head -n 1)
+        problem=$(printf '%s\n' "$problem" | sed -n 's/^✖ //p' | head -n 1)
+        [[ -z $hint ]] || problem+=". $hint"
+        state=error status="Can't reach Docker"
+    else
+        problem=""
+        load_env >/dev/null
+        load_built_php
+        if has_line "$running" nginx; then
+            TRAY_RUNNING=1 off="" state=running status="Running, $(count ${#SITE_NAMES[@]} site sites)"
+        fi
+        if is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then WSL_ROOT="\\\\wsl.localhost\\$WSL_DISTRO_NAME"; fi
+    fi
+
+    act open https://localhost; mitem "Open Dashboard" "$REPLY" bold "$off"; items+=("$REPLY" "$MSEP")
+    if [[ $state != error ]]; then
+        for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do site_menu "$i"; items+=("$REPLY"); done
+        if (( ! ${#SITE_NAMES[@]} )); then mitem "No sites yet" "" off; items+=("$REPLY"); fi
+        add_site_dialog; mitem "Add Site…" "$REPLY" idle; items+=("$REPLY" "$MSEP")
+    fi
+
+    if (( TRAY_RUNNING )); then
+        act_run "Stopping Novacore…" "Novacore has stopped" "" down; mitem "Stop Novacore" "$REPLY" idle; items+=("$REPLY")
+        act_run "Restarting Novacore…" "Novacore has restarted" "" restart; mitem "Restart Novacore" "$REPLY" idle; items+=("$REPLY")
+    else
+        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
+    fi
+
+    if [[ $state != error ]]; then
+        xdebug_menu; items+=("$REPLY")
+        act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$off"; sub+=("$REPLY")
+        act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY"; sub+=("$REPLY")
+        act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub+=("$REPLY")
+        msub Tools "${sub[@]}"; items+=("$REPLY")
+    fi
 
     act tray output; mitem "Show Output…" "$REPLY"; items+=("$REPLY")
     act tray refresh; mitem Refresh "$REPLY" idle; items+=("$REPLY" "$MSEP")
     act tray quit; mitem Quit "$REPLY"; items+=("$REPLY")
 
-    if (( running )); then
-        state=running
-        status="Running, $(count "$n" site sites)"
-    else
-        state=stopped
-        status=Stopped
-    fi
-    jlist "${items[@]}"
-    printf '{"version":1,"state":"%s","status":"%s","items":%s}\n' "$state" "$status" "$REPLY"
+    jlist "${items[@]}"; local list=$REPLY
+    jpairs state "$state" status "$status" ${problem:+problem "$problem"}
+    printf '{"version":1,%s,"items":%s}\n' "$REPLY" "$list"
 }
 
 # tray submit FORM FIELD=VALUE... — for the tray icons: run the command a
@@ -1669,17 +1694,19 @@ tray_submit() {
     exec "$NOVACORE_ROOT/bin/novacore" "${args[@]}"
 }
 
-# Where the tray icon's running command keeps its state: $L.log for its output,
-# $L.pid, $L.label and $L.done for the tray's messages, and $L.exit once done.
-tray_state() { echo "${TMPDIR:-/tmp}/novacore-tray-$(id -u)"; }
+# Where the running command from a tray icon or the Plasma widget keeps its
+# state: $L.log for its output, $L.pid, $L.label and $L.done for the messages
+# to show, and $L.exit once done.
+tray_state() { echo "${TMPDIR:-/tmp}/novacore-tray-$UID"; }
 
-# tray run LABEL DONE ARGS... — for the tray icons: run novacore ARGS detached,
-# so it finishes even if the tray icon stops or is reinstalled meanwhile.
+# tray run LABEL DONE ARGS... — for the tray icons and the Plasma widget: run
+# novacore ARGS detached, so it finishes even if they stop or are reinstalled
+# meanwhile.
 tray_run() {
     (( $# >= 3 )) || fail "Usage: novacore tray run <label> <done> <command...>"
     local L i
     L=$(tray_state)
-    if [[ ! -f $L.exit && -f $L.pid ]] && kill -0 "$(cat "$L.pid")" 2>/dev/null; then
+    if [[ ! -f $L.exit && -f $L.pid ]] && kill -0 "$(<"$L.pid")" 2>/dev/null; then
         fail "Another novacore command from the tray icon is still running"
     fi
     rm -f "$L.exit" "$L.pid"
@@ -1702,17 +1729,22 @@ tray_run() {
     for (( i = 0; i < 50; i++ )); do [[ -s $L.pid ]] && return; sleep 0.1; done
 }
 
-# tray poll — for the tray icons: the command's exit code (blank while it
-# runs), "alive" or "dead", its label and done message, then its output.
+# tray poll — for the tray icons and the Plasma widget: the command's exit
+# code (blank while it runs), "alive" or "dead", its label and done message,
+# then its output. They ask every second, so this reads the files itself
+# rather than starting a program for each.
 tray_poll() {
-    local L p
+    local L code="" pid="" label="" done="" alive=dead
     L=$(tray_state)
-    cat "$L.exit" 2>/dev/null || echo
-    p=$(cat "$L.pid" 2>/dev/null) || true
+    {
+        read -r code < "$L.exit"
+        read -r pid < "$L.pid"
+        IFS= read -r label < "$L.label"
+        IFS= read -r done < "$L.done"
+    } 2>/dev/null || true
     # Check the PID isn't empty: kill -0 "" would signal our own process group.
-    if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi
-    cat "$L.label" 2>/dev/null; echo
-    cat "$L.done" 2>/dev/null; echo
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then alive=alive; fi
+    printf '%s\n' "$code" "$alive" "$label" "$done"
     tail -n 200 "$L.log" 2>/dev/null || true
 }
 
@@ -1802,7 +1834,6 @@ mac_tray_hash() {
 }
 
 xml_str() {
-    shopt -u patsub_replacement 2>/dev/null || true
     local s=${1//&/&amp;}
     s=${s//</&lt;}
     s=${s//>/&gt;}

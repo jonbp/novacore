@@ -41,6 +41,12 @@ struct Output {
 
     var lines: [String] { (out + err).components(separatedBy: "\n") }
 
+    // novacore's own error message among LINES, which starts with a heavy
+    // cross, if it wrote one.
+    static func failure(in lines: [String]) -> String? {
+        lines.last { $0.trimmed.hasPrefix("\u{2716}") }
+    }
+
     // The line that best explains a failure: the first novacore wrote to
     // stderr, where its error messages go, else the first it wrote at all.
     var errorLine: String {
@@ -570,9 +576,9 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         } else if let path = action["folder"] as? String {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
         } else if let path = action["editor"] as? String, let app = editor(for: action) {
-            NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+            open(URL(fileURLWithPath: path), with: app)
         } else if let path = action["terminal"] as? String, let terminal {
-            NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
+            open(URL(fileURLWithPath: path), with: terminal)
         } else if let args = action["console"] as? [String] {
             openConsole(title, args)
         } else if let args = action["run"] as? [String] {
@@ -590,6 +596,10 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
             default: break
             }
         }
+    }
+
+    func open(_ file: URL, with app: URL) {
+        NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
     }
 
     // Run novacore ARGS in a new Terminal window, through a .command file,
@@ -611,7 +621,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         do {
             try script.write(to: file, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
-            NSWorkspace.shared.open([file], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
+            open(file, with: terminal)
         } catch {
             notify("Couldn't open a terminal", error.localizedDescription)
         }
@@ -666,8 +676,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
             if exit == "0" {
                 self.notify("Novacore", done.isEmpty ? "Done: \(label.withoutLabelEllipsis)" : done, url: self.actionURL)
             } else {
-                // novacore's own error message starts with a heavy cross.
-                var message = log.last { $0.trimmed.hasPrefix("\u{2716}") } ?? log.last { !$0.trimmed.isEmpty }
+                var message = Output.failure(in: log) ?? log.last { !$0.trimmed.isEmpty }
                 if exit.isEmpty { message = "novacore stopped before it finished." }
                 self.notify("Couldn't finish: \(label.withoutLabelEllipsis)",
                             message?.withoutLeadingSymbols ?? "novacore exited with code \(exit)", showsOutput: true)
@@ -704,7 +713,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
             // Don't try that version again, e.g. one saved mid-edit.
             self.skippedUpdate = hash
             self.output = result.lines
-            let message = result.lines.last { $0.trimmed.hasPrefix("\u{2716}") } ?? result.errorLine
+            let message = Output.failure(in: result.lines) ?? result.errorLine
             self.notify("Couldn't update the menu bar icon", message.withoutLeadingSymbols, showsOutput: true)
             self.updateView()
         }

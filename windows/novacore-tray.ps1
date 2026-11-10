@@ -351,6 +351,14 @@ if ($png) {
 $AppName = 'Novacore Tray'
 $AppId = 'Novacore.Tray'
 $script:appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore'
+# Where `novacore tray install` puts this script. Only that copy hands over to
+# NovacoreTray.exe and keeps itself up to date, not one run from elsewhere,
+# e.g. the repo itself.
+$script:installed = $PSCommandPath -eq (Join-Path $script:appDir 'novacore-tray.ps1')
+
+function Get-Hash([string] $path) {
+    (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+}
 
 function Register-AppId {
     $key = "HKCU:\Software\Classes\AppUserModelId\$AppId"
@@ -418,14 +426,14 @@ static class NovacoreTray {
 # Startup shortcut at it. Returns whether it did, in which case this copy
 # should quit.
 function Start-Launcher {
-    if ($PSCommandPath -ne (Join-Path $script:appDir 'novacore-tray.ps1')) { return $false }
+    if (-not $script:installed) { return $false }
     if ([System.Diagnostics.Process]::GetCurrentProcess().ProcessName -eq 'NovacoreTray') { return $false }
     $exe = Join-Path $script:appDir 'NovacoreTray.exe'
     $cs = Join-Path $script:appDir 'NovacoreTray.cs'
     # The source, noting the icon's hash, so a new icon rebuilds it too.
     $source = $LauncherSource
     $hasIcon = Test-Path -LiteralPath $script:appIcon
-    if ($hasIcon) { $source += "`n// Icon: $((Get-FileHash -LiteralPath $script:appIcon -Algorithm SHA256).Hash)`n" }
+    if ($hasIcon) { $source += "`n// Icon: $(Get-Hash $script:appIcon)`n" }
     $built = (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cs) -and
         ([System.IO.File]::ReadAllText($cs) -eq $source)
     if (-not $built) {
@@ -472,6 +480,11 @@ function ConvertTo-Arg([string] $s) {
     '"' + ($s -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
 
+# ARGUMENTS as one Windows command line.
+function Join-Args([string[]] $Arguments) {
+    ($Arguments | ForEach-Object { ConvertTo-Arg $_ }) -join ' '
+}
+
 # wsl.exe's arguments to run novacore with ARGUMENTS. -e runs it directly,
 # not through the user's shell, which might not be a POSIX one.
 function Get-NovacoreArgs([string[]] $Arguments) {
@@ -483,7 +496,7 @@ function Get-NovacoreArgs([string[]] $Arguments) {
 function Start-WslJob([string[]] $Arguments, [scriptblock] $OnDone) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:WINDIR 'System32\wsl.exe'
-    $psi.Arguments = ($Arguments | ForEach-Object { ConvertTo-Arg $_ }) -join ' '
+    $psi.Arguments = Join-Args $Arguments
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -606,9 +619,7 @@ function Request-Status {
 # successful status check, while WSL is up anyway, so reading the repo doesn't
 # start WSL. The repo is where the CLI is: <repo>/bin/novacore.
 function Update-Self {
-    # Only the installed copy, not one run from elsewhere, e.g. the repo itself.
-    $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore\novacore-tray.ps1'
-    if ($PSCommandPath -ne $installed) { return }
+    if (-not $script:installed) { return }
     if ($script:lastUpdateCheck -and ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -lt 60) { return }
     # Restarting would close the menu or a dialog in use, so wait for a quiet
     # moment. A running command is fine to leave: it runs on its own in WSL.
@@ -617,13 +628,13 @@ function Update-Self {
 
     $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/windows/novacore-tray.ps1')
     if (-not (Test-Path -LiteralPath $source)) { return }
-    $new = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-    $scriptChanged = $new -ne (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    $new = Get-Hash $source
+    $scriptChanged = $new -ne (Get-Hash $PSCommandPath)
     # And its icon, which NovacoreTray.exe is built with.
     $sourceIcon = Join-Path (Split-Path $source) 'novacore.ico'
     $iconChanged = (Test-Path -LiteralPath $sourceIcon) -and (
         -not (Test-Path -LiteralPath $script:appIcon) -or
-        (Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $script:appIcon -Algorithm SHA256).Hash)
+        (Get-Hash $sourceIcon) -ne (Get-Hash $script:appIcon))
     if (-not $scriptChanged -and -not $iconChanged) { return }
 
     if ($scriptChanged) {
@@ -645,6 +656,11 @@ function Update-Self {
     $arguments = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden " +
         "-File `"$PSCommandPath`" -Distro `"$Distro`" -Command `"$Command`" -RefreshInterval $RefreshInterval -Updated"
     Start-Process (Join-Path $env:WINDIR 'System32\conhost.exe') -ArgumentList $arguments
+    Exit-Tray
+}
+
+# Take the icon out of the notification area and stop.
+function Exit-Tray {
     $script:notify.Visible = $false
     $script:notify.Dispose()
     $script:context.ExitThread()
@@ -844,10 +860,8 @@ function Invoke-MenuAction($a) {
     elseif ($a.tray -eq 'output') { Show-Output }
     elseif ($a.tray -eq 'refresh') { Update-Status -Wake }
     elseif ($a.tray -eq 'quit') {
-        $script:notify.Visible = $false
-        $script:notify.Dispose()
         if ($script:outputForm) { $script:outputForm.Close() }
-        $script:context.ExitThread()
+        Exit-Tray
     }
 }
 
@@ -865,15 +879,11 @@ function Show-Problem($err) {
 # The output of the last action, like the Plasma widget's log.
 function Show-Output {
     if (-not $script:outputForm) {
-        $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
-        $scale = $g.DpiX / 96
-        $g.Dispose()
-
         $form = New-Object System.Windows.Forms.Form
         $form.Text = 'Novacore'
         $form.Icon = $script:windowIcon
         $form.StartPosition = 'CenterScreen'
-        $form.Size = New-Object System.Drawing.Size ([int] (760 * $scale)), ([int] (440 * $scale))
+        $form.Size = New-Object System.Drawing.Size (S 760), (S 440)
 
         $box = New-Object System.Windows.Forms.TextBox
         $box.Multiline = $true
@@ -920,10 +930,10 @@ function Start-Terminal([string] $Title, [string[]] $Arguments) {
     $wsl = @('-d', $Distro) + $Arguments
     if ($script:wt) {
         # Windows Terminal reads ; as a separator between its own commands.
-        $line = (@('--title', $Title, 'wsl.exe') + $wsl | ForEach-Object { ConvertTo-Arg $_ }) -join ' '
+        $line = Join-Args (@('--title', $Title, 'wsl.exe') + $wsl)
         Start-Process $script:wt -ArgumentList ($line -replace ';', '\;')
     } else {
-        Start-Process (Join-Path $env:WINDIR 'System32\wsl.exe') -ArgumentList (($wsl | ForEach-Object { ConvertTo-Arg $_ }) -join ' ')
+        Start-Process (Join-Path $env:WINDIR 'System32\wsl.exe') -ArgumentList (Join-Args $wsl)
     }
 }
 
@@ -1018,14 +1028,19 @@ function Add-Row($grid, [object[]] $controls) {
     }
 }
 
+# A control across all of GRID's columns.
+function Add-Wide($grid, $control) {
+    $row = $grid.RowCount
+    $grid.RowCount = $row + 1
+    $grid.Controls.Add($control, 0, $row)
+    $grid.SetColumnSpan($control, $grid.ColumnCount)
+}
+
 # A heading across GRID's columns.
 function Add-Heading($grid, [string] $text) {
     $label = New-Label $text -Bold
     $label.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, (S 2)
-    $row = $grid.RowCount
-    $grid.RowCount = $row + 1
-    $grid.Controls.Add($label, 0, $row)
-    $grid.SetColumnSpan($label, $grid.ColumnCount)
+    Add-Wide $grid $label
 }
 
 # A row of BUTTONS, right-aligned, for the bottom of a dialog.
@@ -1060,14 +1075,6 @@ function New-Button([string] $text, $result = $null) {
     $button.MinimumSize = New-Object System.Drawing.Size (S 88), 0
     if ($null -ne $result) { $button.DialogResult = $result }
     $button
-}
-
-# A control across both of GRID's columns.
-function Add-Wide($grid, $control) {
-    $row = $grid.RowCount
-    $grid.RowCount = $row + 1
-    $grid.Controls.Add($control, 0, $row)
-    $grid.SetColumnSpan($control, $grid.ColumnCount)
 }
 
 # Replace {id} in TEXT with each of VALUES' answers.

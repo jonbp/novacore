@@ -15,7 +15,7 @@ To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
 | Command | Output |
 |---|---|
 | `tray menu` | The menu, as JSON (see below). It exits 0 even when Docker is unreachable, and says why in `problem`. |
-| `tray run LABEL DONE ARGS…` | Runs `novacore ARGS…` detached, so it finishes even if the icon quits. It fails if another command from the tray is still running. |
+| `tray run LABEL DONE ARGS…` | Runs `novacore ARGS…` detached, so it finishes even if the icon quits. It fails if another command from the tray is still running. The Plasma widget runs its commands this way too. |
 | `tray poll` | The running command's state, one item per line: the exit code (blank while it runs), `alive` or `dead`, LABEL, DONE, then its output. |
 | `tray submit FORM ID=VALUE…` | Runs the command that a form stands for, with the form's answers. |
 

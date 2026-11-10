@@ -41,16 +41,10 @@ PlasmoidItem {
     readonly property string novacore: 'PATH="$HOME/.local/bin:$PATH" ' + (Plasmoid.configuration.command || "novacore")
     readonly property string statusCommand: novacore + " status --json"
 
-    // Actions run detached from plasmashell, so a long build survives a Plasma
-    // restart. They write their output to $L.log, their PID to $L.pid, a label
-    // to $L.label and finally their exit code to $L.exit.
-    readonly property string files: 'L="${XDG_RUNTIME_DIR:-/tmp}/novacore-widget"; '
-    readonly property string pollCommand: files
-        + 'cat "$L.exit" 2>/dev/null || echo; '
-        // Check the PID isn't empty: `kill -0 ""` signals our own process group.
-        + 'p=$(cat "$L.pid" 2>/dev/null); ([ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo alive) || echo dead; '
-        + 'cat "$L.label" 2>/dev/null; echo; '
-        + 'tail -n 200 "$L.log" 2>/dev/null'
+    // Actions run through `novacore tray run`, as the tray icons' do: detached
+    // from plasmashell, so a long build survives a Plasma restart. `novacore
+    // tray poll` then says how the action is doing (see tray/PROTOCOL.md).
+    readonly property string pollCommand: novacore + " tray poll"
 
     function shellQuote(s) {
         return "'" + s.replace(/'/g, "'\\''") + "'"
@@ -68,9 +62,8 @@ PlasmoidItem {
         actionError = ""
         logLines = []
         showLog = true
-        const job = 'echo $$ > "$1.pid"; ' + novacore + " " + args + ' > "$1.log" 2>&1; echo $? > "$1.exit"'
-        executable.exec(files + 'rm -f "$L.exit"; printf %s ' + shellQuote(label) + ' > "$L.label"; '
-            + "setsid sh -c " + shellQuote(job) + ' sh "$L" < /dev/null > /dev/null 2>&1 &')
+        // No done message: the widget shows the outcome itself.
+        executable.exec(novacore + " tray run " + shellQuote(label) + " '' " + args)
     }
 
     function setRunning(up) {
@@ -88,7 +81,8 @@ PlasmoidItem {
         const exit = lines[0].trim()
         const alive = lines[1] === "alive"
         const label = lines[2]
-        const log = lines.slice(3)
+        // lines[3] is the done message, which is for the tray icons.
+        const log = lines.slice(4)
         while (log.length && log[log.length - 1].trim() === "") log.pop()
 
         if (exit === "" && alive) {
