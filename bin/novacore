@@ -1351,7 +1351,8 @@ cmd_trust() {
 
 # --- Tray icons ---------------------------------------------------------------
 #
-# The macOS menu bar icon (macos/NovacoreTray.swift) and the Windows tray icon
+# The Linux tray icon (linux/novacore-tray.py), the macOS menu bar icon
+# (macos/NovacoreTray.swift) and the Windows tray icon
 # (windows/novacore-tray.ps1) share everything but drawing: `tray menu` tells
 # them what to show and what each item does, `tray run` and `tray poll` run a
 # command for them, and `tray submit` turns a dialog's answers into a command.
@@ -1938,6 +1939,122 @@ macos_tray_uninstall() {
     echo
 }
 
+# --- Linux tray icon ---
+
+LINUX_TRAY_ID=novacore-tray
+LINUX_TRAY_APP="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$LINUX_TRAY_ID.desktop"
+LINUX_TRAY_AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$LINUX_TRAY_ID.desktop"
+LINUX_TRAY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/novacore"
+LINUX_TRAY_PID="${XDG_RUNTIME_DIR:-$LINUX_TRAY_STATE}/$LINUX_TRAY_ID.pid"
+
+# desktop_arg ARG — ARG quoted for a .desktop file's Exec line.
+desktop_arg() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//\`/\\\`}
+    s=${s//\$/\\\$}
+    # Then escaped again as the key's string value, and % for field codes.
+    s=${s//\\/\\\\}
+    s=${s//%/%%}
+    printf '"%s"' "$s"
+}
+
+# The command that installs PySide6 on this distro.
+pyside_hint() {
+    local id=""
+    # shellcheck disable=SC1091
+    [[ -r /etc/os-release ]] && id=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
+    case " $id " in
+        *" fedora "*|*" rhel "*)   echo "Run sudo dnf install python3-pyside6, then try again" ;;
+        *" debian "*|*" ubuntu "*) echo "Run sudo apt install python3-pyside6.qtwidgets, then try again" ;;
+        *" arch "*)                echo "Run sudo pacman -S pyside6, then try again" ;;
+        *" suse "*|*opensuse*)     echo "Run sudo zypper install python3-pyside6, then try again" ;;
+        *)                         echo "Install PySide6 or PyQt6 for python3 from your distro's packages, then try again" ;;
+    esac
+}
+
+# Add the tray icon to the app launcher and the autostart folder, and start it
+# now. It runs from the repo, so there's nothing to update after a git pull: it
+# restarts itself when its source changes.
+linux_tray_install() {
+    header "Installing the tray icon"
+    heading "Linux tray icon"
+    local python script="$NOVACORE_ROOT/linux/novacore-tray.py" entry
+    command -v python3 >/dev/null || fail "The tray icon needs Python 3" "$(pyside_hint)"
+    python3 -c 'import PySide6.QtWidgets' 2>/dev/null || python3 -c 'import PyQt6.QtWidgets' 2>/dev/null ||
+        fail "The tray icon needs Qt for Python (PySide6 or PyQt6)" "$(pyside_hint)"
+    # The real interpreter, not a wrapper such as pyenv's, which can pick
+    # another at login.
+    python=$(python3 -c 'import sys; print(sys.executable)')
+
+    entry="[Desktop Entry]
+Type=Application
+Name=Novacore Tray
+GenericName=Local PHP sites
+Comment=Start and stop Novacore, and open your sites
+Exec=$(desktop_arg "$python") $(desktop_arg "$script")
+Icon=$NOVACORE_ROOT/tray/novacore.svg
+Terminal=false
+Categories=Development;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true"
+    mkdir -p "$(dirname "$LINUX_TRAY_APP")" "$(dirname "$LINUX_TRAY_AUTOSTART")"
+    printf '%s\n' "$entry" > "$LINUX_TRAY_APP"
+    printf '%s\n' "$entry" > "$LINUX_TRAY_AUTOSTART"
+
+    if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+        result "Installed. It starts next time you log in to your desktop"
+    else
+        # It replaces one that's already running.
+        setsid -f "$python" "$script" < /dev/null > /dev/null 2>&1
+        result "Installed. It starts when you log in"
+    fi
+    case ${XDG_CURRENT_DESKTOP:-} in
+        *GNOME*) hint "GNOME shows it with the AppIndicator extension (gnome-shell-extension-appindicator)" ;;
+    esac
+    if is_plasma; then
+        heading "KDE Plasma widget"
+        if kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
+            run kpackagetool6 -t Plasma/Applet -u "$NOVACORE_ROOT/plasmoid" || fail "Couldn't update the Plasma widget"
+            result "Updated. One already on a panel picks it up when Plasma restarts"
+        else
+            run kpackagetool6 -t Plasma/Applet -i "$NOVACORE_ROOT/plasmoid" || fail "Couldn't install the Plasma widget"
+            result "Installed. Add Novacore to a panel or the desktop from Add Widgets"
+        fi
+    fi
+    complete Installed
+    echo
+}
+
+PLASMOID_ID=com.github.jonbp.novacore
+
+# Whether this is a KDE Plasma session that can install the widget.
+is_plasma() {
+    [[ :${XDG_CURRENT_DESKTOP:-}: == *:KDE:* ]] && command -v kpackagetool6 >/dev/null
+}
+
+linux_tray_uninstall() {
+    header "Removing the tray icon"
+    heading "Linux tray icon"
+    local pid
+    if pid=$(cat "$LINUX_TRAY_PID" 2>/dev/null) && [[ $pid =~ ^[0-9]+$ ]] &&
+        grep -q novacore-tray "/proc/$pid/cmdline" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$LINUX_TRAY_APP" "$LINUX_TRAY_AUTOSTART" "$LINUX_TRAY_PID" \
+        "$LINUX_TRAY_STATE/tray.log" "$LINUX_TRAY_STATE/tray.hash"
+    rmdir "$LINUX_TRAY_STATE" 2>/dev/null || true
+    result "Removed"
+    if is_plasma && kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
+        heading "KDE Plasma widget"
+        run kpackagetool6 -t Plasma/Applet -r "$PLASMOID_ID" || fail "Couldn't remove the Plasma widget"
+        result "Removed"
+    fi
+    complete Removed
+    echo
+}
+
 cmd_tray() {
     case ${1:-} in
         run)    shift; tray_run "$@"; return ;;
@@ -1951,9 +2068,10 @@ cmd_tray() {
     elif is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then
         os=windows
         command -v powershell.exe >/dev/null || fail "Can't find powershell.exe" "Is Windows interop turned on in WSL?"
+    elif [[ $(uname) == Linux ]]; then
+        os=linux
     else
-        fail "The tray icon is for macOS, and Windows with Novacore in WSL" \
-            "On KDE Plasma, use the widget in plasmoid/ instead"
+        fail "The tray icon is for Linux, macOS, and Windows with Novacore in WSL"
     fi
     case ${1:-install} in
         install)   "${os}_tray_install" ;;
@@ -1978,7 +2096,7 @@ Stack:
   build [--all]               Rebuild images (--all builds every PHP version)
   prune [--cache]             Remove images of PHP versions no site uses
   trust                       Trust Novacore's local CA (one-off, uses sudo)
-  tray [install|uninstall]    macOS or Windows (WSL): add Novacore to the menu bar or taskbar
+  tray [install|uninstall]    Add Novacore to the tray (Linux, Windows via WSL) or menu bar (macOS)
 
 Sites:
   site add <name> [--php X.Y] [--root DIR] [--no-db]

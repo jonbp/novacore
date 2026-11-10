@@ -1,12 +1,12 @@
 # Tray icon protocol
 
-Novacore has two tray icons: the macOS menu bar icon (`macos/NovacoreTray.swift`) and the Windows tray icon (`windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Both icons pick it up straight away.
+Novacore has three tray icons: the Linux tray icon (`linux/novacore-tray.py`), the macOS menu bar icon (`macos/NovacoreTray.swift`) and the Windows tray icon (`windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
 
 ## Adding a feature
 
-1. **A menu item that runs a command:** add it in `tray_menu` in `bin/novacore`, with `act_run` for its action. That's all. Both icons show it, grey it out while another command runs (`idle`), and notify you when it finishes.
+1. **A menu item that runs a command:** add it in `tray_menu` in `bin/novacore`, with `act_run` for its action. That's all. Every icon shows it, grey it out while another command runs (`idle`), and notify you when it finishes.
 2. **A dialog that asks for something:** describe it as a form (see below), with an action that runs `tray submit <form>`. Then add a case to `tray_submit` that turns the answers into the real command.
-3. **Something an icon can't do yet**, such as a new kind of action or field: add it to both icons and document it here. Keep the description generic, so the next feature that needs it can use it too.
+3. **Something an icon can't do yet**, such as a new kind of action or field: add it to every icon and document it here. Keep the description generic, so the next feature that needs it can use it too.
 
 To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
 
@@ -54,7 +54,7 @@ An action has one of these keys:
 | Action | Does |
 |---|---|
 | `{"open": URL}` | Opens a URL in the browser. |
-| `{"folder": PATH}` | Opens a folder in Finder or Explorer. On Windows, the path in WSL is opened as `\\wsl.localhost\<distro>\…`. |
+| `{"folder": PATH}` | Opens a folder in the file manager, Finder or Explorer. On Windows, the path in WSL is opened as `\\wsl.localhost\<distro>\…`. |
 | `{"editor": PATH, "app": A}` | Opens a folder in an editor: A is `vscode` (the default) or `zed`. The item is hidden if that editor isn't installed. On Windows, it opens through the editor's WSL support. |
 | `{"terminal": PATH, "title": T}` | Opens a terminal in a folder. |
 | `{"console": [ARGS…], "title": T}` | Runs `novacore ARGS…` in a new terminal, for interactive commands such as `shell` or `logs`. |
@@ -89,7 +89,7 @@ When you submit the form, its action runs with one `ID=VALUE` argument added for
 
 Any field can have `"enabled": false`. A text field's `hint` shows under it while its value is valid, with `{value}` replaced by what you typed. Its `rules` are checked in order, and the first one that fails shows its `error`, also with `{value}` replaced:
 
-- `{"match": REGEX, "error": …}` fails when the value doesn't match. Keep REGEX to syntax that .NET and ICU share.
+- `{"match": REGEX, "error": …}` fails when the value doesn't match. Keep REGEX to syntax that .NET, ICU and PCRE2 (Qt) share.
 - `{"notIn": [STRINGS], "error": …}` fails when the value is one of them.
 
 ## Info dialogs
