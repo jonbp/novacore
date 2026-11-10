@@ -273,31 +273,32 @@ function New-NovacoreIcon([string] $foreground, [string] $badgeColor = '') {
     [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 
-# Novacore's own icon, the globe in its teal without a badge, as an .ico file
-# with the sizes Windows asks for, each stored as a PNG.
-function Save-NovacoreIco([string] $path) {
-    $sizes = 16, 20, 24, 32, 40, 48, 64, 256
-    $images = foreach ($size in $sizes) {
-        $bmp = New-NovacoreBitmap $size '#17D4A4'
-        $stream = New-Object System.IO.MemoryStream
-        $bmp.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-        $bmp.Dispose()
-        , $stream.ToArray()
-    }
-    $out = New-Object System.IO.BinaryWriter ([System.IO.File]::Create($path))
-    try {
-        $out.Write([uint16] 0); $out.Write([uint16] 1); $out.Write([uint16] $sizes.Count)
-        $offset = 6 + 16 * $sizes.Count
-        for ($i = 0; $i -lt $sizes.Count; $i++) {
-            # 0 stands for 256.
-            $side = [byte] ($sizes[$i] % 256)
-            $out.Write($side); $out.Write($side); $out.Write([byte] 0); $out.Write([byte] 0)
-            $out.Write([uint16] 1); $out.Write([uint16] 32)
-            $out.Write([uint32] $images[$i].Length); $out.Write([uint32] $offset)
-            $offset += $images[$i].Length
+# Novacore's project icon, for the app itself: its program, notifications
+# and windows. It's novacore.ico, next to this script, rendered from
+# novacore.svg by build-icon.sh. Each of its images is a PNG.
+$script:appIcon = Join-Path $PSScriptRoot 'novacore.ico'
+
+# The PNG bytes of the .ico's image closest to SIZE, at least as big if there
+# is one, or $null without the file.
+function Get-AppIconPng([int] $size) {
+    if (-not (Test-Path -LiteralPath $script:appIcon)) { return $null }
+    $bytes = [System.IO.File]::ReadAllBytes($script:appIcon)
+    $best = $null
+    for ($i = 0; $i -lt [BitConverter]::ToUInt16($bytes, 4); $i++) {
+        $entry = 6 + 16 * $i
+        $side = if ($bytes[$entry] -eq 0) { 256 } else { [int] $bytes[$entry] }
+        $better = (-not $best) -or
+            ($best.Side -lt $size -and $side -gt $best.Side) -or
+            ($side -ge $size -and $side -lt $best.Side)
+        if ($better) {
+            $best = @{
+                Side   = $side
+                Length = [BitConverter]::ToUInt32($bytes, $entry + 8)
+                Offset = [BitConverter]::ToUInt32($bytes, $entry + 12)
+            }
         }
-        foreach ($image in $images) { $out.Write($image) }
-    } finally { $out.Dispose() }
+    }
+    , $bytes[$best.Offset..($best.Offset + $best.Length - 1)]
 }
 
 # The status icons, redrawn when the taskbar changes between light and dark.
@@ -318,8 +319,14 @@ function Update-Icons {
 }
 [void] (Update-Icons)
 
-# For windows' title bars: the globe in Novacore's teal, without a badge.
-$script:windowIcon = New-NovacoreIcon '#17D4A4'
+# For windows' title bars and Alt+Tab: the project icon, at the size of a
+# normal icon, which Windows scales down for the title bar.
+$script:windowIcon = $null
+$png = Get-AppIconPng ([System.Windows.Forms.SystemInformation]::IconSize.Width)
+if ($png) {
+    $bmp = New-Object System.Drawing.Bitmap (New-Object System.IO.MemoryStream (, $png))
+    $script:windowIcon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
 
 # --- Launcher -----------------------------------------------------------------
 
@@ -340,17 +347,18 @@ $AppId = 'Novacore.Tray'
 $script:appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore'
 
 function Register-AppId {
-    $png = Join-Path $script:appDir 'novacore.png'
-    if (-not (Test-Path -LiteralPath $png)) {
-        New-Item -ItemType Directory -Force $script:appDir | Out-Null
-        $bmp = New-NovacoreBitmap 64 '#17D4A4'
-        $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
-        $bmp.Dispose()
-    }
     $key = "HKCU:\Software\Classes\AppUserModelId\$AppId"
     New-Item -Force $key | Out-Null
     Set-ItemProperty $key DisplayName $AppName
-    Set-ItemProperty $key IconUri $png
+    # Notifications want an image file, so save the icon's 64px image. Written
+    # every time, so it follows changes to the icon.
+    $png = Get-AppIconPng 64
+    if ($png) {
+        $file = Join-Path $script:appDir 'novacore.png'
+        New-Item -ItemType Directory -Force $script:appDir | Out-Null
+        [System.IO.File]::WriteAllBytes($file, $png)
+        Set-ItemProperty $key IconUri $file
+    }
     [void] [Novacore.Native]::SetCurrentProcessExplicitAppUserModelID($AppId)
 }
 
@@ -408,25 +416,28 @@ function Start-Launcher {
     if ([System.Diagnostics.Process]::GetCurrentProcess().ProcessName -eq 'NovacoreTray') { return $false }
     $exe = Join-Path $script:appDir 'NovacoreTray.exe'
     $cs = Join-Path $script:appDir 'NovacoreTray.cs'
+    # The source, noting the icon's hash, so a new icon rebuilds it too.
+    $source = $LauncherSource
+    $hasIcon = Test-Path -LiteralPath $script:appIcon
+    if ($hasIcon) { $source += "`n// Icon: $((Get-FileHash -LiteralPath $script:appIcon -Algorithm SHA256).Hash)`n" }
     $built = (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cs) -and
-        ([System.IO.File]::ReadAllText($cs) -eq $LauncherSource)
+        ([System.IO.File]::ReadAllText($cs) -eq $source)
     if (-not $built) {
         # The copy this one is updating from may still be shutting down.
         Get-Process NovacoreTray -ErrorAction SilentlyContinue | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-        $ico = Join-Path $script:appDir 'novacore.ico'
-        Save-NovacoreIco $ico
         $options = New-Object System.CodeDom.Compiler.CompilerParameters
         $options.GenerateExecutable = $true
         $options.OutputAssembly = $exe
-        $options.CompilerOptions = "/target:winexe /optimize /win32icon:`"$ico`""
+        $options.CompilerOptions = '/target:winexe /optimize'
+        if ($hasIcon) { $options.CompilerOptions += " /win32icon:`"$($script:appIcon)`"" }
         foreach ($assembly in 'System.dll', 'System.Core.dll', [PSObject].Assembly.Location) {
             [void] $options.ReferencedAssemblies.Add($assembly)
         }
-        $result = (New-Object Microsoft.CSharp.CSharpCodeProvider).CompileAssemblyFromSource($options, $LauncherSource)
+        $result = (New-Object Microsoft.CSharp.CSharpCodeProvider).CompileAssemblyFromSource($options, $source)
         if ($result.Errors.HasErrors) {
             throw "Couldn't build NovacoreTray.exe: $(@($result.Errors | Where-Object { -not $_.IsWarning })[0])"
         }
-        [System.IO.File]::WriteAllText($cs, $LauncherSource)
+        [System.IO.File]::WriteAllText($cs, $source)
     }
 
     $arguments = "-Distro $(ConvertTo-Arg $Distro) -Command $(ConvertTo-Arg $Command) -RefreshInterval $RefreshInterval"
@@ -584,10 +595,10 @@ function Request-Status {
     })
 }
 
-# Replace this script with the repo's copy when that has changed, e.g. after
-# a git pull, and restart into it. It runs after a successful status check,
-# while WSL is up anyway, so reading the repo doesn't start WSL. The repo is
-# where the CLI is: <repo>/bin/novacore.
+# Replace this script and its icon with the repo's copies when they have
+# changed, e.g. after a git pull, and restart into it. It runs after a
+# successful status check, while WSL is up anyway, so reading the repo doesn't
+# start WSL. The repo is where the CLI is: <repo>/bin/novacore.
 function Update-Self {
     # Only the installed copy, not one run from elsewhere, e.g. the repo itself.
     $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Novacore\novacore-tray.ps1'
@@ -601,19 +612,27 @@ function Update-Self {
     $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/windows/novacore-tray.ps1')
     if (-not (Test-Path -LiteralPath $source)) { return }
     $new = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-    if ($new -eq (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash) { return }
-    if ($new -eq $script:skippedUpdate) { return }
+    $scriptChanged = $new -ne (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    # And its icon, which NovacoreTray.exe is built with.
+    $sourceIcon = Join-Path (Split-Path $source) 'novacore.ico'
+    $iconChanged = (Test-Path -LiteralPath $sourceIcon) -and (
+        -not (Test-Path -LiteralPath $script:appIcon) -or
+        (Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $script:appIcon -Algorithm SHA256).Hash)
+    if (-not $scriptChanged -and -not $iconChanged) { return }
 
-    # Don't swap in a script that won't run, e.g. one saved mid-edit.
-    $errors = $null
-    [void] [System.Management.Automation.Language.Parser]::ParseFile($source, [ref] $null, [ref] $errors)
-    if ($errors) {
-        $script:skippedUpdate = $new
-        Show-Problem "Not updating the tray icon: windows/novacore-tray.ps1 has errors. $($errors[0])"
-        return
+    if ($scriptChanged) {
+        if ($new -eq $script:skippedUpdate) { return }
+        # Don't swap in a script that won't run, e.g. one saved mid-edit.
+        $errors = $null
+        [void] [System.Management.Automation.Language.Parser]::ParseFile($source, [ref] $null, [ref] $errors)
+        if ($errors) {
+            $script:skippedUpdate = $new
+            Show-Problem "Not updating the tray icon: windows/novacore-tray.ps1 has errors. $($errors[0])"
+            return
+        }
+        Copy-Item -LiteralPath $source -Destination $PSCommandPath -Force
     }
-
-    Copy-Item -LiteralPath $source -Destination $PSCommandPath -Force
+    if ($iconChanged) { Copy-Item -LiteralPath $sourceIcon -Destination $script:appIcon -Force }
     # Let the new one take the single-instance lock, then hand over to it.
     $script:mutex.ReleaseMutex()
     $script:mutex.Dispose()

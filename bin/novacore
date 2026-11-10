@@ -1322,6 +1322,7 @@ tray_install() {
 New-Item -ItemType Directory -Force $dir | Out-Null
 $ps1 = Join-Path $dir "novacore-tray.ps1"
 Copy-Item -LiteralPath $env:NC_SCRIPT -Destination $ps1 -Force
+Copy-Item -LiteralPath (Join-Path (Split-Path $env:NC_SCRIPT) "novacore.ico") -Destination $dir -Force
 
 # A headless console, so no window flashes up as PowerShell starts.
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
