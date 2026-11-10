@@ -35,7 +35,9 @@ To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
 - `status` follows "Novacore ·" in the first line of the menu. `problem`, if present, goes on the line below it.
 - The icons add that heading and the separator under it. `items` is everything else.
 
-An item is either `{"separator": true}` or:
+An item is either a separator, `{"separator": true}`, or an item. A separator with a `label` starts a section with that heading. Icons that draw a menu can leave the heading out and just draw a line.
+
+An item has these keys:
 
 | Key | Meaning |
 |---|---|
@@ -46,6 +48,12 @@ An item is either `{"separator": true}` or:
 | `idle` | `true` greys it out while a command from the tray runs. Use it for anything that changes something. |
 | `checked` | `true` shows a check mark. |
 | `bold` | `true` shows it in bold, for the main thing a menu does. |
+| `icon` | The name of a picture to show beside it (see below). |
+| `detail` | A second line of text under the label, such as a site's URL and PHP version. |
+
+`icon` and `detail` are for icons that draw a panel rather than a menu, which is only the Windows one for now. The others leave them out. Without an `icon`, the Windows one picks a picture from the item's action. The names are `dashboard`, `site` (a submenu for a site, shown with its initials), `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
+
+The Windows panel lays the menu out like this, so it suits any menu that follows these conventions: if the first item is bold and has an action, clicking the panel's heading does it, instead of it having a row; commands that run (`run`) next to each other become a row of buttons; the icon's own commands (`tray`) go along the bottom; a submenu's bold item becomes a button on its row. A group of options, one of them checked and none with an `icon`, such as PHP versions, is a box to pick from, captioned with the label of the separator before it. A submenu that is only options, such as Xdebug's, opens them as a menu. Any other submenu is a row that expands to show its items as buttons: with more than four, each with an icon, the buttons show only the icon, with the label as a tooltip.
 
 ## Actions
 

@@ -4,6 +4,9 @@
     it shows whether the stack is running, lists the sites, and starts, stops
     and switches PHP versions by running the novacore CLI through wsl.exe.
 
+    A left click opens a panel in the style of Windows 11's own flyouts, and a
+    right click the same items as a menu.
+
     It draws what the CLI describes: `novacore tray menu` gives the menu as
     JSON, with each item's action and the dialogs to show, as it does for the
     macOS menu bar icon in tray/macos/. So new features belong in the CLI, not
@@ -46,6 +49,13 @@ Add-Type -Namespace Novacore -Name Native -MemberDefinition '
 [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 [System.Windows.Forms.Application]::add_ThreadException({ param($sender, $e) Show-Problem $e.Exception })
 
+$g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+$script:scale = $g.DpiX / 96
+$g.Dispose()
+
+# N pixels at 96 DPI, scaled for this screen.
+function S([double] $n) { [int] [Math]::Round($n * $script:scale) }
+
 $Ellipsis = [string] [char] 0x2026  # ellipsis
 $MiddleDot = [string] [char] 0xB7  # middle dot
 
@@ -71,6 +81,11 @@ $script:infoForms = @{}     # open Info windows, by site name
 $script:outputForm = $null
 $script:outputBox = $null
 $script:outputShown = -1
+$script:checkedAt = $null   # when novacore last said how it is
+$script:unseen = ''         # output you haven't looked at: done or failed
+$script:flyout = $null      # the panel a left click opens
+$script:flyoutSignature = $null
+$script:expanded = ''       # the label of the panel's expanded row
 
 # --- Icon ---------------------------------------------------------------------
 
@@ -460,6 +475,7 @@ function Request-Status {
                 $script:model = $json | ConvertFrom-Json
                 $script:modelJson = $json
                 $script:problem = ''
+                $script:checkedAt = Get-Date
                 # Once WSL is up, see if a command from before we started is
                 # still running, e.g. after a reinstall.
                 if (-not $script:checkedAction) {
@@ -484,36 +500,50 @@ function Update-Self {
     if ($script:lastUpdateCheck -and ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -lt 60) { return }
     # Restarting would close the menu or a dialog in use, so wait for a quiet
     # moment. A running command is fine to leave: it runs on its own in WSL.
-    if ($script:menu.Visible -or [System.Windows.Forms.Application]::OpenForms.Count -gt 0) { return }
+    # (The panel stays among the open forms while hidden.)
+    if ($script:menu.Visible -or @([System.Windows.Forms.Application]::OpenForms | Where-Object { $_.Visible }).Count) { return }
     $script:lastUpdateCheck = Get-Date
 
     $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/tray/windows/novacore-tray.ps1')
     if (-not (Test-Path -LiteralPath $source)) { return }
     $new = Get-Hash $source
     $scriptChanged = $new -ne (Get-Hash $PSCommandPath)
-    # And its icons: novacore.ico, which NovacoreTray.exe is built with, and
-    # the status icons.
-    $icons = @(
+    # And the files that come with it: the panel's controls, novacore.ico,
+    # which NovacoreTray.exe is built with, and the status icons.
+    $files = @(
+        @{ From = Join-Path (Split-Path $source) 'novacore-ui.cs'; To = $script:uiSource },
         @{ From = Join-Path (Split-Path $source) 'novacore.ico'; To = $script:appIcon },
         @{ From = Join-Path (Split-Path (Split-Path $source)) 'status-icons.png'; To = $script:statusSheet })
-    $changedIcons = @($icons | Where-Object {
+    $changedFiles = @($files | Where-Object {
         (Test-Path -LiteralPath $_.From) -and (
             -not (Test-Path -LiteralPath $_.To) -or (Get-Hash $_.From) -ne (Get-Hash $_.To)) })
-    if (-not $scriptChanged -and -not $changedIcons) { return }
+    if (-not $scriptChanged -and -not $changedFiles) { return }
 
+    $ui = $files[0].From
+    $uiChanged = $changedFiles -contains $files[0]
+    $version = "$new|$(if ($uiChanged) { Get-Hash $ui })"
+    if ($version -eq $script:skippedUpdate) { return }
+    if ($uiChanged) {
+        # Don't swap in controls that won't compile either.
+        $problem = Test-UiSource $ui
+        if ($problem) {
+            $script:skippedUpdate = $version
+            Show-Problem "Not updating the tray icon: tray/windows/novacore-ui.cs has errors. $problem"
+            return
+        }
+    }
     if ($scriptChanged) {
-        if ($new -eq $script:skippedUpdate) { return }
         # Don't swap in a script that won't run, e.g. one saved mid-edit.
         $errors = $null
         [void] [System.Management.Automation.Language.Parser]::ParseFile($source, [ref] $null, [ref] $errors)
         if ($errors) {
-            $script:skippedUpdate = $new
+            $script:skippedUpdate = $version
             Show-Problem "Not updating the tray icon: tray/windows/novacore-tray.ps1 has errors. $($errors[0])"
             return
         }
         Copy-Item -LiteralPath $source -Destination $PSCommandPath -Force
     }
-    foreach ($icon in $changedIcons) { Copy-Item -LiteralPath $icon.From -Destination $icon.To -Force }
+    foreach ($file in $changedFiles) { Copy-Item -LiteralPath $file.From -Destination $file.To -Force }
     # Let the new one take the single-instance lock, then hand over to it.
     $script:mutex.ReleaseMutex()
     $script:mutex.Dispose()
@@ -521,6 +551,22 @@ function Update-Self {
         "-File `"$PSCommandPath`" -Distro `"$Distro`" -Command `"$Command`" -RefreshInterval $RefreshInterval -Updated"
     Start-Process (Join-Path $env:WINDIR 'System32\conhost.exe') -ArgumentList $arguments
     Exit-Tray
+}
+
+# The first error in compiling the C# in PATH, or nothing if it compiles. It
+# builds to a temporary file, so nothing is loaded into this process.
+function Test-UiSource([string] $path) {
+    $options = New-Object System.CodeDom.Compiler.CompilerParameters
+    $options.GenerateInMemory = $false
+    $options.OutputAssembly = [System.IO.Path]::GetTempFileName() + '.dll'
+    foreach ($assembly in @('System', 'System.Core') + $UiAssemblies) { [void] $options.ReferencedAssemblies.Add("$assembly.dll") }
+    try {
+        $result = (New-Object Microsoft.CSharp.CSharpCodeProvider).CompileAssemblyFromFile($options, $path)
+        $errors = @($result.Errors | Where-Object { -not $_.IsWarning })
+        if ($errors) { "$($errors[0])" }
+    } finally {
+        Remove-Item -LiteralPath $options.OutputAssembly -ErrorAction SilentlyContinue
+    }
 }
 
 # Take the icon out of the notification area and stop.
@@ -539,6 +585,7 @@ function Start-Action([string[]] $Arguments, [string] $Label, [string] $DoneText
     $script:busyLabel = $Label
     $script:actionUrl = $Url
     $script:output = @()
+    $script:unseen = ''
     $script:outputShown = -1
     Update-View
     try {
@@ -592,6 +639,7 @@ function Update-Action {
         $script:busy = $false
         $script:output = $log
         if ($exit -eq '0') {
+            if (-not $script:outputForm) { $script:unseen = 'done' }
             Show-Balloon 'Novacore' $(if ($done) { $done } else { "Done: $(Get-ActionName $label)" }) 'Info' -Url $script:actionUrl
         } else {
             # novacore's own error message starts with a heavy cross.
@@ -599,6 +647,7 @@ function Update-Action {
             if (-not $message) { $message = @($log | Where-Object { $_.Trim() }) | Select-Object -Last 1 }
             if ($exit -eq '') { $message = 'novacore stopped before it finished.' }
             elseif (-not $message) { $message = "novacore exited with code $exit" }
+            if (-not $script:outputForm) { $script:unseen = 'failed' }
             Show-Balloon "Couldn't finish: $(Get-ActionName $label)" (($message -replace '^\W+', '').Trim()) 'Error' -ShowsOutput
         }
         Update-View
@@ -651,16 +700,26 @@ function Add-Separator($items) {
     [void] $items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 }
 
+# Whether to show an item: not one for an editor that isn't installed.
+function Test-ItemShown($spec) {
+    $a = $spec.action
+    -not ($a -and $a.editor -and -not (Get-Editor $a))
+}
+
+# Whether an item can be used now.
+function Test-ItemEnabled($spec) {
+    if ($spec.enabled -eq $false) { return $false }
+    if ($script:busy -and $spec.idle) { return $false }
+    $a = $spec.action
+    -not ($a -and $a.tray -eq 'output' -and $script:output.Count -eq 0)
+}
+
 # Add the items novacore described to ITEMS, a menu's or a submenu's.
 function Add-MenuItems($items, $specs) {
     foreach ($spec in $specs) {
         if ($spec.separator) { Add-Separator $items; continue }
-        $action = $spec.action
-        if ($action -and $action.editor -and -not (Get-Editor $action)) { continue }
-        $enabled = $spec.enabled -ne $false
-        if ($script:busy -and $spec.idle) { $enabled = $false }
-        if ($action -and $action.tray -eq 'output' -and $script:output.Count -eq 0) { $enabled = $false }
-        $item = Add-MenuItem $items $spec.label $action -Enabled $enabled -Bold:([bool] $spec.bold)
+        if (-not (Test-ItemShown $spec)) { continue }
+        $item = Add-MenuItem $items $spec.label $spec.action -Enabled (Test-ItemEnabled $spec) -Bold:([bool] $spec.bold)
         if ($spec.checked) { $item.Checked = $true }
         if ($spec.items) { Add-MenuItems $item.DropDownItems $spec.items }
     }
@@ -673,7 +732,7 @@ function Update-Menu {
     $old | ForEach-Object { $_.Dispose() }
 
     [void] (Add-MenuItem $items "Novacore $MiddleDot $(Get-StatusText)" -Enabled $false)
-    $text = if ($script:problem) { $script:problem } elseif ($script:model) { [string] $script:model.problem } else { '' }
+    $text = Get-ProblemText
     if ($text) {
         if ($text.Length -gt 80) { $text = $text.Substring(0, 79) + $Ellipsis }
         [void] (Add-MenuItem $items $text -Enabled $false)
@@ -689,6 +748,14 @@ function Update-Menu {
         Add-Separator $items
         [void] (Add-MenuItem $items 'Quit' ([pscustomobject] @{ tray = 'quit' }))
     }
+    [Novacore.Ui.Theme]::StyleMenu($script:menu)
+}
+
+# Why novacore can't run, or what's wrong with it, if anything.
+function Get-ProblemText {
+    if ($script:problem) { return $script:problem }
+    if ($script:model) { return [string] $script:model.problem }
+    ''
 }
 
 # Bring the icon, tooltip and menu up to date.
@@ -701,10 +768,15 @@ function Update-View {
     $script:notify.Text = $tip
 
     # Rebuilding the menu closes its open submenus, so only do it on a change.
-    $signature = "$($script:busy)|$($script:busyLabel)|$($script:problem)|$($script:asleep)|$($script:output.Count -gt 0)|$($script:modelJson)"
+    $signature = "$($script:busy)|$($script:busyLabel)|$($script:problem)|$($script:asleep)|$($script:output.Count -gt 0)|$($script:unseen)|$($script:modelJson)"
     if ($signature -ne $script:menuSignature) {
         $script:menuSignature = $signature
         Update-Menu
+        if ($script:flyout.Visible) { Update-Flyout }
+    }
+    if ($script:flyout.Visible) {
+        $note = Get-FooterNote
+        if ($script:flyout.Foot.Note -ne $note) { $script:flyout.Foot.Note = $note; $script:flyout.Foot.Invalidate() }
     }
 }
 
@@ -742,6 +814,10 @@ function Show-Problem($err) {
 
 # The output of the last action, like the Plasma widget's log.
 function Show-Output {
+    if ($script:unseen) {
+        $script:unseen = ''
+        Update-View
+    }
     if (-not $script:outputForm) {
         $form = New-Object System.Windows.Forms.Form
         $form.Text = 'Novacore'
@@ -834,13 +910,6 @@ function Get-Editor($a) {
 }
 
 # --- Dialogs ------------------------------------------------------------------
-
-$g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
-$script:scale = $g.DpiX / 96
-$g.Dispose()
-
-# N pixels at 96 DPI, scaled for this screen.
-function S([double] $n) { [int] [Math]::Round($n * $script:scale) }
 
 function New-Dialog([string] $title) {
     $form = New-Object System.Windows.Forms.Form
@@ -1118,6 +1187,379 @@ function Show-Info($spec) {
     $form.Show()
 }
 
+# --- Panel --------------------------------------------------------------------
+#
+# What a left click opens: a panel in the style of Windows 11's own flyouts,
+# laid out from the same items as the menu. The status goes at the top, with
+# any problem under it. Each item is a row, and separators with a label start
+# sections. A submenu's row expands to show its items as buttons, in groups
+# as its separators split them, with the checked one highlighted. Commands to
+# run that sit together, such as Stop and Restart, share a row of buttons,
+# and the icon's own commands (Show Output, Refresh, Quit) go at the bottom.
+#
+# The controls are drawn by novacore-ui.cs, next to this script, which it
+# compiles when it starts.
+
+$script:uiSource = Join-Path $PSScriptRoot 'novacore-ui.cs'
+if (-not (Test-Path -LiteralPath $script:uiSource)) {
+    # Copies of this script from before it came in two files update
+    # themselves without it, so fetch it from the repo, as Update-Self would.
+    Copy-Item -LiteralPath (Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/tray/windows/novacore-ui.cs')) -Destination $script:uiSource
+}
+$UiAssemblies = 'System.Windows.Forms', 'System.Drawing'
+Add-Type -Path $script:uiSource -ReferencedAssemblies $UiAssemblies
+[void] [Novacore.Ui.Theme]::Load($script:scale)
+
+# The project icon, for the panel's header.
+$script:appImage = $null
+$png = Get-AppIconPng 64
+if ($png) { $script:appImage = New-Object System.Drawing.Bitmap (New-Object System.IO.MemoryStream (, $png)) }
+
+function Get-Glyph([string] $name) { [Novacore.Ui.Theme]::Glyph($name) }
+
+# The name of an item's icon: its own (see tray/PROTOCOL.md), else one for
+# what it does.
+function Get-ItemIcon($spec) {
+    if ($spec.icon) { return [string] $spec.icon }
+    $a = $spec.action
+    if (-not $a) { return '' }
+    if ($a.open) { return 'site' }
+    if ($a.folder) { return 'folder' }
+    if ($a.editor) { return 'code' }
+    if ($a.terminal -or $a.console) { return 'terminal' }
+    if ($a.dialog -eq 'info') { return 'info' }
+    if ($a.dialog -eq 'form') { if ($a.destructive) { return 'remove' } else { return 'add' } }
+    if ($a.tray) { return [string] $a.tray }
+    ''
+}
+
+# The line at the bottom of the panel: the distro, and when we last checked.
+function Get-FooterNote {
+    $note = $Distro
+    if ($script:asleep) { $note += " $MiddleDot asleep" }
+    elseif ($script:checkedAt) { $note += " $MiddleDot updated $($script:checkedAt.ToString('t'))" }
+    $note
+}
+
+$script:onFlyoutClick = { Invoke-Safely { Invoke-FlyoutAction $this.Tag } }
+
+# Carry out an action from the panel. Most take you elsewhere, so the panel
+# closes, but it stays to show a command's progress.
+function Invoke-FlyoutAction($a) {
+    if (-not ($a.run -or $a.tray -eq 'refresh')) { $script:flyout.Hide() }
+    Invoke-MenuAction $a
+}
+
+# A button for an item, for an expanded row or a row of buttons.
+function New-FlyoutChip($spec) {
+    $chip = New-Object Novacore.Ui.Chip
+    $chip.Label = [string] $spec.label
+    $icon = Get-ItemIcon $spec
+    if ($icon) { $chip.Icon = Get-Glyph $icon }
+    if ($icon -eq 'remove') { $chip.IconColor = [Novacore.Ui.Theme]::Danger }
+    $chip.Checked = [bool] $spec.checked
+    $chip.Strong = [bool] $spec.bold
+    $chip.Enabled = Test-ItemEnabled $spec
+    if ($spec.items) {
+        $chip.Tag = $spec
+        $chip.add_Click({ Invoke-Safely { Show-FlyoutMenu $this } })
+    } elseif ($spec.action) {
+        $chip.Tag = $spec.action
+        $chip.add_Click($script:onFlyoutClick)
+    }
+    $chip
+}
+
+# A submenu inside a submenu, which an expanded row can't show, as a menu by
+# its button.
+function Show-FlyoutMenu($chip) {
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    Add-MenuItems $menu.Items $chip.Tag.items
+    [Novacore.Ui.Theme]::StyleMenu($menu)
+    $script:flyout.Hold = $true
+    $menu.add_Closed({ $script:flyout.Hold = $false })
+    $menu.Show($chip, 0, $chip.Height)
+}
+
+# ITEMS split at their separators: each group's items, and the label of the
+# separator before it.
+function Get-ItemGroups($specs) {
+    $groups = New-Object System.Collections.ArrayList
+    $group = @{ Label = ''; Items = New-Object System.Collections.ArrayList }
+    foreach ($spec in $specs) {
+        if ($spec.separator) {
+            if ($group.Items.Count) { [void] $groups.Add($group) }
+            $group = @{ Label = [string] $spec.label; Items = New-Object System.Collections.ArrayList }
+        } elseif (Test-ItemShown $spec) {
+            [void] $group.Items.Add($spec)
+        }
+    }
+    if ($group.Items.Count) { [void] $groups.Add($group) }
+    , $groups
+}
+
+# Whether ITEMS are options to pick one of, such as PHP versions: one is
+# checked, and none has a picture.
+function Test-Choices($specs) {
+    $items = @($specs | Where-Object { -not $_.separator })
+    @($items | Where-Object { $_.checked }).Count -gt 0 -and
+        @($items | Where-Object { Get-ItemIcon $_ }).Count -eq 0
+}
+
+# Options to pick one of, as a menu under CONTROL.
+function Show-ChoiceMenu($control, $specs) {
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    Add-MenuItems $menu.Items $specs
+    [Novacore.Ui.Theme]::StyleMenu($menu)
+    $script:flyout.Hold = $true
+    $menu.add_Closed({ $script:flyout.Hold = $false })
+    $menu.Show($control, (New-Object System.Drawing.Point $control.Width, $control.Height), [System.Windows.Forms.ToolStripDropDownDirection]::BelowLeft)
+}
+
+# What an expanded row shows, in a card: its submenu's items as buttons,
+# leaving out SKIP, which is on the row already. With more than a few, and a
+# picture for each, they're just the pictures, with their labels as
+# tooltips. Groups of options, such as PHP versions, are a box to pick from
+# instead, captioned with their separator's label.
+function New-FlyoutCard($specs, $skip) {
+    $card = New-Object Novacore.Ui.Stack
+    $card.Card = $true
+    $card.BackColor = [Novacore.Ui.Theme]::Card
+    $card.Padding = New-Object System.Windows.Forms.Padding (S 10)
+    $card.Margin = New-Object System.Windows.Forms.Padding (S 8), (S 2), (S 8), (S 6)
+
+    $groups = Get-ItemGroups $specs
+    $buttons = @($groups | Where-Object { -not (Test-Choices $_.Items) } | ForEach-Object { $_.Items } | Where-Object { $_ -ne $skip })
+    $iconsOnly = $buttons.Count -gt 4 -and -not @($buttons | Where-Object { -not (Get-ItemIcon $_) }).Count
+
+    $flow = $null
+    foreach ($group in $groups) {
+        if (Test-Choices $group.Items) { continue }
+        $first = $true
+        foreach ($spec in $group.Items) {
+            if ($spec -eq $skip) { continue }
+            if (-not $flow) {
+                $flow = New-Object Novacore.Ui.Flow
+                $card.Controls.Add($flow)
+            }
+            $chip = New-FlyoutChip $spec
+            if ($iconsOnly) {
+                $chip.Tip = $chip.Label.TrimEnd($Ellipsis.ToCharArray())
+                $chip.Label = ''
+            }
+            # A little space between groups.
+            if ($first -and $flow.Controls.Count) { $chip.Margin = New-Object System.Windows.Forms.Padding (S 8), 0, (S 6), (S 6) }
+            $flow.Controls.Add($chip)
+            $first = $false
+        }
+    }
+    foreach ($group in $groups) {
+        if (-not (Test-Choices $group.Items)) { continue }
+        $field = New-Object Novacore.Ui.Field
+        $field.Caption = $group.Label
+        $field.Value = [string] (@($group.Items | Where-Object { $_.checked })[0].label)
+        $field.Enabled = @($group.Items | Where-Object { $_.action -and (Test-ItemEnabled $_) }).Count -gt 0
+        $field.Tag = $group.Items.ToArray()
+        if ($card.Controls.Count) { $field.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, 0 }
+        $field.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
+        $card.Controls.Add($field)
+    }
+    $card
+}
+
+# Add a row for an item to STACK, and the card it expands into if it's a
+# submenu. A submenu's bold item, such as a site's Open, gets a button on the
+# row too.
+function Add-FlyoutRow($stack, $spec) {
+    $row = New-Object Novacore.Ui.Row
+    $row.Title = [string] $spec.label
+    $row.Detail = [string] $spec.detail
+    $row.Strong = [bool] $spec.bold
+    $row.Enabled = Test-ItemEnabled $spec
+    $icon = Get-ItemIcon $spec
+    if ($icon -eq 'site' -and $spec.items) {
+        $row.Avatar = [Novacore.Ui.Theme]::Initials($row.Title)
+        $row.AvatarColor = [Novacore.Ui.Theme]::AvatarColor($row.Title)
+    } elseif ($icon) {
+        $row.Icon = Get-Glyph $icon
+    }
+    $row.add_ButtonClick({ param($sender, $e) Invoke-Safely { Invoke-FlyoutAction $e.Tag } })
+    $stack.Controls.Add($row)
+
+    if ($spec.items) {
+        $row.Chevron = $true
+        if (Test-Choices $spec.items) {
+            # Just options, such as Xdebug's modes: pick one from a menu.
+            $row.Tag = @($spec.items)
+            $row.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
+            return
+        }
+        $main = @($spec.items | Where-Object { $_.bold -and $_.action -and (Test-ItemEnabled $_) }) | Select-Object -First 1
+        if ($main) {
+            $button = New-Object Novacore.Ui.RowButton
+            $button.Glyph = Get-Glyph $(if ($main.action.open) { 'open' } else { Get-ItemIcon $main })
+            $button.Tip = [string] $main.label
+            $button.Tag = $main.action
+            $row.Buttons.Add($button)
+        }
+        $card = New-FlyoutCard $spec.items $main
+        $row.Tag = $card
+        $stack.Controls.Add($card)
+        $row.Expanded = $script:expanded -eq $row.Title
+        $stack.Collapse($card, -not $row.Expanded)
+        $row.add_Click({ Invoke-Safely { Switch-FlyoutRow $this } })
+    } elseif ($spec.action) {
+        $row.Tag = $spec.action
+        $row.add_Click($script:onFlyoutClick)
+    }
+}
+
+# Expand ROW, closing any other, or close it.
+function Switch-FlyoutRow($row) {
+    $open = -not $row.Expanded
+    $body = $script:flyout.Body
+    foreach ($c in @($body.Controls)) {
+        if ($c -is [Novacore.Ui.Row] -and $c.Expanded -and $c.Tag -is [System.Windows.Forms.Control]) {
+            $c.Expanded = $false
+            $body.Collapse($c.Tag, $true)
+            $c.Invalidate()
+        }
+    }
+    if ($open) {
+        $row.Expanded = $true
+        $body.Collapse($row.Tag, $false)
+    }
+    $row.Invalidate()
+    $script:expanded = if ($open) { $row.Title } else { '' }
+    $script:flyout.Reflow()
+    if ($open -and $body.AutoScroll) { $body.ScrollControlIntoView($row.Tag); $body.ScrollControlIntoView($row) }
+}
+
+# Start a section of STACK, called LABEL if it has one.
+function Add-FlyoutSection($stack, [string] $label) {
+    $n = $stack.Controls.Count
+    if ($n -and ($stack.Controls[$n - 1] -is [Novacore.Ui.Heading] -or $stack.Controls[$n - 1] -is [Novacore.Ui.Divider])) {
+        $stack.Controls[$n - 1].Dispose()
+        $n--
+    }
+    if ($label) {
+        $heading = New-Object Novacore.Ui.Heading
+        $heading.Label = $label
+        $stack.Controls.Add($heading)
+    } elseif ($n) {
+        $stack.Controls.Add((New-Object Novacore.Ui.Divider))
+    }
+}
+
+# Lay the panel out afresh from novacore's items.
+function Update-Flyout {
+    $f = $script:flyout
+    $script:flyoutSignature = $script:menuSignature
+    $f.SuspendLayout()
+    $f.Clear()
+    $f.ApplyTheme()
+
+    $header = New-Object Novacore.Ui.Header
+    $header.Image = $script:appImage
+    $header.Title = 'Novacore'
+    $header.Status = Get-StatusText
+    $header.State = Get-IconState
+    $f.Head.Controls.Add($header)
+    $problem = Get-ProblemText
+    if ($problem) {
+        $banner = New-Object Novacore.Ui.Banner
+        $banner.Message = $problem
+        $f.Head.Controls.Add($banner)
+    }
+    if ($script:busy) { $f.Head.Controls.Add((New-Object Novacore.Ui.Progress)) }
+
+    $specs = if ($script:model) { $script:model.items } else {
+        @([pscustomobject] @{ label = 'Refresh'; action = [pscustomobject] @{ tray = 'refresh' } },
+          [pscustomobject] @{ label = 'Quit'; action = [pscustomobject] @{ tray = 'quit' } })
+    }
+    # The first item, if it's the main one, such as Open Dashboard, is what
+    # clicking the header does.
+    $first = @($specs)[0]
+    if ($first -and $first.bold -and $first.action -and -not $first.items -and -not $first.action.tray) {
+        $header.Tip = ([string] $first.label).TrimEnd($Ellipsis.ToCharArray())
+        $header.Enabled = Test-ItemEnabled $first
+        $header.Tag = $first.action
+        $header.add_Click($script:onFlyoutClick)
+        $specs = @($specs | Select-Object -Skip 1)
+    }
+    $own = New-Object System.Collections.ArrayList
+    $bar = $null
+    foreach ($spec in $specs) {
+        if ($spec.separator) { $bar = $null; Add-FlyoutSection $f.Body ([string] $spec.label); continue }
+        if (-not (Test-ItemShown $spec)) { continue }
+        $a = $spec.action
+        if ($a -and $a.tray -and -not $spec.items) { [void] $own.Add($spec); continue }
+        if ($a -and $a.run -and -not $spec.items) {
+            if (-not $bar) {
+                $bar = New-Object Novacore.Ui.Bar
+                $f.Body.Controls.Add($bar)
+            }
+            $bar.Controls.Add((New-FlyoutChip $spec))
+            continue
+        }
+        $bar = $null
+        Add-FlyoutRow $f.Body $spec
+    }
+    # A command that stands alone, such as Start, is the one to press.
+    foreach ($c in @($f.Body.Controls)) {
+        if ($c -is [Novacore.Ui.Bar] -and $c.Controls.Count -eq 1) { $c.Controls[0].Primary = $true }
+    }
+    # No section without anything in it.
+    $n = $f.Body.Controls.Count
+    if ($n -and ($f.Body.Controls[$n - 1] -is [Novacore.Ui.Heading] -or $f.Body.Controls[$n - 1] -is [Novacore.Ui.Divider])) {
+        $f.Body.Controls[$n - 1].Dispose()
+    }
+
+    $f.Foot.Note = Get-FooterNote
+    foreach ($spec in $own) {
+        $button = New-Object Novacore.Ui.IconButton
+        $button.Icon = Get-Glyph (Get-ItemIcon $spec)
+        $button.Tip = ([string] $spec.label).TrimEnd($Ellipsis.ToCharArray())
+        $button.Enabled = Test-ItemEnabled $spec
+        if ($spec.action.tray -eq 'output' -and $script:unseen) {
+            # The last command's output, not yet seen: red if it failed.
+            $button.Badge = if ($script:unseen -eq 'failed') { [Novacore.Ui.Theme]::Danger } else { [Novacore.Ui.Theme]::Accent }
+            $button.Tip += $(if ($script:unseen -eq 'failed') { ' (the last command failed)' } else { ' (new)' })
+        }
+        $button.Tag = $spec.action
+        $button.add_Click($script:onFlyoutClick)
+        $f.Foot.Controls.Add($button)
+    }
+    $f.ResumeLayout()
+    if ($f.Visible) { $f.Reflow() }
+}
+
+# Follow the system between light and dark.
+function Update-Theme {
+    if (-not [Novacore.Ui.Theme]::Load($script:scale)) { return }
+    [Novacore.Ui.Theme]::StyleMenu($script:menu)
+    $script:flyoutSignature = $null
+    if ($script:flyout.Visible) { Update-Flyout }
+}
+
+function Show-Flyout {
+    Update-Theme
+    if ($script:flyoutSignature -ne $script:menuSignature) { Update-Flyout }
+    $script:flyout.Foot.Note = Get-FooterNote
+    $script:flyout.ShowAt([System.Windows.Forms.Cursor]::Position)
+    # Opening it is a good time to check, even if that wakes WSL.
+    Update-Status -Wake
+}
+
+function Switch-Flyout {
+    $f = $script:flyout
+    if ($f.Visible) { $f.Hide(); return }
+    # Clicking the icon takes the focus from the panel, which hides it, so
+    # don't show it again straight away.
+    if (((Get-Date) - $f.HiddenAt).TotalMilliseconds -lt 400) { return }
+    Show-Flyout
+}
+
 # --- Main ---------------------------------------------------------------------
 
 # Event handlers that throw would otherwise stop the whole tray icon.
@@ -1134,15 +1576,16 @@ $script:menu = New-Object System.Windows.Forms.ContextMenuStrip
 # Opening the menu is a good time to check, even if that wakes WSL.
 $script:menu.add_Opening({ Invoke-Safely { Update-Status -Wake } })
 
+[Novacore.Ui.Theme]::StyleMenu($script:menu)
+$script:flyout = New-Object Novacore.Ui.Flyout
+$script:flyout.Icon = $script:windowIcon
+
 $script:notify = New-Object System.Windows.Forms.NotifyIcon
+# A right click opens the menu, and a left click the panel.
 $script:notify.ContextMenuStrip = $script:menu
-# Show the menu on a left click too, as it's all there is.
 $script:notify.add_MouseUp({
     param($sender, $e)
-    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-        $show = [System.Windows.Forms.NotifyIcon].GetMethod('ShowContextMenu', [System.Reflection.BindingFlags] 'Instance, NonPublic')
-        [void] $show.Invoke($script:notify, $null)
-    }
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Invoke-Safely { Switch-Flyout } }
 })
 $script:notify.add_BalloonTipClicked({
     Invoke-Safely {
@@ -1166,10 +1609,10 @@ $refresh.Interval = [Math]::Max(5, $RefreshInterval) * 1000
 $refresh.add_Tick({ Invoke-Safely { Update-Status } })
 $refresh.Start()
 
-# Follow the taskbar between light and dark.
+# Follow the taskbar, and apps, between light and dark.
 $theme = New-Object System.Windows.Forms.Timer
 $theme.Interval = 2000
-$theme.add_Tick({ Invoke-Safely { [void] (Update-Icons) } })
+$theme.add_Tick({ Invoke-Safely { [void] (Update-Icons); Update-Theme } })
 $theme.Start()
 
 Update-View

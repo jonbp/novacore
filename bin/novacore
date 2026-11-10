@@ -1390,6 +1390,13 @@ msub() {
 
 MSEP='{"separator":true}'
 
+# msep LABEL — REPLY = a separator that starts a section called LABEL.
+msep() { js "$1"; REPLY="{\"separator\":true,\"label\":$REPLY}"; }
+
+# mextra KEY STRING... — add members to the item or submenu in REPLY, e.g.
+# mextra icon site detail "PHP 8.4".
+mextra() { local item=$REPLY; jpairs "$@"; REPLY="${item%\}},$REPLY}"; }
+
 # act TYPE VALUE [KEY VALUE]... — REPLY = an action made of strings, e.g.
 # act open URL, act folder PATH, act editor PATH app zed, act terminal PATH
 # title TITLE, or act tray output (the tray's own: output, refresh or quit).
@@ -1564,7 +1571,7 @@ site_menu() {
 
     act open "$url"; mitem "Open ${url#https://}" "$REPLY" bold; sub+=("$REPLY")
     if repo_web "$path"; then
-        act open "$REPO_URL"; mitem "Open on $REPO_LABEL" "$REPLY"; sub+=("$REPLY")
+        act open "$REPO_URL"; mitem "Open on $REPO_LABEL" "$REPLY"; mextra icon git; sub+=("$REPLY")
     fi
     info_dialog "$1"; mitem "Info…" "$REPLY"; sub+=("$REPLY" "$MSEP")
     act folder "$path"; mitem "Open Folder" "$REPLY"; sub+=("$REPLY")
@@ -1572,7 +1579,8 @@ site_menu() {
     act editor "$path" app zed; mitem "Open in Zed" "$REPLY"; sub+=("$REPLY")
     act terminal "$path" title "$name"; mitem "Open Terminal" "$REPLY"; sub+=("$REPLY")
     act_console "$name · PHP shell" shell "$name"; mitem "PHP Shell" "$REPLY" "$off"; sub+=("$REPLY")
-    act_console "$name · error log" errors "$name"; mitem "Follow Error Log" "$REPLY"; sub+=("$REPLY" "$MSEP")
+    act_console "$name · error log" errors "$name"; mitem "Follow Error Log" "$REPLY"; mextra icon log; sub+=("$REPLY")
+    msep "PHP version"; sub+=("$REPLY")
     for v in "${SUPPORTED_PHP[@]}"; do
         if [[ $v == "$php" ]]; then
             mitem "PHP $v" "" checked idle
@@ -1586,19 +1594,20 @@ site_menu() {
     sub+=("$MSEP")
     remove_site_dialog "$1"; mitem "Remove…" "$REPLY" idle; sub+=("$REPLY")
     msub "$name" "${sub[@]}"
+    mextra icon site detail "${url#https://} · PHP $php"
 }
 
 # REPLY = the Xdebug submenu: novacore xdebug's modes, where "on" is
 # develop,debug.
 xdebug_menu() {
-    local sub=() known=0 mode label
+    local sub=() known=0 mode label current=$XDEBUG_MODE
     for mode in off:Off "develop,debug:On (develop, debug)" - debug:"Debug only" develop:"Develop only" \
         profile:Profile trace:Trace coverage:Coverage; do
         if [[ $mode == - ]]; then sub+=("$MSEP"); continue; fi
         label=${mode#*:}
         mode=${mode%%:*}
         if [[ $mode == "$XDEBUG_MODE" ]]; then
-            known=1
+            known=1 current=$label
             mitem "$label" "" checked idle
         else
             act_run "Setting Xdebug to ${label}…" "Xdebug is now $label" "" xdebug "$mode"
@@ -1608,6 +1617,7 @@ xdebug_menu() {
     done
     if (( ! known )); then mitem "$XDEBUG_MODE" "" checked off; sub+=("$MSEP" "$REPLY"); fi
     msub Xdebug "${sub[@]}"
+    mextra icon bug detail "$current"
 }
 
 # tray menu — the tray icon's menu as JSON (see tray/PROTOCOL.md).
@@ -1633,26 +1643,28 @@ tray_menu() {
         if is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then WSL_ROOT="\\\\wsl.localhost\\$WSL_DISTRO_NAME"; fi
     fi
 
-    act open https://localhost; mitem "Open Dashboard" "$REPLY" bold "$off"; items+=("$REPLY" "$MSEP")
+    act open https://localhost; mitem "Open Dashboard" "$REPLY" bold "$off"; mextra icon dashboard; items+=("$REPLY")
     if [[ $state != error ]]; then
+        msep Sites; items+=("$REPLY")
         for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do site_menu "$i"; items+=("$REPLY"); done
         if (( ! ${#SITE_NAMES[@]} )); then mitem "No sites yet" "" off; items+=("$REPLY"); fi
-        add_site_dialog; mitem "Add Site…" "$REPLY" idle; items+=("$REPLY" "$MSEP")
+        add_site_dialog; mitem "Add Site…" "$REPLY" idle; items+=("$REPLY")
     fi
+    msep Server; items+=("$REPLY")
 
     if (( TRAY_RUNNING )); then
-        act_run "Stopping Novacore…" "Novacore has stopped" "" down; mitem "Stop Novacore" "$REPLY" idle; items+=("$REPLY")
-        act_run "Restarting Novacore…" "Novacore has restarted" "" restart; mitem "Restart Novacore" "$REPLY" idle; items+=("$REPLY")
+        act_run "Stopping Novacore…" "Novacore has stopped" "" down; mitem "Stop Novacore" "$REPLY" idle; mextra icon stop; items+=("$REPLY")
+        act_run "Restarting Novacore…" "Novacore has restarted" "" restart; mitem "Restart Novacore" "$REPLY" idle; mextra icon restart; items+=("$REPLY")
     else
-        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
+        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; mextra icon start; items+=("$REPLY")
     fi
 
     if [[ $state != error ]]; then
         xdebug_menu; items+=("$REPLY")
-        act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$off"; sub+=("$REPLY")
-        act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY"; sub+=("$REPLY")
+        act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$off"; mextra icon database; sub+=("$REPLY")
+        act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY"; mextra icon log; sub+=("$REPLY")
         act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub+=("$REPLY")
-        msub Tools "${sub[@]}"; items+=("$REPLY")
+        msub Tools "${sub[@]}"; mextra icon tools; items+=("$REPLY")
     fi
 
     act tray output; mitem "Show Output…" "$REPLY"; items+=("$REPLY")
@@ -1791,6 +1803,7 @@ windows_tray_install() {
 New-Item -ItemType Directory -Force $dir | Out-Null
 $ps1 = Join-Path $dir "novacore-tray.ps1"
 Copy-Item -LiteralPath $env:NC_SCRIPT -Destination $ps1 -Force
+Copy-Item -LiteralPath (Join-Path (Split-Path $env:NC_SCRIPT) "novacore-ui.cs") -Destination $dir -Force
 Copy-Item -LiteralPath (Join-Path (Split-Path $env:NC_SCRIPT) "novacore.ico") -Destination $dir -Force
 Copy-Item -LiteralPath (Join-Path (Split-Path (Split-Path $env:NC_SCRIPT)) "status-icons.png") -Destination $dir -Force
 

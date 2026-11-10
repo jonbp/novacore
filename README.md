@@ -246,7 +246,9 @@ The icon runs the CLI with the `PATH` you had when you installed it, so `docker`
 
 ### Windows
 
-With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `tray/windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
+With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `tray/windows/novacore-tray.ps1`, and `novacore-ui.cs`, the C# for its panel, to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
+
+Click the icon for a panel in the style of Windows 11's own: Novacore's status, your sites (expand one for a row of actions and its PHP version), Start, Stop and Restart, and Xdebug. Right-click it for the same things as a menu.
 
 Terminals open in Windows Terminal if you have it. VS Code and Zed appear if they're installed on Windows, and open the site through WSL.
 
