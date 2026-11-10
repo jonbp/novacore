@@ -31,6 +31,13 @@ let info = Bundle.main.infoDictionary ?? [:]
 let command = info["NovacoreCommand"] as? String
     ?? (CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "novacore")
 let builtHash = info["NovacoreSourceHash"] as? String ?? ""
+
+// The PATH and LANG you had when you ran `tray install`, so the CLI finds
+// docker. launchd gives the app them when it starts it at login, but opening
+// the app from Finder or Spotlight gives it macOS's bare PATH instead.
+for (key, name) in [("NovacorePath", "PATH"), ("NovacoreLang", "LANG")] {
+    if let value = info[key] as? String, !value.isEmpty { setenv(name, value, 1) }
+}
 let repo = URL(fileURLWithPath: command).deletingLastPathComponent().deletingLastPathComponent()
 let installedApp = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Applications/Novacore Tray.app").path

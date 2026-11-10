@@ -1903,6 +1903,8 @@ macos_tray_install() {
     <key>NSHighResolutionCapable</key><true/>
     <key>NovacoreCommand</key><string>$(xml_str "$NOVACORE_ROOT/bin/novacore")</string>
     <key>NovacoreSourceHash</key><string>$(mac_tray_hash)</string>
+    <key>NovacorePath</key><string>$(xml_str "$PATH")</string>
+    <key>NovacoreLang</key><string>$(xml_str "${LANG:-en_US.UTF-8}")</string>
 </dict>
 </plist>
 EOF
