@@ -1,12 +1,12 @@
 <#
     Novacore's icon in the Windows notification area, for when Novacore runs
-    in WSL. It's the Windows counterpart of the Plasma widget in plasmoid/:
+    in WSL. It's the Windows counterpart of the Plasma widget in tray/plasmoid/:
     it shows whether the stack is running, lists the sites, and starts, stops
     and switches PHP versions by running the novacore CLI through wsl.exe.
 
     It draws what the CLI describes: `novacore tray menu` gives the menu as
     JSON, with each item's action and the dialogs to show, as it does for the
-    macOS menu bar icon in macos/. So new features belong in the CLI, not
+    macOS menu bar icon in tray/macos/. So new features belong in the CLI, not
     here. See tray/PROTOCOL.md.
 
     `novacore tray install`, run inside WSL, copies this script to
@@ -74,134 +74,20 @@ $script:outputShown = -1
 
 # --- Icon ---------------------------------------------------------------------
 
-# The globe from Novacore's link in the Open Source nav on jonbp.co.uk, a
-# 24x24 icon: a circle, and the equator and two meridians tilted like the
-# Earth's axis. The full logo, with its square, is too detailed for 16px. The
-# globe is white or black to suit the taskbar, and a badge in its bottom right
-# corner shows the status by its colour.
-#
-# Shapes are drawn in the icon's 24x24 space by DRAW, given the Graphics, and
-# this returns how much of each pixel of a SIZE x SIZE icon they cover, from 0
-# to 1. GDI+ antialiases thin lines poorly, so they're drawn 8x larger and
-# averaged down, or less for big sizes, where it matters less. Raising coverage
-# to a power below 1 strengthens faint edge pixels, so thin lines read as solid
-# rather than dotted.
-function Get-Coverage([int] $size, [scriptblock] $draw, [double] $power = 1.0) {
-    $k = if ($size -le 32) { 8 } else { [Math]::Max(1, [Math]::Floor(256 / $size)) }
-    $n = $size * $k
-    $bmp = New-Object System.Drawing.Bitmap $n, $n, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    # Pixel edges at whole coordinates, not pixel centres, so nothing shifts
-    # by half a pixel.
-    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
-    $g.ScaleTransform($n / 24, $n / 24)
-    & $draw $g
-    $g.Dispose()
+# The status icons, like the other tray icons', come from status-icons.png,
+# next to this script, copied from tray/ in the repo. tray/build-icons.sh
+# renders it from tray/status.svg: the globe from Novacore's link on
+# jonbp.co.uk, with a pill whose colour shows the status. The sheet has a 64px
+# cell for each theme and status, dark then light, each running, stopped, busy
+# then error, with a column per size and the icon in each cell's top left
+# corner: 16px for 100% scaling up to 48px for 300%, and 64px.
+$script:statusSheet = Join-Path $PSScriptRoot 'status-icons.png'
+$StatusSizes = 16, 20, 24, 28, 32, 36, 40, 48, 64
+$StatusStates = 'Running', 'Stopped', 'Busy', 'Error'
 
-    $data = $bmp.LockBits((New-Object System.Drawing.Rectangle 0, 0, $n, $n), 'ReadOnly', $bmp.PixelFormat)
-    $bytes = New-Object byte[] ($data.Stride * $n)
-    [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
-    $bmp.UnlockBits($data)
-    $bmp.Dispose()
-
-    $coverage = New-Object double[] ($size * $size)
-    for ($y = 0; $y -lt $n; $y++) {
-        $row = $y * $data.Stride
-        $out = [Math]::Floor($y / $k) * $size
-        for ($x = 0; $x -lt $n; $x++) {
-            $coverage[$out + [Math]::Floor($x / $k)] += $bytes[$row + $x * 4 + 3]
-        }
-    }
-    for ($i = 0; $i -lt $coverage.Length; $i++) {
-        # 1.0, not 1: PowerShell would pick Math.Min(int, int) and round.
-        $coverage[$i] = [Math]::Pow([Math]::Min(1.0, $coverage[$i] / (255 * $k * $k)), $power)
-    }
-    , $coverage
-}
-
-# A round-capped pen for the shapes. The coordinates passed to Graphics must be
-# floats: given doubles, PowerShell picks the Int32 overloads and rounds them,
-# which knocks shapes off centre.
-function New-Pen([float] $width) {
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), $width
-    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
-    $pen
-}
-
-# How far the globe's equator, and the badge, tilt from level, like the Earth's
-# axis.
-$Tilt = 23.5
-
-function Get-GlobeCoverage([int] $size) {
-    Get-Coverage $size {
-        param($g)
-        # Lines 1.25px wide at 100% scaling (16px), 1.875px at 150% and so on:
-        # a touch bolder than the 1px of Windows' own notification area icons,
-        # which are hand-fitted to the pixel grid where this isn't. The circle
-        # shrinks to keep its outer edge at the icon's edge.
-        [float] $stroke = 1.875
-        [float] $r = 12 - $stroke / 2
-        [float] $m = 5.5  # the meridians' half-width
-        $pen = New-Pen $stroke
-        $g.DrawEllipse($pen, [float] (12 - $r), [float] (12 - $r), [float] (2 * $r), [float] (2 * $r))
-        $g.TranslateTransform(12, 12)
-        $g.RotateTransform(-$Tilt)
-        $g.DrawLine($pen, [float] -$r, [float] 0, $r, [float] 0)
-        $g.DrawEllipse($pen, [float] -$m, [float] -$r, [float] (2 * $m), [float] (2 * $r))
-    } 0.7
-}
-
-# The badge: a pill tilted like the equator, touching the icon's bottom and
-# right edges, and a 1px gap around it cut out of the globe so the two don't
-# run together. The gap falls outside the icon on the bottom and right, so it
-# takes up no room there.
-$BadgeW = 9; $BadgeH = 4.5  # 6x3px at 16px
-# The pill grown by GROW on every side: a line with round caps, as thick as
-# the pill is tall, between ends that are HALF apart from its centre on each
-# axis. The centre is placed so the pill's lowest and rightmost points just
-# reach the icon's edges.
-function Get-BadgeCoverage([int] $size, [double] $grow = 0) {
-    $draw = {
-        param($g)
-        $r = $BadgeH / 2
-        $a = $Tilt * [Math]::PI / 180
-        $half = ($BadgeW - $BadgeH) / 2
-        $dx = $half * [Math]::Cos($a)
-        $dy = $half * [Math]::Sin($a)
-        $cx = 24 - $dx - $r
-        $cy = 24 - $dy - $r
-        # Rising to the right, like the equator.
-        $g.DrawLine((New-Pen ($BadgeH + 2 * $grow)), [float] ($cx - $dx), [float] ($cy + $dy), [float] ($cx + $dx), [float] ($cy - $dy))
-    }
-    # Get-Coverage runs DRAW from inside itself, so DRAW sees $grow through
-    # PowerShell's dynamic scoping. A closure would hide the script's variables
-    # (such as $BadgeH) when NovacoreTray.exe runs the script.
-    Get-Coverage $size $draw
-}
-
-# The globe's colour, and each status's badge colour, on dark and light
-# taskbars: jonbp.co.uk's palette in its dark and light themes. The globe is
-# the site's text colour; running is Novacore's own accent, neon teal; stopped
-# is the secondary text colour; busy and error are neon yellow and neon red.
-$script:themes = @{
-    Dark = @{
-        Foreground = '#FFFFFF'  # --c-copy
-        Running    = '#17D4A4'  # --c-neon-teal
-        Stopped    = '#768087'  # --c-copy-secondary
-        Busy       = '#FEC82C'  # --c-neon-yellow
-        Error      = '#FE2C62'  # --c-neon-red
-    }
-    Light = @{
-        Foreground = '#0B0B13'
-        Running    = '#009672'
-        Stopped    = '#58626A'
-        Busy       = '#C48C00'
-        Error      = '#DE184C'
-    }
-}
+# The size of the notification area's icons: 16px at 100% scaling, 24px at
+# 150% and so on.
+$script:iconSize = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
 
 # Whether the taskbar is light, so the globe should be black. Windows 10 before
 # 1903 has no setting, and a dark taskbar.
@@ -211,72 +97,42 @@ function Test-LightTaskbar {
     } catch { $false }
 }
 
-# Paint the TOP colour over BOTTOM, both [a, r, g, b] from 0 to 1.
-function Join-Colors([double[]] $bottom, [double[]] $top) {
-    $a = $top[0] + $bottom[0] * (1 - $top[0])
-    if ($a -le 0) { return , [double[]] @(0, 0, 0, 0) }
-    $out = [double[]] @($a, 0, 0, 0)
-    for ($c = 1; $c -le 3; $c++) {
-        $out[$c] = ($top[$c] * $top[0] + $bottom[$c] * $bottom[0] * (1 - $top[0])) / $a
-    }
-    , $out
+# The sheet, read into memory so the file isn't locked and Update-Self can
+# replace it. $null without it.
+function Read-StatusSheet {
+    if (-not (Test-Path -LiteralPath $script:statusSheet)) { return $null }
+    $stream = New-Object System.IO.MemoryStream (, [System.IO.File]::ReadAllBytes($script:statusSheet))
+    $image = [System.Drawing.Image]::FromStream($stream)
+    $sheet = New-Object System.Drawing.Bitmap $image
+    $image.Dispose()
+    $stream.Dispose()
+    $sheet
 }
 
-function Get-Rgb([string] $hex) {
-    $color = [System.Drawing.ColorTranslator]::FromHtml($hex)
-    , [double[]] @(($color.R / 255), ($color.G / 255), ($color.B / 255))
-}
-
-# The globe's and badge's coverage at SIZE, worked out once per size.
-$script:shapes = @{}
-function Get-Shapes([int] $size) {
-    if (-not $script:shapes[$size]) {
-        $script:shapes[$size] = @{
-            Globe = Get-GlobeCoverage $size
-            Badge = Get-BadgeCoverage $size
-            # 24 / size: one pixel, in the icon's 24x24 space.
-            Cut   = Get-BadgeCoverage $size (24 / $size)
-        }
+# The icon in ROW of SHEET, at the notification area's size: the image that
+# size, or else the next size up, scaled down.
+function New-StatusIcon([System.Drawing.Bitmap] $sheet, [int] $row) {
+    $size = $script:iconSize
+    $col = $StatusSizes.Count - 1
+    for ($i = $StatusSizes.Count - 1; $i -ge 0; $i--) {
+        if ($StatusSizes[$i] -ge $size) { $col = $i }
     }
-    $script:shapes[$size]
-}
-
-# A SIZE x SIZE bitmap of the globe in FOREGROUND, with a badge in BADGECOLOR
-# if given.
-function New-NovacoreBitmap([int] $size, [string] $foreground, [string] $badgeColor = '') {
-    $shapes = Get-Shapes $size
-    $fg = Get-Rgb $foreground
-    $status = [bool] $badgeColor
-    if ($status) { $fill = Get-Rgb $badgeColor }
-    # BGRA, as a 32bpp ARGB bitmap keeps it in memory.
-    $bytes = New-Object byte[] ($size * $size * 4)
-    for ($i = 0; $i -lt $size * $size; $i++) {
-        $globe = $shapes.Globe[$i]
-        if ($status) { $globe *= 1 - $shapes.Cut[$i] }
-        $px = [double[]] @($globe, $fg[0], $fg[1], $fg[2])
-        if ($status) {
-            $px = Join-Colors $px @($shapes.Badge[$i], $fill[0], $fill[1], $fill[2])
-        }
-        $bytes[$i * 4] = [Math]::Round(255 * $px[3])
-        $bytes[$i * 4 + 1] = [Math]::Round(255 * $px[2])
-        $bytes[$i * 4 + 2] = [Math]::Round(255 * $px[1])
-        $bytes[$i * 4 + 3] = [Math]::Round(255 * $px[0])
+    $n = $StatusSizes[$col]
+    $from = New-Object System.Drawing.Rectangle ($col * 64), ($row * 64), $n, $n
+    $format = [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    if ($n -eq $size) {
+        $bmp = $sheet.Clone($from, $format)
+    } else {
+        $bmp = New-Object System.Drawing.Bitmap $size, $size, $format
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.DrawImage($sheet, (New-Object System.Drawing.Rectangle 0, 0, $size, $size), $from, [System.Drawing.GraphicsUnit]::Pixel)
+        $g.Dispose()
     }
-    $bmp = New-Object System.Drawing.Bitmap $size, $size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $data = $bmp.LockBits((New-Object System.Drawing.Rectangle 0, 0, $size, $size), 'WriteOnly', $bmp.PixelFormat)
-    for ($y = 0; $y -lt $size; $y++) {
-        [System.Runtime.InteropServices.Marshal]::Copy($bytes, $y * $size * 4, [IntPtr] ($data.Scan0.ToInt64() + $y * $data.Stride), $size * 4)
-    }
-    $bmp.UnlockBits($data)
-    $bmp
-}
-
-# The same as an icon, at the size of the notification area's icons: 16px at
-# 100% scaling, 24px at 150% and so on.
-$script:iconSize = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
-function New-NovacoreIcon([string] $foreground, [string] $badgeColor = '') {
-    $bmp = New-NovacoreBitmap $script:iconSize $foreground $badgeColor
-    [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $bmp.Dispose()
+    $icon
 }
 
 # Novacore's project icon, for the app itself: its program, notifications
@@ -313,14 +169,19 @@ function Update-Icons {
     $light = Test-LightTaskbar
     if ($light -eq $script:lightTaskbar) { return $false }
     $script:lightTaskbar = $light
-    $theme = $script:themes[$(if ($light) { 'Light' } else { 'Dark' })]
     $old = $script:icons
     $script:icons = @{}
-    foreach ($status in 'Running', 'Stopped', 'Busy', 'Error') {
-        $script:icons[$status] = New-NovacoreIcon $theme.Foreground $theme[$status]
+    $sheet = Read-StatusSheet
+    for ($i = 0; $i -lt $StatusStates.Count; $i++) {
+        $script:icons[$StatusStates[$i]] = if ($sheet) {
+            New-StatusIcon $sheet ($(if ($light) { $StatusStates.Count } else { 0 }) + $i)
+        } else {
+            [System.Drawing.SystemIcons]::Application
+        }
     }
+    if ($sheet) { $sheet.Dispose() }
     if ($script:notify) { Update-View }
-    if ($old) { $old.Values | ForEach-Object { $_.Dispose() } }
+    if ($old) { $old.Values | Where-Object { $_ -ne [System.Drawing.SystemIcons]::Application } | ForEach-Object { $_.Dispose() } }
     $true
 }
 [void] (Update-Icons)
@@ -614,7 +475,7 @@ function Request-Status {
     })
 }
 
-# Replace this script and its icon with the repo's copies when they have
+# Replace this script and its icons with the repo's copies when they have
 # changed, e.g. after a git pull, and restart into it. It runs after a
 # successful status check, while WSL is up anyway, so reading the repo doesn't
 # start WSL. The repo is where the CLI is: <repo>/bin/novacore.
@@ -626,16 +487,19 @@ function Update-Self {
     if ($script:menu.Visible -or [System.Windows.Forms.Application]::OpenForms.Count -gt 0) { return }
     $script:lastUpdateCheck = Get-Date
 
-    $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/windows/novacore-tray.ps1')
+    $source = Get-WindowsPath (($Command -replace '/bin/[^/]+$', '') + '/tray/windows/novacore-tray.ps1')
     if (-not (Test-Path -LiteralPath $source)) { return }
     $new = Get-Hash $source
     $scriptChanged = $new -ne (Get-Hash $PSCommandPath)
-    # And its icon, which NovacoreTray.exe is built with.
-    $sourceIcon = Join-Path (Split-Path $source) 'novacore.ico'
-    $iconChanged = (Test-Path -LiteralPath $sourceIcon) -and (
-        -not (Test-Path -LiteralPath $script:appIcon) -or
-        (Get-Hash $sourceIcon) -ne (Get-Hash $script:appIcon))
-    if (-not $scriptChanged -and -not $iconChanged) { return }
+    # And its icons: novacore.ico, which NovacoreTray.exe is built with, and
+    # the status icons.
+    $icons = @(
+        @{ From = Join-Path (Split-Path $source) 'novacore.ico'; To = $script:appIcon },
+        @{ From = Join-Path (Split-Path (Split-Path $source)) 'status-icons.png'; To = $script:statusSheet })
+    $changedIcons = @($icons | Where-Object {
+        (Test-Path -LiteralPath $_.From) -and (
+            -not (Test-Path -LiteralPath $_.To) -or (Get-Hash $_.From) -ne (Get-Hash $_.To)) })
+    if (-not $scriptChanged -and -not $changedIcons) { return }
 
     if ($scriptChanged) {
         if ($new -eq $script:skippedUpdate) { return }
@@ -644,12 +508,12 @@ function Update-Self {
         [void] [System.Management.Automation.Language.Parser]::ParseFile($source, [ref] $null, [ref] $errors)
         if ($errors) {
             $script:skippedUpdate = $new
-            Show-Problem "Not updating the tray icon: windows/novacore-tray.ps1 has errors. $($errors[0])"
+            Show-Problem "Not updating the tray icon: tray/windows/novacore-tray.ps1 has errors. $($errors[0])"
             return
         }
         Copy-Item -LiteralPath $source -Destination $PSCommandPath -Force
     }
-    if ($iconChanged) { Copy-Item -LiteralPath $sourceIcon -Destination $script:appIcon -Force }
+    foreach ($icon in $changedIcons) { Copy-Item -LiteralPath $icon.From -Destination $icon.To -Force }
     # Let the new one take the single-instance lock, then hand over to it.
     $script:mutex.ReleaseMutex()
     $script:mutex.Dispose()

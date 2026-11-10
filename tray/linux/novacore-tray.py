@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Novacore's tray icon on Linux, the counterpart of the macOS menu bar icon in
-# macos/ and the Windows tray icon in windows/.
+# tray/macos/ and the Windows tray icon in tray/windows/.
 #
 # It draws what the CLI describes. `novacore tray menu` gives the menu as JSON,
 # with each item's action, and the dialogs to show (see tray/PROTOCOL.md), so
@@ -18,7 +18,6 @@
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import shutil
@@ -33,16 +32,17 @@ except ImportError:
     from PyQt6 import QtCore, QtGui, QtWidgets
 
 Qt = QtCore.Qt
-QIcon, QImage, QPainter, QPainterPath, QPen, QColor = (
-    QtGui.QIcon, QtGui.QImage, QtGui.QPainter, QtGui.QPainterPath, QtGui.QPen, QtGui.QColor)
+QIcon, QImage, QPainter, QColor = QtGui.QIcon, QtGui.QImage, QtGui.QPainter, QtGui.QColor
 
 APP_ID = "novacore-tray"  # also the name of its .desktop file
 ELLIPSIS = "…"
 MIDDLE_DOT = "·"
 
 SCRIPT = os.path.realpath(__file__)
-# The CLI: the first argument, else the one in the repo this is in.
-COMMAND = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(SCRIPT)), "bin", "novacore")
+# The CLI: the first argument, else the one in the repo this is in, at
+# <repo>/tray/linux/novacore-tray.py.
+COMMAND = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT))), "bin", "novacore")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(COMMAND)))
 APP_ICON = os.path.join(REPO, "tray", "novacore.svg")
 
@@ -57,6 +57,13 @@ log = logging.getLogger("novacore-tray")
 def file_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+def sheet_hash():
+    try:
+        return file_hash(STATUS_SHEET)
+    except OSError:
+        return ""
 
 
 # --- Running novacore -------------------------------------------------------
@@ -213,97 +220,49 @@ if [ $# -eq 0 ]; then exec "${SHELL:-bash}"; fi
 
 # --- Icon -------------------------------------------------------------------
 #
-# The globe from Novacore's link in the Open Source nav on jonbp.co.uk, as the
-# other icons draw it: a circle, with the equator and two meridians tilted like
-# the Earth's axis, in the panel's text colour. A pill in its bottom right
-# corner, tilted like the equator, shows the status by its colour, with a gap
-# cut out of the globe around it. Shapes are in a 24x24 space, y down.
+# The status icons, like the other tray icons', come from tray/status-icons.png,
+# which tray/build-icons.sh renders from tray/status.svg: the globe from
+# Novacore's link on jonbp.co.uk, with a pill whose colour shows the status. The
+# sheet has a 64px cell for each theme and status, dark then light, each
+# running, stopped, busy then error, with a column per size and the icon in each
+# cell's top left corner.
 
-TILT = 23.5
+STATUS_SHEET = os.path.join(REPO, "tray", "status-icons.png")
+STATES = ["running", "stopped", "busy", "error"]
+STATUS_SIZES = [16, 20, 24, 28, 32, 36, 40, 48, 64]
 
-# jonbp.co.uk's palette in its dark and light themes: running is Novacore's
-# neon teal, stopped the secondary text colour, busy and error neon yellow and
-# red.
+# jonbp.co.uk's palette in its dark and light themes, as in the sheet: running
+# is Novacore's neon teal, stopped the secondary text colour, busy and error
+# neon yellow and red.
 BADGE_COLORS = {
     True: {"running": "#17D4A4", "stopped": "#768087", "busy": "#FEC82C", "error": "#FE2C62"},
     False: {"running": "#009672", "stopped": "#58626A", "busy": "#C48C00", "error": "#DE184C"},
 }
 
 
-# Panels scale tray icons to fill their slot, usually 22px, so the globe takes
-# up 16/22 of the image, to look like a 16px icon there.
-ICON_FILL = 16 / 22
-
-
-def draw_icon(state, dark, side):
-    content = side * ICON_FILL
-    inset = (side - content) / 2
-
-    def place(painter):
-        painter.resetTransform()
-        painter.translate(inset, inset)
-        painter.scale(content / 24, content / 24)
-
-    def canvas():
-        image = QImage(side, side, QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        place(painter)
-        return image, painter
-
-    def pen(color, width):
-        p = QPen(QColor(color), width)
-        p.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        return p
-
-    # The pill: a round-capped line as thick as it's tall, placed so its lowest
-    # and rightmost points touch the icon's edges.
-    w, h = 9, 4.5
-    half = (w - h) / 2
-    dx, dy = half * math.cos(math.radians(TILT)), half * math.sin(math.radians(TILT))
-    cx, cy = 24 - dx - h / 2, 24 - dy - h / 2
-    pill = QPainterPath()
-    pill.moveTo(cx - dx, cy + dy)
-    pill.lineTo(cx + dx, cy - dy)
-
-    # The globe, on a layer of its own so lines aren't darker where they cross,
-    # minus a 1px gap around the pill.
-    globe, g = canvas()
-    stroke = 2.25  # 1.5px at 16px
-    r = 12 - stroke / 2
-    m = 5.5  # the meridians' half-width
-    g.setPen(pen("#ffffff" if dark else "#000000", stroke))
-    g.drawEllipse(QtCore.QPointF(12, 12), r, r)
-    g.translate(12, 12)
-    g.rotate(-TILT)
-    g.drawLine(QtCore.QPointF(-r, 0), QtCore.QPointF(r, 0))
-    g.drawEllipse(QtCore.QPointF(0, 0), m, r)
-    place(g)
-    g.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-    g.setPen(pen("#000000", h + 2 * 24 / content))
-    g.drawPath(pill)
-    g.end()
-
-    image, p = canvas()
-    p.save()
-    p.resetTransform()
-    # Black at 85%, like other symbolic icons.
-    p.setOpacity(1 if dark else 0.85)
-    p.drawImage(0, 0, globe)
-    p.restore()
-    p.setPen(pen(BADGE_COLORS[dark][state], h))
-    p.drawPath(pill)
-    p.end()
-    return image
-
-
-def status_icon(state, dark):
-    icon = QIcon()
-    for side in (16, 22, 24, 32, 48, 64):
-        icon.addPixmap(QtGui.QPixmap.fromImage(draw_icon(state, dark, side)))
-    return icon
+def status_icons(dark):
+    """Each status's icon, for a dark or light panel."""
+    sheet = QImage(STATUS_SHEET)
+    if sheet.isNull():
+        log.error("Couldn't read %s", STATUS_SHEET)
+        return {state: QIcon(APP_ICON) for state in STATES}
+    icons = {}
+    for i, state in enumerate(STATES):
+        row = (0 if dark else len(STATES)) + i
+        icon = QIcon()
+        for col, n in enumerate(STATUS_SIZES):
+            # Panels scale tray icons to fill their slot, usually 22px, so
+            # each is centred on a canvas 22/16 its size, to look like a 16px
+            # icon there.
+            side = round(n * 22 / 16)
+            image = QImage(side, side, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.drawImage((side - n) // 2, (side - n) // 2, sheet, col * 64, row * 64, n, n)
+            painter.end()
+            icon.addPixmap(QtGui.QPixmap.fromImage(image))
+        icons[state] = icon
+    return icons
 
 
 def is_dark():
@@ -581,9 +540,10 @@ class Tray(QtCore.QObject):
         self.notices = set()
         self.notify_send = self.find_notify_send()
         self.built_hash = file_hash(SCRIPT)
+        self.sheet_hash = sheet_hash()
 
         self.dark = is_dark()
-        self.icons = {s: status_icon(s, self.dark) for s in BADGE_COLORS[True]}
+        self.icons = status_icons(self.dark)
         try:
             QtGui.QGuiApplication.styleHints().colorSchemeChanged.connect(self.restyle)
         except AttributeError:  # Qt before 6.5; refresh checks instead
@@ -623,7 +583,7 @@ class Tray(QtCore.QObject):
         dark = is_dark()
         if dark != self.dark:
             self.dark = dark
-            self.icons = {s: status_icon(s, dark) for s in BADGE_COLORS[True]}
+            self.icons = status_icons(dark)
             self.update_view()
 
     def announce_update(self):
@@ -685,7 +645,7 @@ class Tray(QtCore.QObject):
         if self.problem:
             return "error"
         state = (self.model or {}).get("state")
-        return state if state in BADGE_COLORS[True] else "stopped"
+        return state if state in STATES else "stopped"
 
     def update_view(self):
         """Bring the icon, tooltip and menu up to date."""
@@ -888,7 +848,7 @@ class Tray(QtCore.QObject):
 
     def check_for_update(self):
         """Restart with the repo's copy of this file when it has changed, e.g.
-        after a git pull."""
+        after a git pull, and reload the status icons when they have."""
         if self.updating or time.monotonic() - self.last_update_check < 60:
             return
         # Restarting would close the menu or a window in use, so wait for a
@@ -896,6 +856,12 @@ class Tray(QtCore.QObject):
         if self.menu_open or self.form_open or self.info_windows or self.output_window:
             return
         self.last_update_check = time.monotonic()
+        # New status icons need no restart, just reading again.
+        new_sheet = sheet_hash()
+        if new_sheet != self.sheet_hash:
+            self.sheet_hash = new_sheet
+            self.icons = status_icons(self.dark)
+            self.update_view()
         try:
             with open(SCRIPT, "rb") as f:
                 source = f.read()

@@ -1351,13 +1351,13 @@ cmd_trust() {
 
 # --- Tray icons ---------------------------------------------------------------
 #
-# The Linux tray icon (linux/novacore-tray.py), the macOS menu bar icon
-# (macos/NovacoreTray.swift) and the Windows tray icon
-# (windows/novacore-tray.ps1) share everything but drawing: `tray menu` tells
+# The Linux tray icon (tray/linux/novacore-tray.py), the macOS menu bar icon
+# (tray/macos/NovacoreTray.swift) and the Windows tray icon
+# (tray/windows/novacore-tray.ps1) share everything but drawing: `tray menu` tells
 # them what to show and what each item does, `tray run` and `tray poll` run a
 # command for them, and `tray submit` turns a dialog's answers into a command.
 # So a new menu item or dialog only needs adding here, in tray_menu. The JSON
-# is described in tray/PROTOCOL.md. The Plasma widget (plasmoid/) lists the
+# is described in tray/PROTOCOL.md. The Plasma widget (tray/plasmoid/) lists the
 # sites itself, from `status --json`, but runs its commands the same way.
 #
 # Like the JSON functions they build on, these set REPLY.
@@ -1783,7 +1783,7 @@ if ($running) {
 windows_tray_install() {
     header "Installing the tray icon"
     heading "Windows tray icon"
-    NC_SCRIPT=$(wslpath -w "$NOVACORE_ROOT/windows/novacore-tray.ps1") \
+    NC_SCRIPT=$(wslpath -w "$NOVACORE_ROOT/tray/windows/novacore-tray.ps1") \
     NC_DISTRO=$WSL_DISTRO_NAME \
     NC_COMMAND="$NOVACORE_ROOT/bin/novacore" \
     WSLENV=NC_SCRIPT:NC_DISTRO:NC_COMMAND \
@@ -1792,6 +1792,7 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 $ps1 = Join-Path $dir "novacore-tray.ps1"
 Copy-Item -LiteralPath $env:NC_SCRIPT -Destination $ps1 -Force
 Copy-Item -LiteralPath (Join-Path (Split-Path $env:NC_SCRIPT) "novacore.ico") -Destination $dir -Force
+Copy-Item -LiteralPath (Join-Path (Split-Path (Split-Path $env:NC_SCRIPT)) "status-icons.png") -Destination $dir -Force
 
 # A headless console, so no window flashes up as PowerShell starts.
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
@@ -1828,10 +1829,11 @@ MAC_TRAY_APP="$HOME/Applications/Novacore Tray.app"
 MAC_TRAY_AGENT="$HOME/Library/LaunchAgents/$MAC_TRAY_ID.plist"
 MAC_TRAY_LOG="$HOME/Library/Logs/Novacore/tray.log"
 
-# The hash of the menu bar app's source and icon. The app compares it with the
+# The hash of the menu bar app's source and icons. The app compares it with the
 # one it was built from, to rebuild itself after a git pull.
 mac_tray_hash() {
-    cat "$NOVACORE_ROOT/macos/NovacoreTray.swift" "$NOVACORE_ROOT/macos/novacore.icns" | shasum -a 256 | cut -d' ' -f1
+    cat "$NOVACORE_ROOT/tray/macos/NovacoreTray.swift" "$NOVACORE_ROOT/tray/macos/novacore.icns" \
+        "$NOVACORE_ROOT/tray/status-icons.png" | shasum -a 256 | cut -d' ' -f1
 }
 
 xml_str() {
@@ -1857,9 +1859,9 @@ macos_tray_install() {
     trap "rm -rf '$tmp'" EXIT
     app="$tmp/Novacore Tray.app"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-    run xcrun swiftc -O -swift-version 5 -o "$app/Contents/MacOS/NovacoreTray" "$NOVACORE_ROOT/macos/NovacoreTray.swift" ||
+    run xcrun swiftc -O -swift-version 5 -o "$app/Contents/MacOS/NovacoreTray" "$NOVACORE_ROOT/tray/macos/NovacoreTray.swift" ||
         fail "Couldn't build the menu bar icon"
-    cp "$NOVACORE_ROOT/macos/novacore.icns" "$app/Contents/Resources/"
+    cp "$NOVACORE_ROOT/tray/macos/novacore.icns" "$NOVACORE_ROOT/tray/status-icons.png" "$app/Contents/Resources/"
     cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1980,7 +1982,7 @@ pyside_hint() {
 linux_tray_install() {
     header "Installing the tray icon"
     heading "Linux tray icon"
-    local python script="$NOVACORE_ROOT/linux/novacore-tray.py" entry
+    local python script="$NOVACORE_ROOT/tray/linux/novacore-tray.py" entry
     command -v python3 >/dev/null || fail "The tray icon needs Python 3" "$(pyside_hint)"
     python3 -c 'import PySide6.QtWidgets' 2>/dev/null || python3 -c 'import PyQt6.QtWidgets' 2>/dev/null ||
         fail "The tray icon needs Qt for Python (PySide6 or PyQt6)" "$(pyside_hint)"
@@ -2016,10 +2018,10 @@ X-GNOME-Autostart-enabled=true"
     if is_plasma; then
         heading "KDE Plasma widget"
         if kpackagetool6 -t Plasma/Applet -s "$PLASMOID_ID" >/dev/null 2>&1; then
-            run kpackagetool6 -t Plasma/Applet -u "$NOVACORE_ROOT/plasmoid" || fail "Couldn't update the Plasma widget"
+            run kpackagetool6 -t Plasma/Applet -u "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't update the Plasma widget"
             result "Updated. One already on a panel picks it up when Plasma restarts"
         else
-            run kpackagetool6 -t Plasma/Applet -i "$NOVACORE_ROOT/plasmoid" || fail "Couldn't install the Plasma widget"
+            run kpackagetool6 -t Plasma/Applet -i "$NOVACORE_ROOT/tray/plasmoid" || fail "Couldn't install the Plasma widget"
             result "Installed. Add Novacore to a panel or the desktop from Add Widgets"
         fi
     fi

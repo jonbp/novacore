@@ -1,6 +1,6 @@
 # Tray icon protocol
 
-Novacore has three tray icons: the Linux tray icon (`linux/novacore-tray.py`), the macOS menu bar icon (`macos/NovacoreTray.swift`) and the Windows tray icon (`windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
+Novacore has three tray icons: the Linux tray icon (`tray/linux/novacore-tray.py`), the macOS menu bar icon (`tray/macos/NovacoreTray.swift`) and the Windows tray icon (`tray/windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
 
 ## Adding a feature
 

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    The tray icons' status icon. tray/build-icons.sh renders it into
+    tray/status-icons.png, filling in {{GLOBE}}, {{GLOBE_OPACITY}} and {{BADGE}}
+    for each theme and status.
+
+    The globe from Novacore's link in the Open Source nav on jonbp.co.uk: a
+    circle, with the equator and two meridians tilted 23.5° like the Earth's
+    axis, in the panel's text colour. Its lines are 1.5px wide at 16px. A pill
+    in its bottom right corner, tilted like the equator and 6x3px at 16px,
+    shows the status by its colour. Its lowest and rightmost points touch the
+    icon's edges, and a gap around it as wide as the globe's lines, 1.5px at
+    16px, is cut out of the globe.
+  -->
+  <defs>
+    <mask id="cut" maskUnits="userSpaceOnUse" x="-2" y="-2" width="28" height="28">
+      <rect x="-2" y="-2" width="28" height="28" fill="#fff"/>
+      <line x1="17.6232" y1="21.75" x2="21.75" y2="19.9556" stroke="#000" stroke-width="9" stroke-linecap="round"/>
+    </mask>
+  </defs>
+  <!-- Faded as a whole, so lines aren't darker where they cross. -->
+  <g mask="url(#cut)" opacity="{{GLOBE_OPACITY}}">
+    <g fill="none" stroke="{{GLOBE}}" stroke-width="2.25" stroke-linecap="round">
+      <circle cx="12" cy="12" r="10.875"/>
+      <g transform="rotate(-23.5 12 12)">
+        <line x1="1.125" y1="12" x2="22.875" y2="12"/>
+        <ellipse cx="12" cy="12" rx="5.5" ry="10.875"/>
+      </g>
+    </g>
+  </g>
+  <line x1="17.6232" y1="21.75" x2="21.75" y2="19.9556" stroke="{{BADGE}}" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

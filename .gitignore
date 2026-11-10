@@ -7,3 +7,6 @@ logs/
 
 # macOS Finder metadata
 .DS_Store
+
+# Python bytecode, from running the Linux tray icon
+__pycache__/

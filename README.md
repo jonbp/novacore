@@ -202,10 +202,10 @@ novacore help
 
 ## KDE Plasma widget
 
-`plasmoid/` holds a Plasma 6 widget. It lists your sites, and you click one to open it. It can also switch a site's PHP version, open the dashboard or a site's folder, and start or stop Novacore.
+`tray/plasmoid/` holds a Plasma 6 widget. It lists your sites, and you click one to open it. It can also switch a site's PHP version, open the dashboard or a site's folder, and start or stop Novacore.
 
 ```sh
-kpackagetool6 -t Plasma/Applet -i plasmoid   # use -u instead of -i to update it
+kpackagetool6 -t Plasma/Applet -i tray/plasmoid   # use -u instead of -i to update it
 ```
 
 Then add **Novacore** to a panel or the desktop. The widget runs `novacore`, and it also looks in `~/.local/bin`. If the CLI is somewhere else, set the full path in the widget's settings.
@@ -234,19 +234,19 @@ Commands you start from the icon, like a PHP switch that builds a new image, run
 
 ### Linux
 
-The icon is a Python script, `linux/novacore-tray.py`, using Qt for Python. Install PySide6 (or PyQt6) from your distro first, e.g. `sudo dnf install python3-pyside6`, `sudo apt install python3-pyside6.qtwidgets` or `sudo pacman -S pyside6`. `novacore tray install` adds **Novacore Tray** to your app launcher and to `~/.config/autostart`, so it starts when you log in, and starts it now. It runs straight from the repo, and restarts itself when the script changes. If you quit it, open **Novacore Tray** from your app launcher to start it again. In KDE Plasma, `tray install` also installs or updates the [Plasma widget](#kde-plasma-widget), and `tray uninstall` removes it.
+The icon is a Python script, `tray/linux/novacore-tray.py`, using Qt for Python. Install PySide6 (or PyQt6) from your distro first, e.g. `sudo dnf install python3-pyside6`, `sudo apt install python3-pyside6.qtwidgets` or `sudo pacman -S pyside6`. `novacore tray install` adds **Novacore Tray** to your app launcher and to `~/.config/autostart`, so it starts when you log in, and starts it now. It runs straight from the repo, and restarts itself when the script changes. If you quit it, open **Novacore Tray** from your app launcher to start it again. In KDE Plasma, `tray install` also installs or updates the [Plasma widget](#kde-plasma-widget), and `tray uninstall` removes it.
 
 The icon shows up in KDE Plasma, XFCE, Cinnamon, LXQt and other desktops with a system tray. GNOME needs the AppIndicator extension, which Ubuntu includes. The menu opens with a left or right click. Terminals open in your desktop's own terminal, or the one in `$TERMINAL`. Notifications use `notify-send`, and clicking one opens the site or a failed command's output. Problems are logged to `~/.local/state/novacore/tray.log`.
 
 ### macOS
 
-The icon is a small app, `~/Applications/Novacore Tray.app`. `novacore tray install` compiles it from `macos/NovacoreTray.swift`, which needs the Xcode Command Line Tools (`xcode-select --install`). A LaunchAgent starts it when you log in. If you quit it, open **Novacore Tray** from Spotlight to start it again.
+The icon is a small app, `~/Applications/Novacore Tray.app`. `novacore tray install` compiles it from `tray/macos/NovacoreTray.swift`, which needs the Xcode Command Line Tools (`xcode-select --install`). A LaunchAgent starts it when you log in. If you quit it, open **Novacore Tray** from Spotlight to start it again.
 
 The icon runs the CLI with the `PATH` you had when you installed it, so `docker` needs to be on that `PATH`. If you move Docker, run `novacore tray install` again. Terminals open in Terminal.app. The first time it sends a notification, macOS asks whether to allow them. If you don't allow them, a failed command opens its output instead. Problems are logged to `~/Library/Logs/Novacore/tray.log`.
 
 ### Windows
 
-With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
+With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `tray/windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
 
 Terminals open in Windows Terminal if you have it. VS Code and Zed appear if they're installed on Windows, and open the site through WSL.
 
@@ -254,7 +254,7 @@ The icon checks the status every 30 seconds, but only while your WSL distro is r
 
 ### Adding to the tray icons
 
-All three icons draw the menu that `novacore tray menu` describes in JSON: each item, what it does, and the dialogs to show. To add a menu item or a dialog, you change `tray_menu` in `bin/novacore`, and every icon picks it up. [`tray/PROTOCOL.md`](tray/PROTOCOL.md) describes the JSON. `tray/build-icons.sh` renders the macOS and Windows app icons from `tray/novacore.svg`, which the Linux icon uses as it is.
+All three icons draw the menu that `novacore tray menu` describes in JSON: each item, what it does, and the dialogs to show. To add a menu item or a dialog, you change `tray_menu` in `bin/novacore`, and every icon picks it up. [`tray/PROTOCOL.md`](tray/PROTOCOL.md) describes the JSON. They also share their status icon: `tray/status.svg`, which `tray/build-icons.sh` renders into `tray/status-icons.png` for all three. It also renders the macOS and Windows app icons from `tray/novacore.svg`, which the Linux icon uses as it is. Run it after changing either SVG.
 
 ## How it works
 
@@ -267,11 +267,11 @@ docker/mariadb/init/       first-run database setup
 sites.conf                 your sites (created on first `site add`)
 data/                      generated: vhosts, certificates, dashboard, compose overrides
 logs/                      PHP error log per site
-plasmoid/                  KDE Plasma widget
-tray/                      what the tray icons share: their protocol and icon
-linux/                     Linux tray icon
-macos/                     macOS menu bar icon
-windows/                   Windows tray icon (for WSL)
+tray/                      the tray icons: their protocol, icons and build script
+tray/linux/                Linux tray icon
+tray/macos/                macOS menu bar icon
+tray/windows/              Windows tray icon (for WSL)
+tray/plasmoid/             KDE Plasma widget
 ```
 
 The CLI reads `sites.conf` and generates three things in `data/`: an nginx vhost for each site, a certificate for each site, and a Compose override (`compose.generated.yml`). The override gives nginx a network alias for each domain, and shares your SSH agent with PHP. nginx reaches PHP through Docker's DNS when a request comes in, so a vhost that points at a PHP version that isn't running gives a 502 instead of stopping nginx from starting.

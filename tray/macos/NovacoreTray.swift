@@ -1,5 +1,5 @@
 // Novacore's icon in the macOS menu bar, the counterpart of the Windows tray
-// icon in windows/ and the Plasma widget in plasmoid/.
+// icon in tray/windows/ and the Plasma widget in tray/plasmoid/.
 //
 // It draws what the CLI describes. `novacore tray menu` gives the menu as
 // JSON, with each item's action, and the dialogs to show (see
@@ -122,80 +122,39 @@ func activate() {
 
 // MARK: - Icon
 
-// The globe from Novacore's link in the Open Source nav on jonbp.co.uk, as the
-// Windows tray icon draws it: a circle, with the equator and two meridians
-// tilted like the Earth's axis, in the menu bar's text colour. A pill in its
-// bottom right corner, tilted like the equator, shows the status by its
-// colour, with a gap cut out of the globe around it. Shapes are in a 24x24
-// space, y down.
+// The status icons, like the other tray icons', come from status-icons.png,
+// copied into the app from tray/, which tray/build-icons.sh renders from
+// tray/status.svg: the globe from Novacore's link on jonbp.co.uk, with a pill
+// whose colour shows the status. The sheet has a 64px cell for each theme and
+// status, dark then light, each running, stopped, busy then error, with a
+// column per size and the icon in each cell's top left corner.
 
-enum IconState: String { case running, stopped, busy, error }
+enum IconState: String, CaseIterable { case running, stopped, busy, error }
 
-let tilt = 23.5 * CGFloat.pi / 180
+let statusSizes = [16, 20, 24, 28, 32, 36, 40, 48, 64]
 
-func hex(_ s: String) -> NSColor {
-    let v = Int(s.dropFirst(), radix: 16) ?? 0
-    return NSColor(srgbRed: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255,
-                   blue: CGFloat(v & 255) / 255, alpha: 1)
-}
-
-// jonbp.co.uk's palette in its dark and light themes: running is Novacore's
-// neon teal, stopped the secondary text colour, busy and error neon yellow
-// and red.
-let badgeColors: [Bool: [IconState: NSColor]] = [
-    true: [.running: hex("#17D4A4"), .stopped: hex("#768087"), .busy: hex("#FEC82C"), .error: hex("#FE2C62")],
-    false: [.running: hex("#009672"), .stopped: hex("#58626A"), .busy: hex("#C48C00"), .error: hex("#DE184C")],
-]
+let statusSheet: CGImage? = Bundle.main.url(forResource: "status-icons", withExtension: "png")
+    .flatMap { try? Data(contentsOf: $0) }
+    .flatMap { NSBitmapImageRep(data: $0)?.cgImage }
 
 func statusImage(_ state: IconState) -> NSImage {
     let side: CGFloat = 16  // points
     // Drawn when shown, so it follows the menu bar between light and dark.
-    return NSImage(size: NSSize(width: side, height: side), flipped: true) { rect in
+    return NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
         guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+        guard let sheet = statusSheet else {
+            NSApp.applicationIconImage.draw(in: rect)
+            return true
+        }
         let dark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        ctx.scaleBy(x: rect.width / 24, y: rect.height / 24)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-
-        // The pill: a round-capped line as thick as it's tall, placed so its
-        // lowest and rightmost points touch the icon's edges.
-        let w: CGFloat = 9, h: CGFloat = 4.5
-        let half = (w - h) / 2
-        let dx = half * cos(tilt), dy = half * sin(tilt)
-        let cx = 24 - dx - h / 2, cy = 24 - dy - h / 2
-        let pill = CGMutablePath()
-        pill.move(to: CGPoint(x: cx - dx, y: cy + dy))
-        pill.addLine(to: CGPoint(x: cx + dx, y: cy - dy))
-
-        // The globe, minus a 1pt gap around the pill.
-        ctx.saveGState()
-        let gap = 24 / side
-        ctx.addRect(CGRect(x: -4, y: -4, width: 32, height: 32))
-        ctx.addPath(pill.copy(strokingWithWidth: h + 2 * gap, lineCap: .round, lineJoin: .round, miterLimit: 10))
-        ctx.clip(using: .evenOdd)
-        // Black at 85%, like the menu bar's own icons, applied to the globe
-        // as a whole, so lines aren't darker where they cross.
-        ctx.setAlpha(dark ? 1 : 0.85)
-        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-        ctx.setStrokeColor((dark ? NSColor.white : NSColor.black).cgColor)
-        let stroke: CGFloat = 2.25  // 1.5pt at 16pt
-        let r = 12 - stroke / 2
-        let m: CGFloat = 5.5  // the meridians' half-width
-        ctx.setLineWidth(stroke)
-        ctx.strokeEllipse(in: CGRect(x: 12 - r, y: 12 - r, width: 2 * r, height: 2 * r))
-        ctx.translateBy(x: 12, y: 12)
-        ctx.rotate(by: -tilt)
-        ctx.move(to: CGPoint(x: -r, y: 0))
-        ctx.addLine(to: CGPoint(x: r, y: 0))
-        ctx.strokePath()
-        ctx.strokeEllipse(in: CGRect(x: -m, y: -r, width: 2 * m, height: 2 * r))
-        ctx.endTransparencyLayer()
-        ctx.restoreGState()
-
-        ctx.addPath(pill)
-        ctx.setLineWidth(h)
-        ctx.setStrokeColor(badgeColors[dark]![state]!.cgColor)
-        ctx.strokePath()
+        let row = (dark ? 0 : 4) + IconState.allCases.firstIndex(of: state)!
+        // The image for the screen's pixels: 16px, or 32px on a Retina screen.
+        let pixels = Int((rect.width * ctx.userSpaceToDeviceSpaceTransform.a).rounded())
+        let col = statusSizes.firstIndex { $0 >= pixels } ?? statusSizes.count - 1
+        let n = statusSizes[col]
+        guard let cell = sheet.cropping(to: CGRect(x: col * 64, y: row * 64, width: n, height: n)) else { return false }
+        ctx.interpolationQuality = .high
+        ctx.draw(cell, in: rect)
         return true
     }
 }
@@ -401,7 +360,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         }
         if !builtHash.isEmpty { defaults.set(builtHash, forKey: "lastRunHash") }
 
-        for state in [IconState.running, .stopped, .busy, .error] { icons[state] = statusImage(state) }
+        for state in IconState.allCases { icons[state] = statusImage(state) }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.autoenablesItems = false
         menu.delegate = self
@@ -686,7 +645,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         }
     }
 
-    // Rebuild this app when the repo's source or icon has changed, e.g. after
+    // Rebuild this app when the repo's source or icons have changed, e.g. after
     // a git pull, by running `novacore tray install`, which restarts it.
     func checkForUpdate() {
         guard !builtHash.isEmpty, Bundle.main.bundlePath == installedApp, !updating else { return }
@@ -695,10 +654,12 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         // quiet moment. A running command is fine: it runs on its own.
         if menuOpen || NSApp.modalWindow != nil || !infoWindows.isEmpty || outputWindow != nil { return }
         lastUpdateCheck = Date()
-        let dir = repo.appendingPathComponent("macos")
+        // The same files as mac_tray_hash in bin/novacore, in the same order.
+        let dir = repo.appendingPathComponent("tray/macos")
         guard let source = try? Data(contentsOf: dir.appendingPathComponent("NovacoreTray.swift")),
-              let icon = try? Data(contentsOf: dir.appendingPathComponent("novacore.icns")) else { return }
-        let hash = SHA256.hash(data: source + icon).map { String(format: "%02x", $0) }.joined()
+              let icon = try? Data(contentsOf: dir.appendingPathComponent("novacore.icns")),
+              let sheet = try? Data(contentsOf: repo.appendingPathComponent("tray/status-icons.png")) else { return }
+        let hash = SHA256.hash(data: source + icon + sheet).map { String(format: "%02x", $0) }.joined()
         if hash == builtHash || hash == skippedUpdate { return }
 
         updating = true
