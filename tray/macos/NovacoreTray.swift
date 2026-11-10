@@ -7,6 +7,9 @@
 // that change something run through `novacore tray run`, detached, and this
 // follows them with `novacore tray poll`.
 //
+// A click opens a panel in the style of Control Center, and a right click or
+// Control-click the same items as a menu.
+//
 // `novacore tray install` compiles this file into ~/Applications/Novacore
 // Tray.app, with the CLI's path and this file's hash in its Info.plist, and
 // starts it from a LaunchAgent. From then on it rebuilds itself when the
@@ -311,11 +314,727 @@ class Form: NSObject, NSTextFieldDelegate {
     }
 }
 
+// MARK: - Panel views
+//
+// What a click on the icon opens: a panel in the style of macOS's Control
+// Center, laid out from the same items as the menu, as the Windows tray icon's
+// panel is (see tray/PROTOCOL.md). The views lay themselves out by hand and
+// draw with the system's colours, so they follow light and dark mode and the
+// accent colour by themselves. Tray.buildPanel fills them in.
+
+let panelWidth: CGFloat = 340
+
+// SF Symbols for the icon names in tray/PROTOCOL.md, and the panel's own.
+let symbolNames: [String: String] = [
+    "dashboard": "house", "site": "globe", "open": "arrow.up.right",
+    "git": "chevron.left.forwardslash.chevron.right", "info": "info.circle", "folder": "folder",
+    "code": "square.and.pencil", "terminal": "terminal", "log": "doc.text", "remove": "trash",
+    "add": "plus", "start": "play.fill", "stop": "stop.fill", "restart": "arrow.clockwise",
+    "bug": "ladybug", "tools": "wrench.and.screwdriver", "database": "cylinder.split.1x2",
+    "output": "terminal", "refresh": "arrow.clockwise", "quit": "power",
+    "error": "exclamationmark.triangle.fill", "right": "chevron.right", "down": "chevron.down",
+    "updown": "chevron.up.chevron.down",
+]
+
+func symbol(_ name: String, _ size: CGFloat = 13, _ weight: NSFont.Weight = .regular) -> NSImage? {
+    guard let s = symbolNames[name] else { return nil }
+    return NSImage(systemSymbolName: s, accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: size, weight: weight))
+}
+
+// Draw IMAGE in COLOR, centred in RECT.
+func drawSymbol(_ image: NSImage?, _ color: NSColor, in rect: NSRect) {
+    guard let image else { return }
+    let size = image.size
+    // The colour for the current appearance, solid, with its alpha applied
+    // when drawing, as filling the symbol with a faint colour would leave it
+    // mostly black. Resolved for plain light or dark, as the panel's vibrant
+    // appearance gives opaque greys that only work with vibrancy's blending.
+    let dark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    var resolved = color
+    NSAppearance(named: dark ? .darkAqua : .aqua)?.performAsCurrentDrawingAppearance {
+        resolved = color.usingColorSpace(.sRGB) ?? color
+    }
+    let solid = resolved.withAlphaComponent(1)
+    let tinted = NSImage(size: size, flipped: false) { r in
+        image.draw(in: r)
+        solid.set()
+        r.fill(using: .sourceAtop)
+        return true
+    }
+    let r = NSRect(x: (rect.midX - size.width / 2).rounded(), y: (rect.midY - size.height / 2).rounded(),
+                   width: size.width, height: size.height)
+    tinted.draw(in: r, from: .zero, operation: .sourceOver, fraction: resolved.alphaComponent,
+                respectFlipped: true, hints: nil)
+}
+
+// Draw one line of TEXT, centred vertically in RECT, cut short to fit.
+func drawText(_ text: String, _ font: NSFont, _ color: NSColor, in rect: NSRect, align: NSTextAlignment = .left) {
+    let style = NSMutableParagraphStyle()
+    style.lineBreakMode = .byTruncatingTail
+    style.alignment = align
+    let s = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color, .paragraphStyle: style])
+    let h = ceil(s.size().height)
+    s.draw(with: NSRect(x: rect.minX, y: rect.midY - h / 2, width: rect.width, height: h),
+           options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+}
+
+func textWidth(_ text: String, _ font: NSFont) -> CGFloat {
+    ceil((text as NSString).size(withAttributes: [.font: font]).width)
+}
+
+func fillRounded(_ rect: NSRect, _ radius: CGFloat, _ color: NSColor) {
+    color.setFill()
+    NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+}
+
+// A faint fill of the text colour: dark on light, light on dark.
+func tint(_ alpha: CGFloat) -> NSColor { NSColor.labelColor.withAlphaComponent(alpha) }
+
+// One or two letters for NAME's avatar: blog -> B, my-site -> MS.
+func initials(_ name: String) -> String {
+    let parts = name.split { "-_. ".contains($0) }
+    guard let first = parts.first?.first else { return "?" }
+    var s = String(first)
+    if parts.count > 1, let second = parts[1].first { s.append(second) }
+    return s.uppercased()
+}
+
+let avatarColors: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemOrange, .systemGreen,
+                               .systemPink, .systemIndigo, .systemRed, .systemBrown]
+
+// A colour for NAME's avatar, the same each time.
+func avatarColor(_ name: String) -> NSColor {
+    var h: Int32 = 0
+    for c in name.utf16 { h = h &* 31 &+ Int32(c) }
+    return avatarColors[Int(h & 0x7FFFFFFF) % avatarColors.count]
+}
+
+func statusColor(_ state: IconState) -> NSColor {
+    switch state {
+    case .running: return .systemGreen
+    case .stopped: return .systemGray
+    case .busy: return .systemOrange
+    case .error: return .systemRed
+    }
+}
+
+// A view whose height depends on its width.
+protocol Sized { func height(for width: CGFloat) -> CGFloat }
+
+class Flipped: NSView {
+    override var isFlipped: Bool { true }
+    // Lay out the subviews for the current size.
+    func place() {}
+}
+
+// Views one above the other, each the full width less its margins.
+class Column: Flipped, Sized {
+    var padding = NSEdgeInsets()
+    private var margins: [ObjectIdentifier: NSEdgeInsets] = [:]
+
+    func add(_ view: NSView, top: CGFloat = 0, side: CGFloat = 0, bottom: CGFloat = 0) {
+        addSubview(view)
+        margins[ObjectIdentifier(view)] = NSEdgeInsets(top: top, left: side, bottom: bottom, right: side)
+    }
+
+    func clear() {
+        subviews.forEach { $0.removeFromSuperview() }
+        margins = [:]
+    }
+
+    // Lay the views out for WIDTH, and return the height they take.
+    @discardableResult func arrange(_ width: CGFloat) -> CGFloat {
+        var y = padding.top
+        for v in subviews where !v.isHidden {
+            let m = margins[ObjectIdentifier(v)] ?? NSEdgeInsets()
+            let w = width - padding.left - padding.right - m.left - m.right
+            let h = (v as? Sized)?.height(for: w) ?? v.fittingSize.height
+            v.frame = NSRect(x: padding.left + m.left, y: y + m.top, width: w, height: h)
+            (v as? Flipped)?.place()
+            y += m.top + h + m.bottom
+        }
+        return y + padding.bottom
+    }
+
+    func height(for width: CGFloat) -> CGFloat { arrange(width) }
+    override func place() { arrange(bounds.width) }
+}
+
+// What an expanded row shows its items in.
+class Card: Column {
+    override func draw(_ dirtyRect: NSRect) { fillRounded(bounds, 10, tint(0.05)) }
+}
+
+// A view that lights up under the mouse and does something when clicked.
+class Control: Flipped {
+    var onClick: (() -> Void)? { didSet { updateHover() } }
+    var isEnabled = true { didSet { alphaValue = isEnabled ? 1 : 0.4; updateHover() } }
+    var radius: CGFloat = 7
+    var hovered = false { didSet { needsDisplay = true } }
+    var pressed = false { didSet { needsDisplay = true } }
+    private var mouseInside = false
+
+    var clickable: Bool { isEnabled && onClick != nil }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self))
+    }
+
+    func updateHover() { hovered = mouseInside && clickable }
+    override func mouseEntered(with event: NSEvent) { mouseInside = true; updateHover() }
+    override func mouseExited(with event: NSEvent) { mouseInside = false; updateHover() }
+
+    func inside(_ event: NSEvent) -> Bool { bounds.contains(convert(event.locationInWindow, from: nil)) }
+
+    override func mouseDown(with event: NSEvent) {
+        guard clickable else { return super.mouseDown(with: event) }
+        pressed = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if clickable { pressed = inside(event) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let fire = pressed && inside(event)
+        pressed = false
+        if fire { onClick?() }
+    }
+
+    // The fill behind it, if any.
+    func background() -> NSColor? {
+        pressed ? tint(0.16) : hovered ? tint(0.09) : nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if let color = background() { fillRounded(bounds, radius, color) }
+    }
+}
+
+// Novacore's icon as it is in the app, without the tile that
+// NSApp.applicationIconImage puts around icons not drawn to the system's shape.
+let rawAppIcon = Bundle.main.url(forResource: "novacore", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
+
+// Novacore's icon and status, at the top. Clicking it opens the dashboard.
+class Header: Control, Sized {
+    var status = ""
+    var color = NSColor.systemGray
+
+    func height(for width: CGFloat) -> CGFloat { 52 }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let icon = NSRect(x: 8, y: ((bounds.height - 34) / 2).rounded(), width: 34, height: 34)
+        if let rawAppIcon {
+            // Its images are inset on the canvas like other app icons (see
+            // tray/build-icons.sh), so draw it larger to make up for that.
+            let grow = icon.width * (1 / 0.8047 - 1) / 2
+            rawAppIcon.draw(in: icon.insetBy(dx: -grow, dy: -grow), from: .zero, operation: .sourceOver, fraction: 1,
+                            respectFlipped: true, hints: nil)
+        } else {
+            NSApp.applicationIconImage.draw(in: icon, from: .zero, operation: .sourceOver, fraction: 1,
+                                            respectFlipped: true, hints: nil)
+        }
+        let x = icon.maxX + 10, w = bounds.width - x - 32
+        drawText("Novacore", .systemFont(ofSize: 13, weight: .semibold), .labelColor,
+                 in: NSRect(x: x, y: bounds.midY - 17, width: w, height: 17))
+        let line = NSRect(x: x, y: bounds.midY + 1, width: w, height: 15)
+        color.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: line.midY - 3.5, width: 7, height: 7)).fill()
+        drawText(status, .systemFont(ofSize: 11), .secondaryLabelColor,
+                 in: NSRect(x: x + 12, y: line.minY, width: w - 12, height: line.height))
+        if hovered {
+            drawSymbol(symbol("open", 11, .semibold), .secondaryLabelColor,
+                       in: NSRect(x: bounds.width - 30, y: 0, width: 22, height: bounds.height))
+        }
+    }
+}
+
+// What's wrong, under the header.
+class Banner: Flipped, Sized {
+    let message: String
+    let font = NSFont.systemFont(ofSize: 11)
+
+    init(_ message: String) {
+        self.message = message
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func height(for width: CGFloat) -> CGFloat {
+        let r = (message as NSString).boundingRect(with: NSSize(width: width - 40, height: 1000),
+                                                   options: .usesLineFragmentOrigin, attributes: [.font: font])
+        return ceil(r.height) + 16
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        fillRounded(bounds, 8, NSColor.systemRed.withAlphaComponent(0.14))
+        drawSymbol(symbol("error", 11), .systemRed, in: NSRect(x: 8, y: 8, width: 20, height: 14))
+        (message as NSString).draw(with: NSRect(x: 32, y: 8, width: bounds.width - 40, height: bounds.height - 16),
+                                   options: .usesLineFragmentOrigin,
+                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    }
+}
+
+// A bar that moves while a command runs.
+class Progress: Flipped, Sized {
+    let bar = NSProgressIndicator()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        bar.style = .bar
+        bar.isIndeterminate = true
+        bar.controlSize = .small
+        addSubview(bar)
+        bar.startAnimation(nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func height(for width: CGFloat) -> CGFloat { 12 }
+    override func place() { bar.frame = bounds }
+}
+
+// The heading of a section.
+class Heading: Flipped, Sized {
+    var label = ""
+    func height(for width: CGFloat) -> CGFloat { 26 }
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawText(label, .systemFont(ofSize: 11, weight: .semibold), .secondaryLabelColor,
+                 in: NSRect(x: 8, y: 9, width: bounds.width - 16, height: 15))
+    }
+}
+
+// A line between sections without a heading.
+class Divider: Flipped, Sized {
+    func height(for width: CGFloat) -> CGFloat { 11 }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: 8, y: 5, width: bounds.width - 16, height: 1).fill()
+    }
+}
+
+// A small button with only a picture, such as a site's Open or Quit.
+class IconButton: Control {
+    var icon = ""
+    var badge: NSColor?   // a dot in the corner
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        drawSymbol(symbol(icon, 13), hovered ? .labelColor : .secondaryLabelColor, in: bounds)
+        if let badge {
+            badge.setFill()
+            NSBezierPath(ovalIn: NSRect(x: bounds.width - 9, y: 3, width: 7, height: 7)).fill()
+        }
+    }
+}
+
+// A row for an item: a picture in a circle, or a site's initials, its label
+// and detail, and for a submenu, a chevron.
+class Row: Control, Sized {
+    var title = ""
+    var detail = ""
+    var strong = false
+    var avatar: String?
+    var avatarColor = NSColor.systemBlue
+    var icon: String?
+    var chevron: String?   // "right", which turns down when expanded, or "updown"
+    var expanded = false { didSet { needsDisplay = true } }
+    weak var card: NSView?
+    var buttons: [IconButton] = [] {
+        didSet {
+            oldValue.forEach { $0.removeFromSuperview() }
+            buttons.forEach(addSubview)
+        }
+    }
+
+    func height(for width: CGFloat) -> CGFloat { detail.isEmpty ? 36 : 46 }
+
+    var trailing: CGFloat { chevron == nil ? bounds.width - 8 : bounds.width - 30 }
+
+    override func place() {
+        var x = trailing
+        for b in buttons.reversed() {
+            x -= 26
+            b.frame = NSRect(x: x, y: ((bounds.height - 26) / 2).rounded(), width: 26, height: 26)
+            x -= 2
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let circle = NSRect(x: 8, y: ((bounds.height - 28) / 2).rounded(), width: 28, height: 28)
+        if let avatar {
+            avatarColor.setFill()
+            NSBezierPath(ovalIn: circle).fill()
+            drawText(avatar, .systemFont(ofSize: 11, weight: .semibold), .white, in: circle, align: .center)
+        } else if let icon {
+            tint(0.08).setFill()
+            NSBezierPath(ovalIn: circle).fill()
+            drawSymbol(symbol(icon, 12), .labelColor, in: circle)
+        }
+        let x = circle.maxX + 10
+        let w = trailing - CGFloat(buttons.count) * 28 - x - 4
+        let font = NSFont.systemFont(ofSize: 13, weight: strong ? .semibold : .regular)
+        if detail.isEmpty {
+            drawText(title, font, .labelColor, in: NSRect(x: x, y: 0, width: w, height: bounds.height))
+        } else {
+            drawText(title, font, .labelColor, in: NSRect(x: x, y: bounds.midY - 16, width: w, height: 16))
+            drawText(detail, .systemFont(ofSize: 11), .secondaryLabelColor,
+                     in: NSRect(x: x, y: bounds.midY, width: w, height: 15))
+        }
+        if let chevron {
+            drawSymbol(symbol(chevron == "right" && expanded ? "down" : chevron, 10, .semibold), .tertiaryLabelColor,
+                       in: NSRect(x: bounds.width - 28, y: 0, width: 20, height: bounds.height))
+        }
+    }
+}
+
+// A button with a picture and a label, such as Stop or a site's Remove.
+class Chip: Control {
+    var title = ""
+    var icon: String?
+    var primary = false     // the one to press, in the accent colour
+    var checked = false
+    var danger = false      // one to think twice about, in red
+    var strong = false
+
+    var font: NSFont { .systemFont(ofSize: 12, weight: strong ? .semibold : .regular) }
+
+    var preferredWidth: CGFloat { textWidth(title, font) + (icon == nil ? 0 : 20) + 24 }
+
+    var filled: Bool { primary || checked }
+
+    override func background() -> NSColor? {
+        if filled {
+            let accent = NSColor.controlAccentColor
+            return pressed ? accent.withSystemEffect(.pressed) : hovered ? accent.withSystemEffect(.rollover) : accent
+        }
+        if danger { return NSColor.systemRed.withAlphaComponent(pressed ? 0.26 : hovered ? 0.19 : 0.12) }
+        return tint(pressed ? 0.18 : hovered ? 0.13 : 0.08)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let text: NSColor = filled ? .white : danger ? .systemRed : .labelColor
+        let iconWidth: CGFloat = icon == nil ? 0 : 20
+        let tw = min(textWidth(title, font), bounds.width - 20 - iconWidth)
+        var x = ((bounds.width - iconWidth - tw) / 2).rounded()
+        if let icon {
+            drawSymbol(symbol(icon, 12), text, in: NSRect(x: x, y: 0, width: 14, height: bounds.height))
+            x += iconWidth
+        }
+        drawText(title, font, text, in: NSRect(x: x, y: 0, width: tw + 1, height: bounds.height))
+    }
+}
+
+// Chips side by side, sharing the width, such as Stop and Restart.
+class Bar: Flipped, Sized {
+    var chips: [Chip] { subviews.compactMap { $0 as? Chip } }
+
+    func height(for width: CGFloat) -> CGFloat { 30 }
+
+    override func place() {
+        let chips = self.chips, gap: CGFloat = 6
+        guard !chips.isEmpty else { return }
+        let w = (bounds.width - gap * CGFloat(chips.count - 1)) / CGFloat(chips.count)
+        for (i, chip) in chips.enumerated() {
+            chip.frame = NSRect(x: (CGFloat(i) * (w + gap)).rounded(), y: 0, width: w.rounded(), height: bounds.height)
+        }
+    }
+}
+
+// A small link to an action: its picture, and its label in the accent
+// colour, underlined under the mouse.
+class Link: Control {
+    var title = ""
+    var icon: String?
+
+    override func background() -> NSColor? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        var x: CGFloat = 0
+        if let icon {
+            drawSymbol(symbol(icon, 11), .secondaryLabelColor, in: NSRect(x: 0, y: 0, width: 16, height: bounds.height))
+            x = 22
+        }
+        let font = NSFont.systemFont(ofSize: 12)
+        let w = min(textWidth(title, font) + 1, bounds.width - x)
+        drawText(title, font, .linkColor, in: NSRect(x: x, y: 0, width: w, height: bounds.height))
+        if hovered || pressed {
+            NSColor.linkColor.setFill()
+            let line = ceil(NSAttributedString(string: title, attributes: [.font: font]).size().height)
+            let baseline = bounds.midY - line / 2 + font.ascender
+            NSRect(x: x, y: (baseline + 1.5).rounded(), width: w - 1, height: 1).fill()
+        }
+    }
+}
+
+// Links two to a line, each group of them starting a new line.
+class Grid: Flipped, Sized {
+    private var groupStarts: Set<ObjectIdentifier> = []
+
+    func add(_ link: Link, startsGroup: Bool) {
+        addSubview(link)
+        if startsGroup { groupStarts.insert(ObjectIdentifier(link)) }
+    }
+
+    @discardableResult func arrange(_ width: CGFloat) -> CGFloat {
+        let height: CGFloat = 24, gap: CGFloat = 8
+        let column = ((width - gap) / 2).rounded(.down)
+        var col = 0, y: CGFloat = 0
+        for (i, link) in subviews.enumerated() {
+            if i > 0 && groupStarts.contains(ObjectIdentifier(link)) {
+                if col != 0 { y += height }
+                col = 0
+            }
+            link.frame = NSRect(x: CGFloat(col) * (column + gap), y: y, width: column, height: height)
+            col += 1
+            if col == 2 {
+                col = 0
+                y += height
+            }
+        }
+        return col == 0 ? y : y + height
+    }
+
+    func height(for width: CGFloat) -> CGFloat { arrange(width) }
+    override func place() { arrange(bounds.width) }
+}
+
+// Chips in lines, wrapping as they need to.
+class Flow: Flipped, Sized {
+    @discardableResult func arrange(_ width: CGFloat) -> CGFloat {
+        var x: CGFloat = 0, y: CGFloat = 0
+        let chips = subviews.compactMap { $0 as? Chip }
+        for chip in chips {
+            let w = min(chip.preferredWidth, width)
+            var gap: CGFloat = x > 0 ? 6 : 0
+            if x > 0 && x + gap + w > width {
+                x = 0
+                y += 34
+                gap = 0
+            }
+            chip.frame = NSRect(x: x + gap, y: y, width: w, height: 28)
+            x += gap + w
+        }
+        return chips.isEmpty ? 0 : y + 28
+    }
+
+    func height(for width: CGFloat) -> CGFloat { arrange(width) }
+    override func place() { arrange(bounds.width) }
+}
+
+// Options to pick one of, such as PHP versions, as a pop-up button.
+class Field: Flipped, Sized {
+    let caption: String
+    let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    init(_ caption: String) {
+        self.caption = caption
+        super.init(frame: .zero)
+        popup.autoenablesItems = false
+        addSubview(popup)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func height(for width: CGFloat) -> CGFloat { 28 }
+
+    override func place() {
+        let size = popup.fittingSize
+        let w = min(max(size.width, 90), bounds.width / 2)
+        popup.frame = NSRect(x: bounds.width - w, y: ((bounds.height - size.height) / 2).rounded(),
+                             width: w, height: size.height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawText(caption, .systemFont(ofSize: 12), .labelColor,
+                 in: NSRect(x: 2, y: 0, width: popup.frame.minX - 10, height: bounds.height))
+    }
+}
+
+// The bottom of the panel: when the status was checked, and the icon's own
+// commands.
+class Footer: Flipped {
+    var note = "" { didSet { if note != oldValue { needsDisplay = true } } }
+    var buttons: [IconButton] = [] {
+        didSet {
+            oldValue.forEach { $0.removeFromSuperview() }
+            buttons.forEach(addSubview)
+            place()
+        }
+    }
+
+    override func place() {
+        var x = bounds.width - 10
+        for b in buttons.reversed() {
+            x -= 28
+            b.frame = NSRect(x: x, y: ((bounds.height - 28) / 2).rounded(), width: 28, height: 28)
+            x -= 2
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        let end = buttons.first?.frame.minX ?? bounds.width - 10
+        drawText(note, .systemFont(ofSize: 11), .secondaryLabelColor,
+                 in: NSRect(x: 16, y: 0, width: end - 24, height: bounds.height))
+    }
+}
+
+// The rim around the panel, as menus have.
+class Border: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 11.5, yRadius: 11.5)
+        tint(0.14).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
+// A mask that rounds a visual effect view's corners.
+func roundedMask(_ radius: CGFloat) -> NSImage {
+    let edge = radius * 2 + 1
+    let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+        NSColor.black.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+        return true
+    }
+    image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+    image.resizingMode = .stretch
+    return image
+}
+
+// The panel itself: a window under the icon, with the header at the top, the
+// items in a list that scrolls, and the footer.
+class Panel: NSPanel {
+    let head = Column()
+    let body = Column()
+    let foot = Footer()
+    let scroll = NSScrollView()
+    var top: CGFloat = 0
+    var onHide: () -> Void = {}
+    var hiddenAt = Date.distantPast
+    private var hiding = false
+
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 300),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        level = .statusBar
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle, .transient]
+
+        let effect = NSVisualEffectView()
+        effect.material = .menu
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.maskImage = roundedMask(12)
+        contentView = effect
+
+        let root = Flipped(frame: effect.bounds)
+        root.autoresizingMask = [.width, .height]
+        effect.addSubview(root)
+        head.padding = NSEdgeInsets(top: 6, left: 6, bottom: 4, right: 6)
+        body.padding = NSEdgeInsets(top: 0, left: 6, bottom: 6, right: 6)
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.documentView = body
+        [head, scroll, foot].forEach(root.addSubview)
+
+        let border = Border(frame: effect.bounds)
+        border.autoresizingMask = [.width, .height]
+        effect.addSubview(border)
+    }
+
+    override var canBecomeKey: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { hide() } else { super.keyDown(with: event) }  // Escape
+    }
+
+    // Clicking another app's window, or switching to it, closes it.
+    override func resignKey() {
+        super.resignKey()
+        hide()
+    }
+
+    func clear() {
+        head.clear()
+        body.clear()
+        foot.buttons = []
+    }
+
+    // Size it to its contents, at most three quarters of the screen high, with
+    // its top where it is.
+    func reflow() {
+        let w = panelWidth
+        let headHeight = head.arrange(w), bodyHeight = body.arrange(w), footHeight: CGFloat = 44
+        let screenHeight = (screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let shown = min(bodyHeight, max(80, screenHeight * 0.75 - headHeight - footHeight))
+        let total = headHeight + shown + footHeight
+        setFrame(NSRect(x: frame.minX, y: top - total, width: w, height: total), display: false)
+        head.frame = NSRect(x: 0, y: 0, width: w, height: headHeight)
+        body.frame = NSRect(x: 0, y: 0, width: w, height: bodyHeight)
+        scroll.frame = NSRect(x: 0, y: headHeight, width: w, height: shown)
+        foot.frame = NSRect(x: 0, y: headHeight + shown, width: w, height: footHeight)
+        foot.place()
+        contentView?.needsDisplay = true
+        invalidateShadow()
+    }
+
+    // Show it under ITEM, the icon's frame on the screen.
+    func show(below item: NSRect, on screen: NSScreen) {
+        let visible = screen.visibleFrame
+        top = min(item.minY, visible.maxY) - 6
+        let x = max(visible.minX + 8, min(item.midX - panelWidth / 2, visible.maxX - panelWidth - 8))
+        setFrameOrigin(NSPoint(x: x, y: top))
+        reflow()
+        body.scroll(.zero)
+        orderFrontRegardless()
+        makeKey()
+    }
+
+    func hide() {
+        guard isVisible, !hiding else { return }
+        hiding = true
+        orderOut(nil)
+        hiding = false
+        hiddenAt = Date()
+        onHide()
+    }
+}
+
 // MARK: - The tray
 
 class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem!
     let menu = NSMenu()
+    var panel: Panel!
+    var panelSignature: String?
+    var expanded = ""              // the title of the panel's expanded row
+    var clickMonitor: Any?         // for clicks outside the panel
+    var checkedAt: Date?           // when novacore last said how it is
+    var unseen = ""                // output you haven't looked at: done or failed
     var icons: [IconState: NSImage] = [:]
     var model: JSON?               // novacore tray menu, parsed
     var modelJSON = ""
@@ -364,7 +1083,16 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.autoenablesItems = false
         menu.delegate = self
-        statusItem.menu = menu
+        // A click opens the panel, and a right click or Control-click the menu.
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            // On mouse up, as the button unhighlights itself when the mouse
+            // comes up, which would hide that the panel is open.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        panel = Panel()
+        panel.onHide = { [weak self] in self?.panelDidHide() }
         // The images draw for the menu bar's appearance, so redraw on a change.
         appearanceObserver = statusItem.button?.observe(\.effectiveAppearance) { button, _ in
             DispatchQueue.main.async { button.needsDisplay = true }
@@ -411,6 +1139,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
                 self.model = obj
                 self.modelJSON = result.out
                 self.problem = ""
+                self.checkedAt = Date()
                 // See if a command from before we started is still running.
                 if !self.checkedAction {
                     self.checkedAction = true
@@ -442,12 +1171,19 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         statusItem.button?.image = icons[iconState]
         statusItem.button?.toolTip = "Novacore\n\(statusText)"
         // Rebuilding the menu closes its open submenus, so only do it on a change.
-        let signature = "\(busy)|\(busyLabel)|\(problem)|\(output.isEmpty)|\(modelJSON)"
+        let signature = "\(busy)|\(busyLabel)|\(problem)|\(output.isEmpty)|\(unseen)|\(modelJSON)"
         if signature != menuSignature {
             menuSignature = signature
             buildMenu()
+            if panel.isVisible { buildPanel() }
         }
+        if panel.isVisible { panel.foot.note = footerNote }
         updateOutputWindow()
+    }
+
+    // Why novacore can't run, or what's wrong with it, if anything.
+    var problemText: String {
+        problem.isEmpty ? (model?["problem"] as? String ?? "") : problem
     }
 
     // MARK: Menu
@@ -457,7 +1193,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         let header = NSMenuItem(title: "Novacore \(middleDot) \(statusText)", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        var detail = problem.isEmpty ? (model?["problem"] as? String ?? "") : problem
+        var detail = problemText
         if !detail.isEmpty {
             if detail.count > 80 { detail = String(detail.prefix(79)) + ellipsis }
             let item = NSMenuItem(title: detail, action: nil, keyEquivalent: "")
@@ -480,14 +1216,11 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
                 menu.addItem(.separator())
                 continue
             }
+            if !isShown(spec) { continue }
             let action = spec["action"] as? JSON
-            if let action, action["editor"] != nil && editor(for: action) == nil { continue }
             let title = spec["label"] as? String ?? ""
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            var enabled = spec["enabled"] as? Bool ?? true
-            if busy && spec["idle"] as? Bool == true { enabled = false }
-            if action?["tray"] as? String == "output" && output.isEmpty { enabled = false }
-            item.isEnabled = enabled
+            item.isEnabled = isEnabled(spec)
             if let action {
                 item.target = self
                 item.action = #selector(menuItemClicked(_:))
@@ -508,13 +1241,50 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         }
     }
 
-    // Opening the menu is a good time to check.
-    func menuWillOpen(_ menu: NSMenu) {
-        menuOpen = true
-        refresh()
+    // Whether to show an item: not one for an editor that isn't installed.
+    func isShown(_ spec: JSON) -> Bool {
+        guard let action = spec["action"] as? JSON, action["editor"] != nil else { return true }
+        return editor(for: action) != nil
     }
 
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+    // Whether an item can be used now.
+    func isEnabled(_ spec: JSON) -> Bool {
+        if spec["enabled"] as? Bool == false { return false }
+        if busy && spec["idle"] as? Bool == true { return false }
+        let action = spec["action"] as? JSON
+        return !(action?["tray"] as? String == "output" && output.isEmpty)
+    }
+
+    // Opening the menu is a good time to check.
+    func menuWillOpen(_ menu: NSMenu) {
+        if menu === self.menu {
+            menuOpen = true
+            refresh()
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        if menu === self.menu { menuOpen = false }
+    }
+
+    @objc func statusItemClicked(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            panel.hide()
+            // Setting the menu just for this click makes the button show it.
+            statusItem.menu = menu
+            sender.performClick(nil)
+            statusItem.menu = nil
+        } else if panel.isVisible {
+            panel.hide()
+        } else if Date().timeIntervalSince(panel.hiddenAt) > 0.4 {
+            // Pressing the icon takes the focus from the panel, which closes
+            // it, so this click was to close it, not to open it again.
+            showPanel()
+        }
+        // Show that the panel is open, as a menu's icon does.
+        sender.highlight(panel.isVisible)
+    }
 
     @objc func menuItemClicked(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? JSON else { return }
@@ -529,6 +1299,9 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
 
     // Carry out an action from the CLI. See "Actions" in tray/PROTOCOL.md.
     func perform(_ action: JSON) {
+        // Most actions take you elsewhere, so the panel closes, but it stays
+        // to show a command's progress.
+        if action["run"] == nil && action["tray"] as? String != "refresh" { panel.hide() }
         let title = action["title"] as? String ?? "Novacore"
         if let url = action["open"] as? String, let u = URL(string: url) {
             NSWorkspace.shared.open(u)
@@ -597,6 +1370,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         busyLabel = label
         actionURL = url
         output = []
+        unseen = ""
         updateView()
         runNovacore(["tray", "run", label, done] + args) { result in
             if result.code == 0 { return }
@@ -632,6 +1406,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
             if !self.busy { return }
             self.busy = false
             self.output = log
+            if self.outputWindow == nil { self.unseen = exit == "0" ? "done" : "failed" }
             if exit == "0" {
                 self.notify("Novacore", done.isEmpty ? "Done: \(label.withoutLabelEllipsis)" : done, url: self.actionURL)
             } else {
@@ -652,7 +1427,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         if let last = lastUpdateCheck, Date().timeIntervalSince(last) < 60 { return }
         // Restarting would close the menu or a window in use, so wait for a
         // quiet moment. A running command is fine: it runs on its own.
-        if menuOpen || NSApp.modalWindow != nil || !infoWindows.isEmpty || outputWindow != nil { return }
+        if menuOpen || panel.isVisible || NSApp.modalWindow != nil || !infoWindows.isEmpty || outputWindow != nil { return }
         lastUpdateCheck = Date()
         // The same files as mac_tray_hash in bin/novacore, in the same order.
         let dir = repo.appendingPathComponent("tray/macos")
@@ -747,6 +1522,10 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
 
     // The output of the last command.
     func showOutput() {
+        if !unseen.isEmpty {
+            unseen = ""
+            updateView()
+        }
         if outputWindow == nil {
             let scroll = NSTextView.scrollableTextView()
             let text = scroll.documentView as! NSTextView
@@ -858,6 +1637,339 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
                     label: fill(action["label"] as? String ?? "Working\(ellipsis)", values),
                     done: fill(action["done"] as? String ?? "", values),
                     url: fill(action["url"] as? String ?? "", values))
+    }
+}
+
+// MARK: - The panel's contents
+//
+// Laid out from the same items as the menu. The status goes at the top, with
+// any problem under it. Each item is a row, and separators with a label start
+// sections. A submenu's row expands into a card of its items as links, with
+// destructive ones, such as Remove, as buttons, and groups of options, such
+// as PHP versions, as a pop-up button; a submenu of
+// only options, such as Xdebug's, opens them as a menu. Commands to run that
+// sit together, such as Stop and Restart, share a row of buttons, and the
+// icon's own commands (Show Output, Refresh, Quit) go along the bottom.
+
+extension Tray {
+    func showPanel() {
+        guard let button = statusItem.button, let window = button.window,
+              let screen = window.screen ?? NSScreen.main else { return }
+        if panelSignature != menuSignature { buildPanel() }
+        panel.foot.note = footerNote
+        panel.show(below: window.convertToScreen(button.convert(button.bounds, to: nil)), on: screen)
+        button.highlight(true)
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) {
+            [weak self] _ in self?.panel.hide()
+        }
+        // Opening it is a good time to check.
+        refresh()
+    }
+
+    func panelDidHide() {
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+        clickMonitor = nil
+        statusItem.button?.highlight(false)
+    }
+
+    // The line at the bottom of the panel: when we last checked.
+    var footerNote: String {
+        guard let checkedAt else { return "Checking\(ellipsis)" }
+        return "Updated \(DateFormatter.localizedString(from: checkedAt, dateStyle: .none, timeStyle: .short))"
+    }
+
+    // The name of an item's icon: its own (see tray/PROTOCOL.md), else one
+    // for what it does.
+    func itemIcon(_ spec: JSON) -> String {
+        if let icon = spec["icon"] as? String { return icon }
+        guard let a = spec["action"] as? JSON else { return "" }
+        if a["open"] != nil { return "site" }
+        if a["folder"] != nil { return "folder" }
+        if a["editor"] != nil { return "code" }
+        if a["terminal"] != nil || a["console"] != nil { return "terminal" }
+        if a["dialog"] as? String == "info" { return "info" }
+        if a["dialog"] as? String == "form" { return a["destructive"] as? Bool == true ? "remove" : "add" }
+        return a["tray"] as? String ?? ""
+    }
+
+    // ITEMS split at their separators: each group's items, with their
+    // positions, and the label of the separator before it.
+    func itemGroups(_ items: [JSON]) -> [(label: String, items: [(Int, JSON)])] {
+        var groups: [(label: String, items: [(Int, JSON)])] = []
+        var group: (label: String, items: [(Int, JSON)]) = ("", [])
+        for (i, spec) in items.enumerated() {
+            if spec["separator"] as? Bool == true {
+                if !group.items.isEmpty { groups.append(group) }
+                group = (spec["label"] as? String ?? "", [])
+            } else if isShown(spec) {
+                group.items.append((i, spec))
+            }
+        }
+        if !group.items.isEmpty { groups.append(group) }
+        return groups
+    }
+
+    // Whether ITEMS are options to pick one of, such as PHP versions: one is
+    // checked, and none has a picture.
+    func isChoices(_ items: [JSON]) -> Bool {
+        let items = items.filter { $0["separator"] as? Bool != true }
+        return items.contains { $0["checked"] as? Bool == true } && !items.contains { !itemIcon($0).isEmpty }
+    }
+
+    // ITEMS as a menu under VIEW.
+    func popUpMenu(_ items: [JSON], under view: NSView) {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        addItems(items, to: menu)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
+    }
+
+    // Lay the panel out afresh from novacore's items.
+    func buildPanel() {
+        panelSignature = menuSignature
+        let scrolled = panel.scroll.contentView.bounds.origin
+        panel.clear()
+
+        let header = Header()
+        header.status = statusText
+        header.color = statusColor(iconState)
+        panel.head.add(header)
+        if !problemText.isEmpty { panel.head.add(Banner(problemText), top: 2, side: 6, bottom: 4) }
+        if busy { panel.head.add(Progress(), top: 2, side: 10, bottom: 4) }
+
+        var specs = model?["items"] as? [JSON]
+            ?? [["label": "Refresh", "action": ["tray": "refresh"]], ["label": "Quit", "action": ["tray": "quit"]]]
+        // The first item, if it's the main one, such as Open Dashboard, is
+        // what clicking the header does.
+        if let first = specs.first, first["bold"] as? Bool == true, first["items"] == nil,
+           let action = first["action"] as? JSON, action["tray"] == nil {
+            header.toolTip = (first["label"] as? String ?? "").withoutLabelEllipsis
+            header.isEnabled = isEnabled(first)
+            header.onClick = { [weak self] in self?.perform(action) }
+            specs.removeFirst()
+        }
+
+        var own: [JSON] = []
+        var bar: Bar?
+        for spec in specs {
+            if spec["separator"] as? Bool == true {
+                bar = nil
+                addSection(spec["label"] as? String ?? "")
+                continue
+            }
+            if !isShown(spec) { continue }
+            let action = spec["action"] as? JSON
+            let isSubmenu = spec["items"] != nil
+            if action?["tray"] != nil && !isSubmenu {
+                own.append(spec)
+            } else if action?["run"] != nil && !isSubmenu {
+                if bar == nil {
+                    bar = Bar()
+                    panel.body.add(bar!, top: 2, side: 8, bottom: 4)
+                }
+                bar?.addSubview(chip(spec))
+            } else {
+                bar = nil
+                addRow(spec)
+            }
+        }
+        // A command that stands alone, such as Start, is the one to press.
+        for case let b as Bar in panel.body.subviews where b.chips.count == 1 { b.chips[0].primary = true }
+        // No section without anything in it.
+        if let last = panel.body.subviews.last, last is Heading || last is Divider { last.removeFromSuperview() }
+
+        panel.foot.buttons = own.map { spec in
+            let button = IconButton()
+            let action = spec["action"] as? JSON ?? [:]
+            button.icon = itemIcon(spec)
+            button.toolTip = (spec["label"] as? String ?? "").withoutLabelEllipsis
+            button.isEnabled = isEnabled(spec)
+            if action["tray"] as? String == "output" && !unseen.isEmpty {
+                // The last command's output, not yet seen: red if it failed.
+                button.badge = unseen == "failed" ? .systemRed : .controlAccentColor
+                button.toolTip! += unseen == "failed" ? " (the last command failed)" : " (new)"
+            }
+            button.onClick = { [weak self] in self?.perform(action) }
+            return button
+        }
+        panel.foot.note = footerNote
+
+        if panel.isVisible {
+            panel.reflow()
+            panel.body.scroll(scrolled)
+        }
+    }
+
+    // Start a section of the panel, called LABEL if it has one.
+    func addSection(_ label: String) {
+        let body = panel.body
+        if let last = body.subviews.last, last is Heading || last is Divider { last.removeFromSuperview() }
+        if !label.isEmpty {
+            let heading = Heading()
+            heading.label = label
+            body.add(heading)
+        } else if !body.subviews.isEmpty {
+            body.add(Divider())
+        }
+    }
+
+    // A button for an item, for an expanded row or a row of buttons.
+    func chip(_ spec: JSON) -> Chip {
+        let chip = Chip()
+        chip.title = spec["label"] as? String ?? ""
+        let icon = itemIcon(spec)
+        if !icon.isEmpty { chip.icon = icon }
+        chip.danger = isDestructive(spec)
+        chip.checked = spec["checked"] as? Bool == true
+        chip.strong = spec["bold"] as? Bool == true
+        chip.isEnabled = isEnabled(spec)
+        if let items = spec["items"] as? [JSON] {
+            chip.onClick = { [weak self, weak chip] in if let chip { self?.popUpMenu(items, under: chip) } }
+        } else if let action = spec["action"] as? JSON {
+            chip.onClick = { [weak self] in self?.perform(action) }
+        }
+        return chip
+    }
+
+    // Add a row for an item, and the card it expands into if it's a submenu.
+    // A submenu's bold item, such as a site's Open, gets a button on the row.
+    func addRow(_ spec: JSON) {
+        let body = panel.body
+        let row = Row()
+        row.title = spec["label"] as? String ?? ""
+        row.detail = spec["detail"] as? String ?? ""
+        row.strong = spec["bold"] as? Bool == true
+        row.isEnabled = isEnabled(spec)
+        let icon = itemIcon(spec)
+        let items = spec["items"] as? [JSON]
+        if icon == "site" && items != nil {
+            row.avatar = initials(row.title)
+            row.avatarColor = avatarColor(row.title)
+        } else if !icon.isEmpty {
+            row.icon = icon
+        }
+        body.add(row)
+
+        guard let items else {
+            if let action = spec["action"] as? JSON { row.onClick = { [weak self] in self?.perform(action) } }
+            return
+        }
+        if isChoices(items) {
+            // Just options, such as Xdebug's modes: pick one from a menu.
+            row.chevron = "updown"
+            row.onClick = { [weak self, weak row] in if let row { self?.popUpMenu(items, under: row) } }
+            return
+        }
+        row.chevron = "right"
+        let main = items.firstIndex {
+            $0["bold"] as? Bool == true && $0["action"] is JSON && isShown($0) && isEnabled($0)
+        }
+        if let main, let action = items[main]["action"] as? JSON {
+            let button = IconButton()
+            button.icon = action["open"] != nil ? "open" : itemIcon(items[main])
+            button.toolTip = (items[main]["label"] as? String ?? "").withoutLabelEllipsis
+            button.onClick = { [weak self] in self?.perform(action) }
+            row.buttons = [button]
+        }
+        let card = makeCard(items, skip: main)
+        body.add(card, top: 2, side: 8, bottom: 6)
+        row.card = card
+        row.expanded = expanded == row.title
+        card.isHidden = !row.expanded
+        row.onClick = { [weak self, weak row] in if let row { self?.toggle(row) } }
+    }
+
+    // Whether an item is one to think twice about, such as Remove.
+    func isDestructive(_ spec: JSON) -> Bool {
+        itemIcon(spec) == "remove" || (spec["action"] as? JSON)?["destructive"] as? Bool == true
+    }
+
+    // A link for an item, for an expanded row.
+    func link(_ spec: JSON) -> Link {
+        let link = Link()
+        link.title = spec["label"] as? String ?? ""
+        let icon = itemIcon(spec)
+        if !icon.isEmpty { link.icon = icon }
+        link.toolTip = link.title.withoutLabelEllipsis
+        link.isEnabled = isEnabled(spec)
+        if let items = spec["items"] as? [JSON] {
+            link.onClick = { [weak self, weak link] in if let link { self?.popUpMenu(items, under: link) } }
+        } else if let action = spec["action"] as? JSON {
+            link.onClick = { [weak self] in self?.perform(action) }
+        }
+        return link
+    }
+
+    // What an expanded row shows: its submenu's items as links, two to a
+    // line, leaving out the one at SKIP, which is on the row already. Groups
+    // of options, such as PHP versions, are a pop-up button instead,
+    // captioned with their separator's label, and destructive items, such as
+    // Remove, are buttons at the bottom.
+    func makeCard(_ items: [JSON], skip: Int?) -> Card {
+        let card = Card()
+        card.padding = NSEdgeInsets(top: 8, left: 10, bottom: 10, right: 10)
+        let groups = itemGroups(items)
+
+        var grid: Grid?
+        var buttons: [JSON] = []
+        for group in groups where !isChoices(group.items.map { $0.1 }) {
+            var first = true
+            for (i, spec) in group.items where i != skip {
+                if isDestructive(spec) {
+                    buttons.append(spec)
+                    continue
+                }
+                let g = grid ?? Grid()
+                if grid == nil {
+                    grid = g
+                    card.add(g)
+                }
+                g.add(link(spec), startsGroup: first)
+                first = false
+            }
+        }
+        for group in groups where isChoices(group.items.map { $0.1 }) {
+            let field = Field(group.label)
+            let popup = field.popup
+            for (_, spec) in group.items {
+                let item = NSMenuItem(title: spec["label"] as? String ?? "", action: nil, keyEquivalent: "")
+                let action = spec["action"] as? JSON
+                item.representedObject = action
+                item.isEnabled = spec["checked"] as? Bool == true || (action != nil && isEnabled(spec))
+                popup.menu?.addItem(item)
+                if spec["checked"] as? Bool == true { popup.select(item) }
+            }
+            popup.isEnabled = group.items.contains { $0.1["action"] != nil && isEnabled($0.1) }
+            popup.target = self
+            popup.action = #selector(choicePicked(_:))
+            card.add(field, top: card.subviews.isEmpty ? 0 : 8)
+        }
+        if !buttons.isEmpty {
+            let flow = Flow()
+            buttons.forEach { flow.addSubview(chip($0)) }
+            card.add(flow, top: card.subviews.isEmpty ? 0 : 10)
+        }
+        return card
+    }
+
+    @objc func choicePicked(_ sender: NSPopUpButton) {
+        if let action = sender.selectedItem?.representedObject as? JSON { perform(action) }
+    }
+
+    // Expand ROW, closing any other, or close it.
+    func toggle(_ row: Row) {
+        let open = !row.expanded
+        for case let other as Row in panel.body.subviews where other.expanded {
+            other.expanded = false
+            other.card?.isHidden = true
+        }
+        if open {
+            row.expanded = true
+            row.card?.isHidden = false
+        }
+        expanded = open ? row.title : ""
+        panel.reflow()
+        if open, let card = row.card { panel.body.scrollToVisible(row.frame.union(card.frame)) }
     }
 }
 

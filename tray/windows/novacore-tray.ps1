@@ -1192,8 +1192,9 @@ function Show-Info($spec) {
 # What a left click opens: a panel in the style of Windows 11's own flyouts,
 # laid out from the same items as the menu. The status goes at the top, with
 # any problem under it. Each item is a row, and separators with a label start
-# sections. A submenu's row expands to show its items as buttons, in groups
-# as its separators split them, with the checked one highlighted. Commands to
+# sections. A submenu's row expands to show its items as links, two to a
+# line, with each group its separators make starting a new line, and
+# destructive ones, such as Remove, as buttons. Commands to
 # run that sit together, such as Stop and Restart, share a row of buttons,
 # and the icon's own commands (Show Output, Refresh, Quit) go at the bottom.
 #
@@ -1250,13 +1251,14 @@ function Invoke-FlyoutAction($a) {
     Invoke-MenuAction $a
 }
 
-# A button for an item, for an expanded row or a row of buttons.
+# A button for an item, for a row of buttons, or a destructive one in an
+# expanded row.
 function New-FlyoutChip($spec) {
     $chip = New-Object Novacore.Ui.Chip
     $chip.Label = [string] $spec.label
     $icon = Get-ItemIcon $spec
     if ($icon) { $chip.Icon = Get-Glyph $icon }
-    if ($icon -eq 'remove') { $chip.IconColor = [Novacore.Ui.Theme]::Danger }
+    $chip.Danger = [bool] (Test-Destructive $spec)
     $chip.Checked = [bool] $spec.checked
     $chip.Strong = [bool] $spec.bold
     $chip.Enabled = Test-ItemEnabled $spec
@@ -1316,40 +1318,56 @@ function Show-ChoiceMenu($control, $specs) {
     $menu.Show($control, (New-Object System.Drawing.Point $control.Width, $control.Height), [System.Windows.Forms.ToolStripDropDownDirection]::BelowLeft)
 }
 
-# What an expanded row shows, in a card: its submenu's items as buttons,
-# leaving out SKIP, which is on the row already. With more than a few, and a
-# picture for each, they're just the pictures, with their labels as
-# tooltips. Groups of options, such as PHP versions, are a box to pick from
-# instead, captioned with their separator's label.
+# Whether an item is one to think twice about, such as Remove.
+function Test-Destructive($spec) {
+    (Get-ItemIcon $spec) -eq 'remove' -or ($spec.action -and $spec.action.destructive)
+}
+
+# A link for an item, for an expanded row.
+function New-FlyoutLink($spec) {
+    $link = New-Object Novacore.Ui.Link
+    $link.Label = [string] $spec.label
+    $icon = Get-ItemIcon $spec
+    if ($icon) { $link.Icon = Get-Glyph $icon }
+    $link.Enabled = Test-ItemEnabled $spec
+    if ($spec.items) {
+        $link.Tag = $spec
+        $link.add_Click({ Invoke-Safely { Show-FlyoutMenu $this } })
+    } elseif ($spec.action) {
+        $link.Tag = $spec.action
+        $link.add_Click($script:onFlyoutClick)
+    }
+    $link
+}
+
+# What an expanded row shows, in a card: its submenu's items as links, two to
+# a line, leaving out SKIP, which is on the row already. Groups of options,
+# such as PHP versions, are a box to pick from instead, captioned with their
+# separator's label, and destructive items, such as Remove, are buttons at the
+# bottom.
 function New-FlyoutCard($specs, $skip) {
     $card = New-Object Novacore.Ui.Stack
     $card.Card = $true
     $card.BackColor = [Novacore.Ui.Theme]::Card
-    $card.Padding = New-Object System.Windows.Forms.Padding (S 10)
+    $card.Padding = New-Object System.Windows.Forms.Padding (S 12), (S 8), (S 12), (S 10)
     $card.Margin = New-Object System.Windows.Forms.Padding (S 8), (S 2), (S 8), (S 6)
 
     $groups = Get-ItemGroups $specs
-    $buttons = @($groups | Where-Object { -not (Test-Choices $_.Items) } | ForEach-Object { $_.Items } | Where-Object { $_ -ne $skip })
-    $iconsOnly = $buttons.Count -gt 4 -and -not @($buttons | Where-Object { -not (Get-ItemIcon $_) }).Count
-
-    $flow = $null
+    $grid = $null
+    $buttons = New-Object System.Collections.ArrayList
     foreach ($group in $groups) {
         if (Test-Choices $group.Items) { continue }
         $first = $true
         foreach ($spec in $group.Items) {
             if ($spec -eq $skip) { continue }
-            if (-not $flow) {
-                $flow = New-Object Novacore.Ui.Flow
-                $card.Controls.Add($flow)
+            if (Test-Destructive $spec) { [void] $buttons.Add($spec); continue }
+            if (-not $grid) {
+                $grid = New-Object Novacore.Ui.Grid
+                $card.Controls.Add($grid)
             }
-            $chip = New-FlyoutChip $spec
-            if ($iconsOnly) {
-                $chip.Tip = $chip.Label.TrimEnd($Ellipsis.ToCharArray())
-                $chip.Label = ''
-            }
-            # A little space between groups.
-            if ($first -and $flow.Controls.Count) { $chip.Margin = New-Object System.Windows.Forms.Padding (S 8), 0, (S 6), (S 6) }
-            $flow.Controls.Add($chip)
+            $link = New-FlyoutLink $spec
+            $grid.Controls.Add($link)
+            if ($first) { [void] $grid.GroupStarts.Add($link) }
             $first = $false
         }
     }
@@ -1360,9 +1378,17 @@ function New-FlyoutCard($specs, $skip) {
         $field.Value = [string] (@($group.Items | Where-Object { $_.checked })[0].label)
         $field.Enabled = @($group.Items | Where-Object { $_.action -and (Test-ItemEnabled $_) }).Count -gt 0
         $field.Tag = $group.Items.ToArray()
-        if ($card.Controls.Count) { $field.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, 0 }
+        if ($card.Controls.Count) { $field.Margin = New-Object System.Windows.Forms.Padding 0, (S 8), 0, 0 }
         $field.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
         $card.Controls.Add($field)
+    }
+    if ($buttons.Count) {
+        $flow = New-Object Novacore.Ui.Flow
+        if ($card.Controls.Count) { $flow.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, 0 }
+        foreach ($spec in $buttons) {
+            $flow.Controls.Add((New-FlyoutChip $spec))
+        }
+        $card.Controls.Add($flow)
     }
     $card
 }

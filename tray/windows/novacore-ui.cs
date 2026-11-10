@@ -24,7 +24,7 @@ public static class Theme {
     public static float Scale = 1f;
     public static Color Back, Footer, Card, Hover, Press, Text, SubText, Disabled, Border, Divider;
     public static Color Accent, OnAccent, ChipFill, ChipHover, ChipBorder, Danger, DangerTint;
-    public static Font Body, Strong, Small, SmallStrong, Title, Icons, IconsSmall, Avatar;
+    public static Font Body, Strong, Small, SmallStrong, Title, Icons, IconsSmall, Avatar, Underlined;
 
     public static int S(double n) { return (int) Math.Round(n * Scale); }
 
@@ -48,6 +48,11 @@ public static class Theme {
     }
 
     static Color Hex(string s) { return ColorTranslator.FromHtml(s); }
+
+    // A colour T of the way from A to B.
+    public static Color Mix(Color a, Color b, double t) {
+        return Color.FromArgb((int) (a.R + (b.R - a.R) * t), (int) (a.G + (b.G - a.G) * t), (int) (a.B + (b.B - a.B) * t));
+    }
 
     static Font MakeFont(float size, FontStyle style, params string[] families) {
         foreach (string name in families) {
@@ -90,6 +95,7 @@ public static class Theme {
         string[] display = { "Segoe UI Variable Display Semibold", "Segoe UI Semibold" };
         string[] icons = { "Segoe Fluent Icons", "Segoe MDL2 Assets" };
         Body = MakeFont(10f, FontStyle.Regular, text);
+        Underlined = new Font(Body, FontStyle.Underline);
         Strong = MakeFont(10f, FontStyle.Regular, semibold);
         Small = MakeFont(8.5f, FontStyle.Regular, text);
         SmallStrong = MakeFont(8.5f, FontStyle.Regular, semibold);
@@ -414,12 +420,13 @@ public class Row : Widget {
     }
 }
 
-// A button with a label, an icon or both, for actions inside an expanded row
-// and side by side in a Bar.
+// A button with a label, an icon or both, for destructive actions inside an
+// expanded row, such as Remove, and side by side in a Bar.
 public class Chip : Widget {
     public string Icon, Label;
-    // Checked shows a tick on the accent colour; Primary just the colour.
-    public bool Checked, Primary, Strong;
+    // Checked shows a tick on the accent colour; Primary just the colour;
+    // Danger is red, for one to think twice about.
+    public bool Checked, Primary, Strong, Danger;
     public Color IconColor = Color.Empty;
     public string Tip;
 
@@ -445,6 +452,10 @@ public class Chip : Widget {
             text = Theme.OnAccent;
             if (hot && Enabled) fill = ControlPaint.Light(fill, 0.1f);
             Theme.FillRound(g, fill, r, radius);
+        } else if (Danger && Enabled) {
+            fill = Theme.Mix(Theme.DangerTint, Theme.Danger, down ? 0.2 : hot ? 0.1 : 0);
+            text = Theme.Danger;
+            Theme.FillRound(g, fill, r, radius);
         } else {
             fill = !Enabled ? Theme.ChipFill : down ? Theme.Press : hot ? Theme.ChipHover : Theme.ChipFill;
             text = Enabled ? Theme.Text : Theme.Disabled;
@@ -460,7 +471,7 @@ public class Chip : Widget {
             x += Theme.S(16) + Theme.S(6);
         }
         if (!string.IsNullOrEmpty(Icon)) {
-            Color ic = Checked || Primary || !Enabled ? text : IconColor != Color.Empty ? IconColor : Strong ? Theme.Accent : text;
+            Color ic = Checked || Primary || Danger || !Enabled ? text : IconColor != Color.Empty ? IconColor : Strong ? Theme.Accent : text;
             Theme.Glyph(g, Icon, Theme.IconsSmall, ic, new Rectangle(x, 0, Theme.S(16), Height));
             x += Theme.S(16) + Theme.S(8);
         }
@@ -513,6 +524,66 @@ public class Flow : FlowLayoutPanel {
         Size s = base.GetPreferredSize(new Size(proposed.Width, 0));
         return new Size(proposed.Width, Math.Max(0, s.Height - Theme.S(6)));
     }
+}
+
+// A small link to an action, inside an expanded row: its icon, and its label
+// in the accent colour, underlined under the mouse.
+public class Link : Widget {
+    public string Icon, Label;
+
+    public Link() { Cursor = Cursors.Hand; }
+
+    int TextLeft { get { return string.IsNullOrEmpty(Icon) ? 0 : Theme.S(16 + 8); } }
+
+    // The label as a tooltip, if it doesn't fit.
+    protected override void OnMouseEnter(EventArgs e) {
+        tips.SetToolTip(this, Theme.Measure(Label, Theme.Body) > Width - TextLeft ? Label : null);
+        base.OnMouseEnter(e);
+    }
+
+    public override Size GetPreferredSize(Size proposed) { return new Size(proposed.Width, Theme.S(28)); }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        if (!string.IsNullOrEmpty(Icon))
+            Theme.Glyph(g, Icon, Theme.IconsSmall, Enabled ? Theme.SubText : Theme.Disabled, new Rectangle(0, 0, Theme.S(16), Height));
+        Theme.Draw(g, Label, hot && Enabled ? Theme.Underlined : Theme.Body, Enabled ? Theme.Accent : Theme.Disabled,
+            new Rectangle(TextLeft, 0, Width - TextLeft, Height),
+            TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+    }
+}
+
+// Links two to a line, each group of them starting a new line.
+public class Grid : Panel {
+    public readonly HashSet<Control> GroupStarts = new HashSet<Control>();
+
+    public Grid() {
+        DoubleBuffered = true;
+        Margin = Padding.Empty;
+        BackColor = Theme.Card;
+    }
+
+    protected override void OnControlRemoved(ControlEventArgs e) { GroupStarts.Remove(e.Control); base.OnControlRemoved(e); }
+
+    // Place the links for WIDTH, or only measure them, and return the height.
+    int Place(int width, bool apply) {
+        int h = Theme.S(28), gap = Theme.S(8), column = (width - gap) / 2, col = 0, y = 0;
+        bool first = true;
+        foreach (Control c in Controls) {
+            if (!first && GroupStarts.Contains(c)) {
+                if (col != 0) y += h;
+                col = 0;
+            }
+            if (apply) c.SetBounds(col * (column + gap), y, column, h);
+            first = false;
+            if (++col == 2) { col = 0; y += h; }
+        }
+        return col == 0 ? y : y + h;
+    }
+
+    public override Size GetPreferredSize(Size proposed) { return new Size(proposed.Width, Place(proposed.Width, false)); }
+
+    protected override void OnLayout(LayoutEventArgs e) { Place(ClientSize.Width, true); }
 }
 
 // Controls side by side, sharing the width: Start, Stop and so on.
