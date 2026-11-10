@@ -258,7 +258,7 @@ The icon checks the status every 30 seconds, but only while your WSL distro is r
 
 ### Adding to the tray icons
 
-All three icons draw the menu that `novacore tray menu` describes in JSON: each item, what it does, and the dialogs to show. To add a menu item or a dialog, you change `tray_menu` in `bin/novacore`, and every icon picks it up. [`tray/PROTOCOL.md`](tray/PROTOCOL.md) describes the JSON. They also share their status icon: `tray/status.svg`, which `tray/build-icons.sh` renders into `tray/status-icons.png` for all three. It also renders the macOS and Windows app icons from `tray/novacore.svg`, which the Linux icon uses as it is. Run it after changing either SVG.
+All three icons draw the menu that `novacore tray menu` describes in JSON: each item, what it does, and the dialogs to show. To add a menu item or a dialog, you change `tray_menu` in `bin/novacore`, and every icon picks it up. [`tray/PROTOCOL.md`](tray/PROTOCOL.md) describes the JSON. They also share their status icon: `tray/status.svg`, which `tray/build-icons.sh` renders into `tray/status-icons.png` for all three. It also renders the Windows app icon from `tray/novacore.svg`, which the Linux icon uses as it is. Run it after changing either SVG. The macOS app's icons are finished files: `tray/macos/Assets.car`, a Liquid Glass icon that follows your choice of light, dark, clear or tinted icons on macOS 26 and later, and `tray/macos/novacore.icns`, the same globe on a dark tile, for earlier versions.
 
 ## How it works
 

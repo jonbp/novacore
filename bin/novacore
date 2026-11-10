@@ -1842,11 +1842,14 @@ MAC_TRAY_APP="$HOME/Applications/Novacore Tray.app"
 MAC_TRAY_AGENT="$HOME/Library/LaunchAgents/$MAC_TRAY_ID.plist"
 MAC_TRAY_LOG="$HOME/Library/Logs/Novacore/tray.log"
 
-# The hash of the menu bar app's source and icons. The app compares it with the
-# one it was built from, to rebuild itself after a git pull.
+# The hash of the menu bar app's source and icons, and Assets.car if there is
+# one. The app compares it with the one it was built from, to rebuild itself
+# after a git pull.
 mac_tray_hash() {
+    local car=()
+    [[ -f $NOVACORE_ROOT/tray/macos/Assets.car ]] && car=("$NOVACORE_ROOT/tray/macos/Assets.car")
     cat "$NOVACORE_ROOT/tray/macos/NovacoreTray.swift" "$NOVACORE_ROOT/tray/macos/novacore.icns" \
-        "$NOVACORE_ROOT/tray/status-icons.png" | shasum -a 256 | cut -d' ' -f1
+        "$NOVACORE_ROOT/tray/status-icons.png" ${car[@]+"${car[@]}"} | shasum -a 256 | cut -d' ' -f1
 }
 
 xml_str() {
@@ -1875,6 +1878,13 @@ macos_tray_install() {
     run xcrun swiftc -O -swift-version 5 -o "$app/Contents/MacOS/NovacoreTray" "$NOVACORE_ROOT/tray/macos/NovacoreTray.swift" ||
         fail "Couldn't build the menu bar icon"
     cp "$NOVACORE_ROOT/tray/macos/novacore.icns" "$NOVACORE_ROOT/tray/status-icons.png" "$app/Contents/Resources/"
+    # macOS 26 and later draw the icon from Assets.car, in the light, dark,
+    # tinted or clear style you've chosen. Earlier ones use the .icns.
+    local icon_name=""
+    if [[ -f $NOVACORE_ROOT/tray/macos/Assets.car ]] && (( $(sw_vers -productVersion | cut -d. -f1) >= 26 )); then
+        cp "$NOVACORE_ROOT/tray/macos/Assets.car" "$app/Contents/Resources/"
+        icon_name="<key>CFBundleIconName</key><string>AppIcon</string>"
+    fi
     cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1885,6 +1895,7 @@ macos_tray_install() {
     <key>CFBundleDisplayName</key><string>Novacore Tray</string>
     <key>CFBundleExecutable</key><string>NovacoreTray</string>
     <key>CFBundleIconFile</key><string>novacore</string>
+    $icon_name
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$(xml_str "$(version)")</string>
     <key>CFBundleVersion</key><string>1</string>

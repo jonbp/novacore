@@ -517,10 +517,6 @@ class Control: Flipped {
     }
 }
 
-// Novacore's icon as it is in the app, without the tile that
-// NSApp.applicationIconImage puts around icons not drawn to the system's shape.
-let rawAppIcon = Bundle.main.url(forResource: "novacore", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
-
 // Novacore's icon and status, at the top. Clicking it opens the dashboard.
 class Header: Control, Sized {
     var status = ""
@@ -531,16 +527,12 @@ class Header: Control, Sized {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let icon = NSRect(x: 8, y: ((bounds.height - 34) / 2).rounded(), width: 34, height: 34)
-        if let rawAppIcon {
-            // Its images are inset on the canvas like other app icons (see
-            // tray/build-icons.sh), so draw it larger to make up for that.
-            let grow = icon.width * (1 / 0.8047 - 1) / 2
-            rawAppIcon.draw(in: icon.insetBy(dx: -grow, dy: -grow), from: .zero, operation: .sourceOver, fraction: 1,
-                            respectFlipped: true, hints: nil)
-        } else {
-            NSApp.applicationIconImage.draw(in: icon, from: .zero, operation: .sourceOver, fraction: 1,
-                                            respectFlipped: true, hints: nil)
-        }
+        // The icon as the system draws it, in the style you've chosen. Like
+        // other app icons, its tile is inset on the canvas, so draw it larger
+        // to make up for that.
+        let grow = icon.width * (1 / 0.8047 - 1) / 2
+        NSApp.applicationIconImage.draw(in: icon.insetBy(dx: -grow, dy: -grow), from: .zero, operation: .sourceOver,
+                                        fraction: 1, respectFlipped: true, hints: nil)
         let x = icon.maxX + 10, w = bounds.width - x - 32
         drawText("Novacore", .systemFont(ofSize: 13, weight: .semibold), .labelColor,
                  in: NSRect(x: x, y: bounds.midY - 17, width: w, height: 17))
@@ -1434,7 +1426,8 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         guard let source = try? Data(contentsOf: dir.appendingPathComponent("NovacoreTray.swift")),
               let icon = try? Data(contentsOf: dir.appendingPathComponent("novacore.icns")),
               let sheet = try? Data(contentsOf: repo.appendingPathComponent("tray/status-icons.png")) else { return }
-        let hash = SHA256.hash(data: source + icon + sheet).map { String(format: "%02x", $0) }.joined()
+        let car = (try? Data(contentsOf: dir.appendingPathComponent("Assets.car"))) ?? Data()
+        let hash = SHA256.hash(data: source + icon + sheet + car).map { String(format: "%02x", $0) }.joined()
         if hash == builtHash || hash == skippedUpdate { return }
 
         updating = true

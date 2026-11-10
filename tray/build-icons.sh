@@ -4,23 +4,24 @@
 #   status status-icons.png, every tray icon's status icon, from status.svg. A
 #          sheet of each status and theme at each size (see below).
 #
-# and their app icons from novacore.svg, Novacore's project icon from
+# and the Windows app icon from novacore.svg, Novacore's project icon from
 # jonbp.github.io/project-icons/novacore.svg without its animation:
 #
 #   ico    tray/windows/novacore.ico, for NovacoreTray.exe, its notifications and
 #          windows. Each size is stored in it as a PNG.
-#   icns   tray/macos/novacore.icns, for Novacore Tray.app. Its images are inset on
-#          the canvas like other macOS app icons, rather than filling it.
+#
+# The macOS app's icons, tray/macos/novacore.icns and Assets.car, are finished
+# files rather than built here.
 #
 # Each size is rendered straight from the SVG by headless Chrome, which
 # antialiases far better than drawing it at runtime. Set CHROME to use a
 # particular one. Run it after changing an SVG, and commit the results. With no
-# arguments it builds all three.
+# arguments it builds both.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 targets=("$@")
-(( ${#targets[@]} )) || targets=(status ico icns)
+(( ${#targets[@]} )) || targets=(status ico)
 
 chrome=${CHROME:-}
 [[ -n $chrome ]] || chrome=$(command -v google-chrome || command -v chromium || command -v chromium-browser ||
@@ -132,18 +133,6 @@ open("windows/novacore.ico", "wb").write(out + b"".join(images))
 EOF
             echo "Wrote tray/windows/novacore.ico"
             ;;
-        icns)
-            command -v iconutil >/dev/null || { echo "Building the .icns needs macOS's iconutil" >&2; exit 1; }
-            set="$tmp/novacore.iconset"
-            mkdir -p "$set"
-            # Apple's app icon grid: an 824px body on a 1024px canvas.
-            for n in 16 32 128 256 512; do
-                render "$n" 0.8047 "$set/icon_${n}x${n}.png"
-                render $(( n * 2 )) 0.8047 "$set/icon_${n}x${n}@2x.png"
-            done
-            iconutil -c icns -o macos/novacore.icns "$set"
-            echo "Wrote tray/macos/novacore.icns"
-            ;;
-        *) echo "Unknown target '$target': use status, ico or icns" >&2; exit 1 ;;
+        *) echo "Unknown target '$target': use status or ico" >&2; exit 1 ;;
     esac
 done
