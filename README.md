@@ -210,27 +210,43 @@ kpackagetool6 -t Plasma/Applet -i plasmoid   # use -u instead of -i to update it
 
 Then add **Novacore** to a panel or the desktop. The widget runs `novacore`, and it also looks in `~/.local/bin`. If the CLI is somewhere else, set the full path in the widget's settings.
 
-## Windows tray icon
+## Tray icons
 
-On Windows, with Novacore in WSL, you can add an icon to the taskbar's notification area. Like the KDE widget, it shows whether Novacore is running and starts, stops or restarts it. It also covers most of the CLI:
+On macOS and on Windows, Novacore can add an icon to the menu bar or the taskbar. Like the KDE widget, it shows whether Novacore is running, and it starts, stops or restarts it. The colour of the small pill on the globe shows the status: green while running, grey when stopped, yellow while busy and red when something's wrong. The icon also covers most of the CLI:
 
 - **Add Site…** asks for a name, PHP version and document root, and whether to create a database.
 - Each site's menu opens the site, its folder, a terminal there, a shell in its PHP container, or its error log. It also switches the site's PHP version, and removes the site, optionally with its database.
 - **Info…** shows a site's paths and database settings, like `novacore site info`, with a button to copy each one.
 - **Xdebug** sets the Xdebug mode, and **Tools** opens a database shell, the container logs or the sites folder.
 
-Terminals open in Windows Terminal if you have it, and VS Code appears in a site's menu if `code` is on your Windows PATH. Run this inside WSL to install the icon:
+VS Code appears in a site's menu if you have it. Run this to install the icon (on Windows, inside WSL):
 
 ```sh
 novacore tray install
 novacore tray uninstall
 ```
 
-It copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. After that it keeps itself up to date: when the script in the repo changes, for example after a `git pull`, the icon copies the new version and restarts. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
+It works out which system you're on. Once installed, the icon keeps itself up to date: when its source in the repo changes, for example after a `git pull`, it rebuilds itself and restarts.
 
-The icon checks the status every 30 seconds, but only while your WSL distro is running, so it doesn't stop WSL from shutting down when it's idle. Opening the menu always checks, and that starts WSL if it isn't running.
+Commands you start from the icon, like a PHP switch that builds a new image, run on their own, so they finish even if you quit or reinstall the icon. A notification tells you when one is done, and clicking a failure's notification shows its output.
 
-Commands you start from the icon, like a PHP switch that builds a new image, run in WSL on their own, so they finish even if you quit or reinstall the icon. A notification tells you when one is done, and clicking a failure's notification shows its output. If the icon itself runs into a problem, it logs it to `%LOCALAPPDATA%\Novacore\tray.log`.
+### macOS
+
+The icon is a small app, `~/Applications/Novacore Tray.app`. `novacore tray install` compiles it from `macos/NovacoreTray.swift`, which needs the Xcode Command Line Tools (`xcode-select --install`). A LaunchAgent starts it when you log in. If you quit it, open **Novacore Tray** from Spotlight to start it again.
+
+The icon runs the CLI with the `PATH` you had when you installed it, so `docker` needs to be on that `PATH`. If you move Docker, run `novacore tray install` again. Terminals open in Terminal.app. The first time it sends a notification, macOS asks whether to allow them. If you don't allow them, a failed command opens its output instead. Problems are logged to `~/Library/Logs/Novacore/tray.log`.
+
+### Windows
+
+With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
+
+Terminals open in Windows Terminal if you have it. VS Code appears if `code` is on your Windows PATH.
+
+The icon checks the status every 30 seconds, but only while your WSL distro is running, so it doesn't stop WSL from shutting down when it's idle. Opening the menu always checks, and that starts WSL if it isn't running. If the icon itself runs into a problem, it logs it to `%LOCALAPPDATA%\Novacore\tray.log`.
+
+### Adding to the tray icons
+
+Both icons draw the menu that `novacore tray menu` describes in JSON: each item, what it does, and the dialogs to show. To add a menu item or a dialog, you change `tray_menu` in `bin/novacore`, and both icons pick it up. [`tray/PROTOCOL.md`](tray/PROTOCOL.md) describes the JSON. `tray/build-icons.sh` renders both icons' app icons from `tray/novacore.svg`.
 
 ## How it works
 
@@ -244,6 +260,8 @@ sites.conf                 your sites (created on first `site add`)
 data/                      generated: vhosts, certificates, dashboard, compose overrides
 logs/                      PHP error log per site
 plasmoid/                  KDE Plasma widget
+tray/                      what the tray icons share: their protocol and icon
+macos/                     macOS menu bar icon
 windows/                   Windows tray icon (for WSL)
 ```
 

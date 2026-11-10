@@ -4,3 +4,6 @@ sites.conf
 sites/
 data/
 logs/
+
+# macOS Finder metadata
+.DS_Store

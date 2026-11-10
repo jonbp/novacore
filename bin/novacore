@@ -196,6 +196,9 @@ check_docker() {
         fi
         fail "Your user can't use Docker" "Run sudo usermod -aG docker $user, then log out and back in"
     fi
+    if [[ $(uname) == Darwin ]]; then
+        fail "Can't reach the Docker daemon" "Is Docker Desktop or OrbStack running?"
+    fi
     fail "Can't reach the Docker daemon" "Is it running? Try sudo systemctl start docker"
 }
 
@@ -1286,6 +1289,380 @@ cmd_trust() {
     echo
 }
 
+# --- Tray icons ---------------------------------------------------------------
+#
+# The macOS menu bar icon (macos/NovacoreTray.swift) and the Windows tray icon
+# (windows/novacore-tray.ps1) share everything but drawing: `tray menu` tells
+# them what to show and what each item does, `tray run` and `tray poll` run a
+# command for them, and `tray submit` turns a dialog's answers into a command.
+# So a new menu item or dialog only needs adding here, in tray_menu. The JSON
+# is described in tray/PROTOCOL.md.
+
+# js STRING — REPLY = STRING as a JSON string. It sets REPLY rather than
+# printing, as the menu builds hundreds of these and subshells are slow.
+js() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    REPLY="\"$s\""
+}
+
+# jlist JSON... — REPLY = a JSON array of values that are JSON already.
+jlist() { local IFS=,; REPLY="[$*]"; }
+
+# jstrs STRING... — REPLY = a JSON array of strings.
+jstrs() {
+    local out=() s
+    for s in "$@"; do js "$s"; out+=("$REPLY"); done
+    jlist ${out[@]+"${out[@]}"}
+}
+
+# mitem LABEL ACTION FLAG... — REPLY = a menu item, with ACTION (JSON, or
+# empty for none). FLAGs are bold, checked, idle (greyed out while a command
+# from the tray runs) and off (greyed out). Empty ones are ignored.
+mitem() {
+    local f out
+    js "$1"; out="{\"label\":$REPLY"
+    [[ -z $2 ]] || out+=",\"action\":$2"
+    shift 2
+    for f in "$@"; do
+        case $f in
+            bold|checked|idle) out+=",\"$f\":true" ;;
+            off)               out+=',"enabled":false' ;;
+        esac
+    done
+    REPLY="$out}"
+}
+
+# msub LABEL ITEM... — REPLY = a submenu of ITEMs.
+msub() {
+    local label=$1
+    shift
+    jlist "$@"
+    local items=$REPLY
+    js "$label"
+    REPLY="{\"label\":$REPLY,\"items\":$items}"
+}
+
+MSEP='{"separator":true}'
+
+# act TYPE VALUE — REPLY = an action with one string, e.g. act open URL. The
+# types are open (a URL), folder, editor (a path) and tray (the tray's own:
+# output, refresh or quit).
+act() { js "$2"; REPLY="{\"$1\":$REPLY}"; }
+
+# act_terminal PATH TITLE — open a terminal in PATH.
+act_terminal() {
+    local path title
+    js "$1"; path=$REPLY
+    js "$2"; title=$REPLY
+    REPLY="{\"terminal\":$path,\"title\":$title}"
+}
+
+# act_console TITLE ARGS... — run novacore ARGS in a terminal.
+act_console() {
+    local title
+    js "$1"; title=$REPLY
+    shift
+    jstrs "$@"
+    REPLY="{\"console\":$REPLY,\"title\":$title}"
+}
+
+# act_run LABEL DONE URL ARGS... — run novacore ARGS through `tray run`,
+# showing LABEL meanwhile and DONE after. URL, if set, opens when the
+# notification is clicked.
+act_run() {
+    local label done url=""
+    js "$1"; label=$REPLY
+    js "$2"; done=$REPLY
+    if [[ -n $3 ]]; then js "$3"; url=",\"url\":$REPLY"; fi
+    shift 3
+    jstrs "$@"
+    REPLY="{\"run\":$REPLY,\"label\":$label,\"done\":$done$url}"
+}
+
+# A site's details for its Info dialog, like `novacore site info`.
+info_dialog() {
+    local name=$1 url path root db_host sections=() rows=() row
+    url="https://$(domain "$name")"
+    path="$SITES_PATH/$name"
+    root=$(site_root "$name")
+    [[ $root == . ]] && root=$path || root="$path/$root"
+    db_host=$(host_db_host)
+
+    # section HEADING LABEL VALUE ... — add a section of rows.
+    section() {
+        local heading=$1
+        rows=()
+        shift
+        while (( $# >= 2 )); do jstrs "$1" "$2"; rows+=("$REPLY"); shift 2; done
+        jlist "${rows[@]}"
+        row=$REPLY
+        js "$heading"
+        sections+=("{\"heading\":$REPLY,\"rows\":$row}")
+    }
+    local wsl=()
+    if is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then
+        wsl=("In Windows" "\\\\wsl.localhost\\$WSL_DISTRO_NAME${path//\//\\}")
+    fi
+    section Site URL "$url" PHP "$(site_php "$name")" Folder "$path" ${wsl[@]+"${wsl[@]}"} \
+        "Document root" "$root" "Error log" "$LOGS_DIR/$name.log"
+    section Database Name "$(db_name "$name")" User "$DB_USER" Password "$DB_PASSWORD" \
+        Host "$db_host" "Host in Novacore" mariadb
+    section "DB_HOST that works in Novacore and on your machine" \
+        wp-config.php "define( 'DB_HOST', getenv( 'NOVACORE_DB_HOST' ) ?: '$db_host' );" \
+        Bedrock "Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '$db_host' );" \
+        Laravel "'host' => env( 'NOVACORE_DB_HOST', env( 'DB_HOST', '127.0.0.1' ) ),"
+    unset -f section
+
+    local buttons=()
+    act open "$url"; mitem "Open Site" "$REPLY"; buttons+=("$REPLY")
+    act folder "$path"; mitem "Open Folder" "$REPLY"; buttons+=("$REPLY")
+    jlist "${buttons[@]}"; local b=$REPLY
+    jlist "${sections[@]}"; local s=$REPLY
+    js "$name"
+    REPLY="{\"dialog\":\"info\",\"title\":$REPLY,\"sections\":$s,\"buttons\":$b}"
+}
+
+# The Add Site dialog. RUNNING is 1 if Novacore is running.
+add_site_dialog() {
+    local running=$1 v hints="" names php root db action
+    # The same rules as check_name, and the names that are taken.
+    jstrs default $(site_names)
+    names=$REPLY
+    for v in "${SUPPORTED_PHP[@]}"; do
+        php_built "$v" && continue
+        js "PHP $v needs building first, which takes a few minutes."
+        hints+="${hints:+,}\"$v\":$REPLY"
+    done
+    jstrs "${SUPPORTED_PHP[@]}"
+    php="{\"id\":\"php\",\"type\":\"choice\",\"label\":\"PHP\",\"options\":$REPLY,\"value\":\"$DEFAULT_PHP\",\"hints\":{$hints}}"
+    root='{"id":"root","type":"combo","label":"Document root","options":["Auto-detect","public","web","public_html","htdocs"],"value":"Auto-detect","note":"Auto-detect looks for public, web, public_html or htdocs."}'
+    if (( running )); then
+        db='{"id":"db","type":"check","label":"Create a database","value":true}'
+    else
+        db='{"id":"db","type":"check","label":"Create a database (start Novacore first)","value":false,"enabled":false}'
+    fi
+    act_run "Adding {name}…" "{name} is ready at https://{name}.$NOVACORE_TLD" "https://{name}.$NOVACORE_TLD" tray submit add-site
+    action=$REPLY
+    REPLY='{"dialog":"form","title":"Add Site","submit":"Add","fields":[
+{"id":"name","type":"text","label":"Name","lowercase":true,"hint":"https://{value}.'"$NOVACORE_TLD"'","rules":[
+{"match":"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$","error":"Use letters, numbers and hyphens, not at the start or end."},
+{"notIn":'"$names"',"error":"There'"'"'s already a site called {value}, or it'"'"'s reserved."}]},
+'"$php,$root,$db"'],"action":'"$action"'}'
+}
+
+# The Remove dialog for site NAME. RUNNING is 1 if Novacore is running.
+remove_site_dialog() {
+    local name=$1 running=$2 path=$SITES_PATH/$1 heading message title db action
+    js "Remove $name"; title=$REPLY
+    js "Stop serving https://$(domain "$name")?"; heading=$REPLY
+    js "Its files stay in $path."; message=$REPLY
+    if (( running )); then
+        js "Also delete its database, $(db_name "$name")"
+        db="{\"id\":\"drop-db\",\"type\":\"check\",\"label\":$REPLY,\"value\":false}"
+    else
+        js "Also delete its database, $(db_name "$name") (start Novacore first)"
+        db="{\"id\":\"drop-db\",\"type\":\"check\",\"label\":$REPLY,\"value\":false,\"enabled\":false}"
+    fi
+    act_run "Removing ${name}…" "Removed $name. Its files are still in $path" "" tray submit remove-site "site=$name"
+    action=$REPLY
+    REPLY="{\"dialog\":\"form\",\"title\":$title,\"heading\":$heading,\"message\":$message,\"submit\":\"Remove\",\"destructive\":true,\"fields\":[$db],\"action\":$action}"
+}
+
+# php_built X.Y — whether PHP X.Y's image exists. Needs BUILT_PHP set.
+php_built() { [[ " $BUILT_PHP " == *" $1 "* ]]; }
+
+# tray menu — the tray icon's menu as JSON (see tray/PROTOCOL.md).
+tray_menu() {
+    shopt -u patsub_replacement 2>/dev/null || true
+    local problem hint running=0 items=() sub=() name url path php v label flag
+    local state status
+
+    # The menu still works when Docker doesn't, so say why rather than fail.
+    if ! problem=$( (check_docker) 2>&1 >/dev/null ); then
+        hint=$(printf '%s\n' "$problem" | sed -n 's/^  Hint: //p' | head -n 1)
+        problem=$(printf '%s\n' "$problem" | sed -n 's/^✖ //p' | head -n 1)
+        [[ -z $hint ]] || problem+=". $hint"
+        act open https://localhost; mitem "Open Dashboard" "$REPLY" bold off; items+=("$REPLY" "$MSEP")
+        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
+        act tray output; mitem "Show Output…" "$REPLY"; items+=("$REPLY")
+        act tray refresh; mitem Refresh "$REPLY" idle; items+=("$REPLY" "$MSEP")
+        act tray quit; mitem Quit "$REPLY"; items+=("$REPLY")
+        jlist "${items[@]}"; local list=$REPLY
+        js "$problem"
+        printf '{"version":1,"state":"error","status":"Can'"'"'t reach Docker","problem":%s,"items":%s}\n' "$REPLY" "$list"
+        return
+    fi
+    load_env >/dev/null
+    is_running && running=1
+    BUILT_PHP=$(docker image ls novacore/php --format '{{.Tag}}' | tr '\n' ' ')
+
+    act open https://localhost
+    if (( running )); then mitem "Open Dashboard" "$REPLY" bold; else mitem "Open Dashboard" "$REPLY" bold off; fi
+    items+=("$REPLY" "$MSEP")
+
+    local n=0
+    for name in $(site_names); do
+        n=$(( n + 1 ))
+        url="https://$(domain "$name")"
+        path="$SITES_PATH/$name"
+        php=$(site_php "$name")
+        sub=()
+        act open "$url"; mitem "Open ${url#https://}" "$REPLY" bold; sub+=("$REPLY")
+        info_dialog "$name"; mitem "Info…" "$REPLY"; sub+=("$REPLY" "$MSEP")
+        act folder "$path"; mitem "Open Folder" "$REPLY"; sub+=("$REPLY")
+        act editor "$path"; mitem "Open in VS Code" "$REPLY"; sub+=("$REPLY")
+        act_terminal "$path" "$name"; mitem "Open Terminal" "$REPLY"; sub+=("$REPLY")
+        flag=""; (( running )) || flag=off
+        act_console "$name · PHP shell" shell "$name"; mitem "PHP Shell" "$REPLY" "$flag"; sub+=("$REPLY")
+        act_console "$name · error log" errors "$name"; mitem "Follow Error Log" "$REPLY"; sub+=("$REPLY" "$MSEP")
+        for v in "${SUPPORTED_PHP[@]}"; do
+            if [[ $v == "$php" ]]; then
+                mitem "PHP $v" "" checked idle
+            else
+                if php_built "$v"; then label="Switching $name to PHP ${v}…"; else label="Building PHP ${v}…"; fi
+                act_run "$label" "$name now uses PHP $v" "" php "$name" "$v"
+                mitem "PHP $v" "$REPLY" idle
+            fi
+            sub+=("$REPLY")
+        done
+        sub+=("$MSEP")
+        remove_site_dialog "$name" "$running"; mitem "Remove…" "$REPLY" idle; sub+=("$REPLY")
+        msub "$name" "${sub[@]}"
+        items+=("$REPLY")
+    done
+    if (( n == 0 )); then mitem "No sites yet" "" off; items+=("$REPLY"); fi
+    add_site_dialog "$running"; mitem "Add Site…" "$REPLY" idle; items+=("$REPLY" "$MSEP")
+
+    if (( running )); then
+        act_run "Stopping Novacore…" "Novacore has stopped" "" down; mitem "Stop Novacore" "$REPLY" idle; items+=("$REPLY")
+        act_run "Restarting Novacore…" "Novacore has restarted" "" restart; mitem "Restart Novacore" "$REPLY" idle; items+=("$REPLY")
+    else
+        act_run "Starting Novacore…" "Novacore is running" "" up; mitem "Start Novacore" "$REPLY" idle; items+=("$REPLY")
+    fi
+
+    # novacore xdebug's modes; "on" is develop,debug.
+    sub=()
+    local known=0 mode
+    for mode in off:Off "develop,debug:On (develop, debug)" - debug:"Debug only" develop:"Develop only" \
+        profile:Profile trace:Trace coverage:Coverage; do
+        if [[ $mode == - ]]; then sub+=("$MSEP"); continue; fi
+        label=${mode#*:}
+        mode=${mode%%:*}
+        if [[ $mode == "$XDEBUG_MODE" ]]; then
+            known=1
+            mitem "$label" "" checked idle
+        else
+            act_run "Setting Xdebug to ${label}…" "Xdebug is now $label" "" xdebug "$mode"
+            mitem "$label" "$REPLY" idle
+        fi
+        sub+=("$REPLY")
+    done
+    if (( ! known )); then mitem "$XDEBUG_MODE" "" checked off; sub+=("$MSEP" "$REPLY"); fi
+    msub Xdebug "${sub[@]}"; items+=("$REPLY")
+
+    sub=()
+    flag=""; (( running )) || flag=off
+    act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$flag"; sub+=("$REPLY")
+    act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY"; sub+=("$REPLY")
+    act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub+=("$REPLY")
+    msub Tools "${sub[@]}"; items+=("$REPLY")
+
+    act tray output; mitem "Show Output…" "$REPLY"; items+=("$REPLY")
+    act tray refresh; mitem Refresh "$REPLY" idle; items+=("$REPLY" "$MSEP")
+    act tray quit; mitem Quit "$REPLY"; items+=("$REPLY")
+
+    if (( running )); then
+        state=running
+        status="Running, $(count "$n" site sites)"
+    else
+        state=stopped
+        status=Stopped
+    fi
+    jlist "${items[@]}"
+    printf '{"version":1,"state":"%s","status":"%s","items":%s}\n' "$state" "$status" "$REPLY"
+}
+
+# tray submit FORM FIELD=VALUE... — for the tray icons: run the command a
+# dialog from tray_menu stands for, given its answers.
+tray_submit() {
+    local form=${1:-} kv name="" php="" root="" db=0 drop_db=0 site="" args=()
+    shift || true
+    for kv in "$@"; do
+        case $kv in
+            name=*)    name=${kv#*=} ;;
+            php=*)     php=${kv#*=} ;;
+            root=*)    root=${kv#*=} ;;
+            db=*)      db=${kv#*=} ;;
+            drop-db=*) drop_db=${kv#*=} ;;
+            site=*)    site=${kv#*=} ;;
+            *)         fail "Unknown field '$kv'" ;;
+        esac
+    done
+    case $form in
+        add-site)
+            args=(site add "$name" --php "$php")
+            [[ -z $root || $root == Auto-detect ]] || args+=(--root "$root")
+            [[ $db == 1 ]] || args+=(--no-db)
+            ;;
+        remove-site)
+            args=(site rm "$site")
+            [[ $drop_db != 1 ]] || args+=(--drop-db)
+            ;;
+        *) fail "Unknown form '$form'" ;;
+    esac
+    exec "$NOVACORE_ROOT/bin/novacore" "${args[@]}"
+}
+
+# Where the tray icon's running command keeps its state: $L.log for its output,
+# $L.pid, $L.label and $L.done for the tray's messages, and $L.exit once done.
+tray_state() { echo "${TMPDIR:-/tmp}/novacore-tray-$(id -u)"; }
+
+# tray run LABEL DONE ARGS... — for the tray icons: run novacore ARGS detached,
+# so it finishes even if the tray icon stops or is reinstalled meanwhile.
+tray_run() {
+    (( $# >= 3 )) || fail "Usage: novacore tray run <label> <done> <command...>"
+    local L i
+    L=$(tray_state)
+    if [[ ! -f $L.exit && -f $L.pid ]] && kill -0 "$(cat "$L.pid")" 2>/dev/null; then
+        fail "Another novacore command from the tray icon is still running"
+    fi
+    rm -f "$L.exit" "$L.pid"
+    printf '%s' "$1" > "$L.label"
+    printf '%s' "$2" > "$L.done"
+    shift 2
+    # shellcheck disable=SC2016
+    local script='L=$1; shift; echo $$ > "$L.pid"; "$0" "$@" > "$L.log" 2>&1; echo $? > "$L.exit"'
+    if command -v setsid >/dev/null; then
+        # WSL ends a wsl.exe call's processes when it exits, unless they're in
+        # a session of their own.
+        setsid -f bash -c "$script" "$NOVACORE_ROOT/bin/novacore" "$L" "$@" < /dev/null > /dev/null 2>&1
+    else
+        # macOS has no setsid. The menu bar app's launchd job leaves its
+        # children running when it stops (AbandonProcessGroup), so a
+        # background job is enough.
+        ( bash -c "$script" "$NOVACORE_ROOT/bin/novacore" "$L" "$@" < /dev/null > /dev/null 2>&1 & )
+    fi
+    # Wait for its PID, so a poll straight after this sees it running.
+    for (( i = 0; i < 50; i++ )); do [[ -s $L.pid ]] && return; sleep 0.1; done
+}
+
+# tray poll — for the tray icons: the command's exit code (blank while it
+# runs), "alive" or "dead", its label and done message, then its output.
+tray_poll() {
+    local L p
+    L=$(tray_state)
+    cat "$L.exit" 2>/dev/null || echo
+    p=$(cat "$L.pid" 2>/dev/null) || true
+    # Check the PID isn't empty: kill -0 "" would signal our own process group.
+    if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi
+    cat "$L.label" 2>/dev/null; echo
+    cat "$L.done" 2>/dev/null; echo
+    tail -n 200 "$L.log" 2>/dev/null || true
+}
+
+# --- Windows tray icon ---
+
 # windows_ps — run the PowerShell script on stdin on Windows. Encoding it saves
 # quoting it through WSL's interop, and lets it span lines.
 windows_ps() {
@@ -1315,7 +1692,7 @@ if ($running) {
 # Install the tray icon on Windows: copy the script to %LOCALAPPDATA%\Novacore,
 # start it from a shortcut in the Startup folder, and start it now. Run again
 # to update it after pulling a new version.
-tray_install() {
+windows_tray_install() {
     header "Installing the tray icon"
     heading "Windows tray icon"
     NC_SCRIPT=$(wslpath -w "$NOVACORE_ROOT/windows/novacore-tray.ps1") \
@@ -1343,7 +1720,7 @@ Start-Process -FilePath $lnk
     echo
 }
 
-tray_uninstall() {
+windows_tray_uninstall() {
     header "Removing the tray icon"
     heading "Windows tray icon"
     windows_ps <<<"$TRAY_STOP_PS"'
@@ -1356,57 +1733,145 @@ Remove-Item -LiteralPath "HKCU:\Software\Classes\AppUserModelId\Novacore.Tray" -
     echo
 }
 
-# Where the tray icon's running command keeps its state: $L.log for its output,
-# $L.pid, $L.label and $L.done for the tray's messages, and $L.exit once done.
-tray_state() { echo "${TMPDIR:-/tmp}/novacore-tray-$(id -u)"; }
+# --- macOS menu bar icon ---
 
-# tray run LABEL DONE ARGS... — for the tray icon: run novacore ARGS detached,
-# so it finishes even if the tray icon stops or is reinstalled meanwhile.
-# WSL ends a wsl.exe call's processes when it exits, unless they're in a
-# session of their own, hence setsid -f.
-tray_run() {
-    (( $# >= 3 )) || fail "Usage: novacore tray run <label> <done> <command...>"
-    local L i
-    L=$(tray_state)
-    if [[ ! -f $L.exit && -f $L.pid ]] && kill -0 "$(cat "$L.pid")" 2>/dev/null; then
-        fail "Another novacore command from the tray icon is still running"
-    fi
-    rm -f "$L.exit" "$L.pid"
-    printf '%s' "$1" > "$L.label"
-    printf '%s' "$2" > "$L.done"
-    shift 2
-    # shellcheck disable=SC2016
-    setsid -f bash -c 'L=$1; shift; echo $$ > "$L.pid"; "$0" "$@" > "$L.log" 2>&1; echo $? > "$L.exit"' \
-        "$NOVACORE_ROOT/bin/novacore" "$L" "$@" < /dev/null > /dev/null 2>&1
-    # Wait for its PID, so a poll straight after this sees it running.
-    for (( i = 0; i < 50; i++ )); do [[ -s $L.pid ]] && return; sleep 0.1; done
+MAC_TRAY_ID=io.github.jonbp.novacore.tray
+MAC_TRAY_APP="$HOME/Applications/Novacore Tray.app"
+MAC_TRAY_AGENT="$HOME/Library/LaunchAgents/$MAC_TRAY_ID.plist"
+MAC_TRAY_LOG="$HOME/Library/Logs/Novacore/tray.log"
+
+# The hash of the menu bar app's source and icon. The app compares it with the
+# one it was built from, to rebuild itself after a git pull.
+mac_tray_hash() {
+    cat "$NOVACORE_ROOT/macos/NovacoreTray.swift" "$NOVACORE_ROOT/macos/novacore.icns" | shasum -a 256 | cut -d' ' -f1
 }
 
-# tray poll — for the tray icon: the command's exit code (blank while it
-# runs), "alive" or "dead", its label and done message, then its output.
-tray_poll() {
-    local L p
-    L=$(tray_state)
-    cat "$L.exit" 2>/dev/null || echo
-    p=$(cat "$L.pid" 2>/dev/null) || true
-    # Check the PID isn't empty: kill -0 "" would signal our own process group.
-    if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi
-    cat "$L.label" 2>/dev/null; echo
-    cat "$L.done" 2>/dev/null; echo
-    tail -n 200 "$L.log" 2>/dev/null || true
+xml_str() {
+    shopt -u patsub_replacement 2>/dev/null || true
+    local s=${1//&/&amp;}
+    s=${s//</&lt;}
+    s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+
+# Build the menu bar app into ~/Applications, start it from a LaunchAgent, and
+# start it now. Run again to update it; the app also does that itself when the
+# repo's copy changes.
+macos_tray_install() {
+    header "Installing the menu bar icon"
+    heading "macOS menu bar icon"
+    xcrun --find swiftc >/dev/null 2>&1 ||
+        fail "Building the icon needs the Xcode Command Line Tools" "Run xcode-select --install, then try again"
+    command -v docker >/dev/null || warn "docker isn't on your PATH, so the icon won't find it either"
+
+    local tmp app uid domain i
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+    app="$tmp/Novacore Tray.app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    run xcrun swiftc -O -swift-version 5 -o "$app/Contents/MacOS/NovacoreTray" "$NOVACORE_ROOT/macos/NovacoreTray.swift" ||
+        fail "Couldn't build the menu bar icon"
+    cp "$NOVACORE_ROOT/macos/novacore.icns" "$app/Contents/Resources/"
+    cat > "$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>$MAC_TRAY_ID</string>
+    <key>CFBundleName</key><string>Novacore Tray</string>
+    <key>CFBundleDisplayName</key><string>Novacore Tray</string>
+    <key>CFBundleExecutable</key><string>NovacoreTray</string>
+    <key>CFBundleIconFile</key><string>novacore</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$(xml_str "$(version)")</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NovacoreCommand</key><string>$(xml_str "$NOVACORE_ROOT/bin/novacore")</string>
+    <key>NovacoreSourceHash</key><string>$(mac_tray_hash)</string>
+</dict>
+</plist>
+EOF
+    # Sign it as a whole, so macOS knows it as one app, e.g. for notifications.
+    run codesign --force --sign - "$app" || fail "Couldn't sign the menu bar icon"
+
+    # Stop the running one, then swap in the new one.
+    uid=$(id -u)
+    domain="gui/$uid"
+    launchctl bootout "$domain/$MAC_TRAY_ID" 2>/dev/null || true
+    mkdir -p "$(dirname "$MAC_TRAY_APP")" "$(dirname "$MAC_TRAY_AGENT")" "$(dirname "$MAC_TRAY_LOG")"
+    rm -rf "$MAC_TRAY_APP"
+    mv "$app" "$MAC_TRAY_APP"
+
+    # launchd starts apps with a bare PATH, so give it this one, where docker is.
+    cat > "$MAC_TRAY_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$MAC_TRAY_ID</string>
+    <key>ProgramArguments</key>
+    <array><string>$(xml_str "$MAC_TRAY_APP/Contents/MacOS/NovacoreTray")</string></array>
+    <key>RunAtLoad</key><true/>
+    <!-- Restart it if it crashes, but not after Quit. -->
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <!-- Let commands it started finish when it stops, e.g. to update itself. -->
+    <key>AbandonProcessGroup</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$(xml_str "$PATH")</string>
+        <key>LANG</key><string>$(xml_str "${LANG:-en_US.UTF-8}")</string>
+    </dict>
+    <key>StandardOutPath</key><string>$(xml_str "$MAC_TRAY_LOG")</string>
+    <key>StandardErrorPath</key><string>$(xml_str "$MAC_TRAY_LOG")</string>
+</dict>
+</plist>
+EOF
+    # Straight after a bootout, launchd can still be tearing the old one down.
+    for (( i = 0; i < 20; i++ )); do
+        launchctl bootstrap "$domain" "$MAC_TRAY_AGENT" 2>/dev/null && break
+        sleep 0.5
+    done
+    (( i < 20 )) || fail "Couldn't start the menu bar icon" "Try launchctl bootstrap $domain $MAC_TRAY_AGENT"
+    result "Installed in ~/Applications. It starts when you log in"
+    complete Installed
+    echo
+}
+
+macos_tray_uninstall() {
+    header "Removing the menu bar icon"
+    heading "macOS menu bar icon"
+    launchctl bootout "gui/$(id -u)/$MAC_TRAY_ID" 2>/dev/null || true
+    pkill -x NovacoreTray 2>/dev/null || true
+    rm -rf "$MAC_TRAY_APP" "$MAC_TRAY_AGENT" "$(dirname "$MAC_TRAY_LOG")"
+    defaults delete "$MAC_TRAY_ID" >/dev/null 2>&1 || true
+    result "Removed"
+    complete Removed
+    echo
 }
 
 cmd_tray() {
     case ${1:-} in
-        run)  shift; tray_run "$@"; return ;;
-        poll) tray_poll; return ;;
+        run)    shift; tray_run "$@"; return ;;
+        poll)   tray_poll; return ;;
+        menu)   tray_menu; return ;;
+        submit) shift; tray_submit "$@"; return ;;
     esac
-    is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]] || fail "The tray icon is for Windows, with Novacore in WSL" \
-        "On KDE Plasma, use the widget in plasmoid/ instead"
-    command -v powershell.exe >/dev/null || fail "Can't find powershell.exe" "Is Windows interop turned on in WSL?"
+    local os
+    if [[ $(uname) == Darwin ]]; then
+        os=macos
+    elif is_wsl && [[ -n ${WSL_DISTRO_NAME:-} ]]; then
+        os=windows
+        command -v powershell.exe >/dev/null || fail "Can't find powershell.exe" "Is Windows interop turned on in WSL?"
+    else
+        fail "The tray icon is for macOS, and Windows with Novacore in WSL" \
+            "On KDE Plasma, use the widget in plasmoid/ instead"
+    fi
     case ${1:-install} in
-        install)   tray_install ;;
-        uninstall) tray_uninstall ;;
+        install)   "${os}_tray_install" ;;
+        uninstall) "${os}_tray_uninstall" ;;
         *)         fail "Unknown option '$1'" "Usage: novacore tray [install|uninstall]" ;;
     esac
 }
@@ -1427,7 +1892,7 @@ Stack:
   build [--all]               Rebuild images (--all builds every PHP version)
   prune [--cache]             Remove images of PHP versions no site uses
   trust                       Trust Novacore's local CA (one-off, uses sudo)
-  tray [install|uninstall]    Windows (WSL): add Novacore to the notification area
+  tray [install|uninstall]    macOS or Windows (WSL): add Novacore to the menu bar or taskbar
 
 Sites:
   site add <name> [--php X.Y] [--root DIR] [--no-db]
