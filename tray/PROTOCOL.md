@@ -55,7 +55,7 @@ An action has one of these keys:
 |---|---|
 | `{"open": URL}` | Opens a URL in the browser. |
 | `{"folder": PATH}` | Opens a folder in Finder or Explorer. On Windows, the path in WSL is opened as `\\wsl.localhost\<distro>\…`. |
-| `{"editor": PATH}` | Opens a folder in VS Code. The item is hidden if VS Code isn't installed. On Windows, it opens through VS Code's WSL remote. |
+| `{"editor": PATH, "app": A}` | Opens a folder in an editor: A is `vscode` (the default) or `zed`. The item is hidden if that editor isn't installed. On Windows, it opens through the editor's WSL support. |
 | `{"terminal": PATH, "title": T}` | Opens a terminal in a folder. |
 | `{"console": [ARGS…], "title": T}` | Runs `novacore ARGS…` in a new terminal, for interactive commands such as `shell` or `logs`. |
 | `{"run": [ARGS…], "label": L, "done": D, "url": U}` | Runs `novacore ARGS…` through `tray run`. L shows while it runs, and D is the notification when it's done. Clicking that notification opens U, if it's set. If the command fails, the notification shows its error, and clicking it shows the output. |

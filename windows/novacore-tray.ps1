@@ -776,7 +776,7 @@ function Add-MenuItems($items, $specs) {
     foreach ($spec in $specs) {
         if ($spec.separator) { Add-Separator $items; continue }
         $action = $spec.action
-        if ($action -and $action.editor -and -not $script:code) { continue }
+        if ($action -and $action.editor -and -not (Get-Editor $action)) { continue }
         $enabled = $spec.enabled -ne $false
         if ($script:busy -and $spec.idle) { $enabled = $false }
         if ($action -and $action.tray -eq 'output' -and $script:output.Count -eq 0) { $enabled = $false }
@@ -832,7 +832,10 @@ function Update-View {
 function Invoke-MenuAction($a) {
     if ($a.open) { Start-Process $a.open }
     elseif ($a.folder) { Start-Process explorer.exe "`"$(Get-WindowsPath $a.folder)`"" }
-    elseif ($a.editor) { Start-Process $script:code -ArgumentList "--remote wsl+$Distro `"$($a.editor)`"" -WindowStyle Hidden }
+    elseif ($a.editor) {
+        $editor = Get-Editor $a
+        if ($editor) { Start-Process $editor.Path -ArgumentList ($editor.Args -f (ConvertTo-Arg $Distro), (ConvertTo-Arg $a.editor)) -WindowStyle Hidden }
+    }
     elseif ($a.terminal) { Start-Terminal $a.title @('--cd', $a.terminal) }
     elseif ($a.console) { Start-Terminal $a.title (@('-e', $Command) + @($a.console)) }
     elseif ($a.run) { Start-Action @($a.run) $a.label $a.done -Url ([string] $a.url) }
@@ -925,7 +928,36 @@ function Start-Terminal([string] $Title, [string[]] $Arguments) {
 }
 
 $script:wt = (Get-Command wt.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-$script:code = (Get-Command code.cmd -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+
+# NAME on the PATH, else the first of PATHS that exists, else $null.
+function Find-Program([string] $name, [string[]] $paths) {
+    $found = (Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $found) { $found = $paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1 }
+    $found
+}
+
+# The editors an editor action's app can name: each one's CLI, if it's
+# installed, and its arguments to open a folder in the distro, with {0} for
+# the distro and {1} for the folder.
+$script:editors = @{
+    vscode = @{
+        Path = Find-Program code.cmd @(
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd",
+            "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd")
+        Args = '--remote wsl+{0} {1}'
+    }
+    zed = @{
+        Path = Find-Program zed.exe @("$env:LOCALAPPDATA\Programs\Zed\bin\zed.exe")
+        Args = '--wsl {0} {1}'
+    }
+}
+
+# The editor action A names, or $null if it isn't installed.
+function Get-Editor($a) {
+    $app = if ($a.app) { [string] $a.app } else { 'vscode' }
+    $editor = $script:editors[$app]
+    if ($editor -and $editor.Path) { $editor }
+}
 
 # --- Dialogs ------------------------------------------------------------------
 

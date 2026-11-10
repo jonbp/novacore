@@ -1380,6 +1380,56 @@ act_run() {
     REPLY="{\"run\":$REPLY,\"label\":$label,\"done\":$done$url}"
 }
 
+# act_editor PATH APP — open PATH in an editor: vscode or zed.
+act_editor() {
+    js "$1"
+    REPLY="{\"editor\":$REPLY,\"app\":\"$2\"}"
+}
+
+# repo_web PATH — the web page of the git repo at PATH, from its origin
+# remote (or its first, without one), as "LABEL URL", e.g. "GitHub
+# https://github.com/me/blog". Fails if there's no repo or remote.
+repo_web() {
+    local remotes url host rest label
+    remotes=$(git -C "$1" config --get-regexp '^remote\..*\.url$' 2>/dev/null) || return 1
+    url=$(printf '%s\n' "$remotes" | awk '$1 == "remote.origin.url" { print $2; exit }')
+    [[ -n $url ]] || url=$(printf '%s\n' "$remotes" | awk 'NR == 1 { print $2 }')
+    [[ -n $url ]] || return 1
+
+    # Split into host and path: https://user@host:port/path, ssh://git@host:port/path
+    # or scp-like git@host:path.
+    if [[ $url =~ ^[a-z+]+://([^@/]*@)?([^/:]+)(:[0-9]+)?/(.*)$ ]]; then
+        host=${BASH_REMATCH[2]} rest=${BASH_REMATCH[4]}
+    elif [[ $url =~ ^([^@/]*@)?([^/:]+):(.*)$ ]]; then
+        host=${BASH_REMATCH[2]} rest=${BASH_REMATCH[3]}
+    else
+        return 1  # A local path.
+    fi
+    # An SSH alias, such as github-work for a second account: its real host.
+    if [[ $host != *.* && $url != http* ]] && command -v ssh >/dev/null; then
+        host=$(ssh -G "$host" 2>/dev/null | awk '$1 == "hostname" { print $2; exit }') || return 1
+    fi
+    # Still no dot: an alias we couldn't resolve, so no page to link to.
+    [[ $host == *.* ]] || return 1
+    rest=${rest#/}
+    rest=${rest%/}
+    rest=${rest%.git}
+    case $host in
+        github.com|*.github.com) label=GitHub ;;
+        gitlab.com|gitlab.*)     label=GitLab ;;
+        bitbucket.org)           label=Bitbucket ;;
+        codeberg.org)            label=Codeberg ;;
+        ssh.dev.azure.com|vs-ssh.visualstudio.com|dev.azure.com)
+            # v3/org/project/repo over SSH, org/project/_git/repo over HTTPS.
+            label="Azure DevOps"
+            [[ $rest =~ ^v3/([^/]+)/([^/]+)/([^/]+)$ ]] && rest="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/_git/${BASH_REMATCH[3]}"
+            host=dev.azure.com
+            ;;
+        *) label=$host ;;
+    esac
+    REPLY="$label https://$host/$rest"
+}
+
 # A site's details for its Info dialog, like `novacore site info`.
 info_dialog() {
     local name=$1 url path root db_host sections=() rows=() row
@@ -1509,9 +1559,14 @@ tray_menu() {
         php=$(site_php "$name")
         sub=()
         act open "$url"; mitem "Open ${url#https://}" "$REPLY" bold; sub+=("$REPLY")
+        if repo_web "$path"; then
+            label=${REPLY% *}
+            act open "${REPLY##* }"; mitem "Open on $label" "$REPLY"; sub+=("$REPLY")
+        fi
         info_dialog "$name"; mitem "Info…" "$REPLY"; sub+=("$REPLY" "$MSEP")
         act folder "$path"; mitem "Open Folder" "$REPLY"; sub+=("$REPLY")
-        act editor "$path"; mitem "Open in VS Code" "$REPLY"; sub+=("$REPLY")
+        act_editor "$path" vscode; mitem "Open in VS Code" "$REPLY"; sub+=("$REPLY")
+        act_editor "$path" zed; mitem "Open in Zed" "$REPLY"; sub+=("$REPLY")
         act_terminal "$path" "$name"; mitem "Open Terminal" "$REPLY"; sub+=("$REPLY")
         flag=""; (( running )) || flag=off
         act_console "$name · PHP shell" shell "$name"; mitem "PHP Shell" "$REPLY" "$flag"; sub+=("$REPLY")

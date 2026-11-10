@@ -215,11 +215,11 @@ Then add **Novacore** to a panel or the desktop. The widget runs `novacore`, and
 On macOS and on Windows, Novacore can add an icon to the menu bar or the taskbar. Like the KDE widget, it shows whether Novacore is running, and it starts, stops or restarts it. The colour of the small pill on the globe shows the status: green while running, grey when stopped, yellow while busy and red when something's wrong. The icon also covers most of the CLI:
 
 - **Add Site…** asks for a name, PHP version and document root, and whether to create a database.
-- Each site's menu opens the site, its folder, a terminal there, a shell in its PHP container, or its error log. It also switches the site's PHP version, and removes the site, optionally with its database.
+- Each site's menu opens the site, its repository on GitHub, GitLab and the like (if it has a git remote), its folder, a terminal there, a shell in its PHP container, or its error log. It also switches the site's PHP version, and removes the site, optionally with its database.
 - **Info…** shows a site's paths and database settings, like `novacore site info`, with a button to copy each one.
 - **Xdebug** sets the Xdebug mode, and **Tools** opens a database shell, the container logs or the sites folder.
 
-VS Code appears in a site's menu if you have it. Run this to install the icon (on Windows, inside WSL):
+VS Code and Zed appear in a site's menu if you have them. Run this to install the icon (on Windows, inside WSL):
 
 ```sh
 novacore tray install
@@ -240,7 +240,7 @@ The icon runs the CLI with the `PATH` you had when you installed it, so `docker`
 
 With Novacore in WSL, the icon goes in the taskbar's notification area. `novacore tray install` copies `windows/novacore-tray.ps1` to `%LOCALAPPDATA%\Novacore` and adds a shortcut to your Startup folder, so the icon starts when you sign in to Windows. The script uses only Windows PowerShell, which comes with Windows, and runs the CLI in your distro through `wsl.exe`. On its first run it builds `NovacoreTray.exe`, a small program that runs the script, so Task Manager and notifications show it as Novacore Tray rather than Windows PowerShell. Windows treats that as a new app, so if the icon disappears into the overflow (^), drag it back onto the taskbar.
 
-Terminals open in Windows Terminal if you have it. VS Code appears if `code` is on your Windows PATH.
+Terminals open in Windows Terminal if you have it. VS Code and Zed appear if they're installed on Windows, and open the site through WSL.
 
 The icon checks the status every 30 seconds, but only while your WSL distro is running, so it doesn't stop WSL from shutting down when it's idle. Opening the menu always checks, and that starts WSL if it isn't running. If the icon itself runs into a problem, it logs it to `%LOCALAPPDATA%\Novacore\tray.log`.
 

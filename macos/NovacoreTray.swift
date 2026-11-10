@@ -371,7 +371,11 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
     var outputWindow: NSWindow?
     var outputView: NSTextView?
     var appearanceObserver: NSKeyValueObservation?
-    let editor = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode")
+    // The editors an editor action's app can name, if they're installed.
+    let editors: [String: URL] = [
+        "vscode": "com.microsoft.VSCode",
+        "zed": "dev.zed.Zed",
+    ].compactMapValues { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }
     let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -512,7 +516,7 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
                 continue
             }
             let action = spec["action"] as? JSON
-            if action?["editor"] != nil && editor == nil { continue }
+            if let action, action["editor"] != nil && editor(for: action) == nil { continue }
             let title = spec["label"] as? String ?? ""
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             var enabled = spec["enabled"] as? Bool ?? true
@@ -553,6 +557,11 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
         DispatchQueue.main.async { self.perform(action) }
     }
 
+    // The editor an editor action names, or nil if it isn't installed.
+    func editor(for action: JSON) -> URL? {
+        editors[action["app"] as? String ?? "vscode"]
+    }
+
     // Carry out an action from the CLI. See "Actions" in tray/PROTOCOL.md.
     func perform(_ action: JSON) {
         let title = action["title"] as? String ?? "Novacore"
@@ -560,8 +569,8 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
             NSWorkspace.shared.open(u)
         } else if let path = action["folder"] as? String {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
-        } else if let path = action["editor"] as? String, let editor {
-            NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+        } else if let path = action["editor"] as? String, let app = editor(for: action) {
+            NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
         } else if let path = action["terminal"] as? String, let terminal {
             NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
         } else if let args = action["console"] as? [String] {
