@@ -5,6 +5,8 @@
 [![GitHub Open Issues](https://img.shields.io/github/issues-raw/jonbp/novacore)](https://github.com/jonbp/novacore/issues)
 [![GitHub Open Pull Requests](https://img.shields.io/github/issues-pr-raw/jonbp/novacore)](https://github.com/jonbp/novacore/pulls)
 
+## About
+
 A local LEMP stack in Docker for PHP sites: nginx, PHP-FPM 7.4–8.5 with Xdebug, and MariaDB, driven by a small CLI.
 
 - **No hosts-file edits.** Sites live at `https://<name>.localhost`, which already resolves to 127.0.0.1.
