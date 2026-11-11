@@ -49,6 +49,7 @@ services:
       - ${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./docker/nginx/autoindex.xslt:/etc/nginx/autoindex.xslt:ro,z
       - ./data/nginx/sites:/etc/nginx/sites:ro,z
       - ./data/nginx/www:/etc/novacore/www:ro,z
       - ./data/certs:/etc/novacore/certs:z
