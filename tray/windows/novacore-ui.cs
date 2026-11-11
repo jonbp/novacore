@@ -159,15 +159,6 @@ public static class Theme {
         return Hex(avatarColors[(h & 0x7FFFFFFF) % avatarColors.Length]);
     }
 
-    // One or two letters for NAME's avatar: blog -> B, my-site -> MS.
-    public static string Initials(string name) {
-        string[] parts = (name ?? "").Split(new char[] { '-', '_', '.', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0) return "?";
-        string s = parts[0].Substring(0, 1);
-        if (parts.Length > 1) s += parts[1].Substring(0, 1);
-        return s.ToUpperInvariant();
-    }
-
     public static GraphicsPath Round(Rectangle r, int radius) {
         GraphicsPath path = new GraphicsPath();
         int d = Math.Max(1, Math.Min(radius * 2, Math.Min(r.Width, r.Height)));

@@ -1190,13 +1190,10 @@ function Show-Info($spec) {
 # --- Panel --------------------------------------------------------------------
 #
 # What a left click opens: a panel in the style of Windows 11's own flyouts,
-# laid out from the same items as the menu. The status goes at the top, with
-# any problem under it. Each item is a row, and separators with a label start
-# sections. A submenu's row expands to show its items as links, two to a
-# line, with each group its separators make starting a new line, and
-# destructive ones, such as Remove, as buttons. Commands to
-# run that sit together, such as Stop and Restart, share a row of buttons,
-# and the icon's own commands (Show Output, Refresh, Quit) go at the bottom.
+# drawn from the layout novacore gives with the menu (see "The panel" in
+# tray/PROTOCOL.md), so what goes where is decided there, not here. The
+# status goes at the top, with any problem under it, and the icon's own
+# commands (Show Output, Refresh, Quit) at the bottom.
 #
 # The controls are drawn by novacore-ui.cs, next to this script, which it
 # compiles when it starts.
@@ -1218,20 +1215,9 @@ if ($png) { $script:appImage = New-Object System.Drawing.Bitmap (New-Object Syst
 
 function Get-Glyph([string] $name) { [Novacore.Ui.Theme]::Glyph($name) }
 
-# The name of an item's icon: its own (see tray/PROTOCOL.md), else one for
-# what it does.
+# An item's picture (see tray/PROTOCOL.md), if it has one.
 function Get-ItemIcon($spec) {
-    if ($spec.icon) { return [string] $spec.icon }
-    $a = $spec.action
-    if (-not $a) { return '' }
-    if ($a.open) { return 'site' }
-    if ($a.folder) { return 'folder' }
-    if ($a.editor) { return 'code' }
-    if ($a.terminal -or $a.console) { return 'terminal' }
-    if ($a.dialog -eq 'info') { return 'info' }
-    if ($a.dialog -eq 'form') { if ($a.destructive) { return 'remove' } else { return 'add' } }
-    if ($a.tray) { return [string] $a.tray }
-    ''
+    if ($spec.icon) { Get-Glyph ([string] $spec.icon) } else { '' }
 }
 
 # The line at the bottom of the panel: the distro, and when we last checked.
@@ -1251,14 +1237,14 @@ function Invoke-FlyoutAction($a) {
     Invoke-MenuAction $a
 }
 
-# A button for an item, for a row of buttons, or a destructive one in an
-# expanded row.
+# A button for an item, for a row of buttons or a card.
 function New-FlyoutChip($spec) {
     $chip = New-Object Novacore.Ui.Chip
     $chip.Label = [string] $spec.label
     $icon = Get-ItemIcon $spec
-    if ($icon) { $chip.Icon = Get-Glyph $icon }
-    $chip.Danger = [bool] (Test-Destructive $spec)
+    if ($icon) { $chip.Icon = $icon }
+    $chip.Danger = [bool] $spec.danger
+    $chip.Primary = [bool] $spec.primary
     $chip.Checked = [bool] $spec.checked
     $chip.Strong = [bool] $spec.bold
     $chip.Enabled = Test-ItemEnabled $spec
@@ -1283,31 +1269,6 @@ function Show-FlyoutMenu($chip) {
     $menu.Show($chip, 0, $chip.Height)
 }
 
-# ITEMS split at their separators: each group's items, and the label of the
-# separator before it.
-function Get-ItemGroups($specs) {
-    $groups = New-Object System.Collections.ArrayList
-    $group = @{ Label = ''; Items = New-Object System.Collections.ArrayList }
-    foreach ($spec in $specs) {
-        if ($spec.separator) {
-            if ($group.Items.Count) { [void] $groups.Add($group) }
-            $group = @{ Label = [string] $spec.label; Items = New-Object System.Collections.ArrayList }
-        } elseif (Test-ItemShown $spec) {
-            [void] $group.Items.Add($spec)
-        }
-    }
-    if ($group.Items.Count) { [void] $groups.Add($group) }
-    , $groups
-}
-
-# Whether ITEMS are options to pick one of, such as PHP versions: one is
-# checked, and none has a picture.
-function Test-Choices($specs) {
-    $items = @($specs | Where-Object { -not $_.separator })
-    @($items | Where-Object { $_.checked }).Count -gt 0 -and
-        @($items | Where-Object { Get-ItemIcon $_ }).Count -eq 0
-}
-
 # Options to pick one of, as a menu under CONTROL.
 function Show-ChoiceMenu($control, $specs) {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -1318,17 +1279,12 @@ function Show-ChoiceMenu($control, $specs) {
     $menu.Show($control, (New-Object System.Drawing.Point $control.Width, $control.Height), [System.Windows.Forms.ToolStripDropDownDirection]::BelowLeft)
 }
 
-# Whether an item is one to think twice about, such as Remove.
-function Test-Destructive($spec) {
-    (Get-ItemIcon $spec) -eq 'remove' -or ($spec.action -and $spec.action.destructive)
-}
-
 # A link for an item, for an expanded row.
 function New-FlyoutLink($spec) {
     $link = New-Object Novacore.Ui.Link
     $link.Label = [string] $spec.label
     $icon = Get-ItemIcon $spec
-    if ($icon) { $link.Icon = Get-Glyph $icon }
+    if ($icon) { $link.Icon = $icon }
     $link.Enabled = Test-ItemEnabled $spec
     if ($spec.items) {
         $link.Tag = $spec
@@ -1340,27 +1296,21 @@ function New-FlyoutLink($spec) {
     $link
 }
 
-# What an expanded row shows, in a card: its submenu's items as links, two to
-# a line, leaving out SKIP, which is on the row already. Groups of options,
-# such as PHP versions, are a box to pick from instead, captioned with their
-# separator's label, and destructive items, such as Remove, are buttons at the
-# bottom.
-function New-FlyoutCard($specs, $skip) {
+# What an expanded row shows, in a card: its links, two to a line, each group
+# starting a new one, its options as boxes to pick from, captioned, and its
+# buttons, such as Remove, at the bottom.
+function New-FlyoutCard($content) {
     $card = New-Object Novacore.Ui.Stack
     $card.Card = $true
     $card.BackColor = [Novacore.Ui.Theme]::Card
     $card.Padding = New-Object System.Windows.Forms.Padding (S 12), (S 8), (S 12), (S 10)
     $card.Margin = New-Object System.Windows.Forms.Padding (S 8), (S 2), (S 8), (S 6)
 
-    $groups = Get-ItemGroups $specs
     $grid = $null
-    $buttons = New-Object System.Collections.ArrayList
-    foreach ($group in $groups) {
-        if (Test-Choices $group.Items) { continue }
+    foreach ($group in @($content.links)) {
         $first = $true
-        foreach ($spec in $group.Items) {
-            if ($spec -eq $skip) { continue }
-            if (Test-Destructive $spec) { [void] $buttons.Add($spec); continue }
+        foreach ($spec in @($group)) {
+            if (-not $spec -or -not (Test-ItemShown $spec)) { continue }
             if (-not $grid) {
                 $grid = New-Object Novacore.Ui.Grid
                 $card.Controls.Add($grid)
@@ -1371,17 +1321,19 @@ function New-FlyoutCard($specs, $skip) {
             $first = $false
         }
     }
-    foreach ($group in $groups) {
-        if (-not (Test-Choices $group.Items)) { continue }
+    foreach ($group in @($content.choices)) {
+        if (-not $group) { continue }
+        $items = @($group.items)
         $field = New-Object Novacore.Ui.Field
-        $field.Caption = $group.Label
-        $field.Value = [string] (@($group.Items | Where-Object { $_.checked })[0].label)
-        $field.Enabled = @($group.Items | Where-Object { $_.action -and (Test-ItemEnabled $_) }).Count -gt 0
-        $field.Tag = $group.Items.ToArray()
+        $field.Caption = [string] $group.label
+        $field.Value = [string] (@($items | Where-Object { $_.checked })[0].label)
+        $field.Enabled = @($items | Where-Object { $_.action -and (Test-ItemEnabled $_) }).Count -gt 0
+        $field.Tag = $items
         if ($card.Controls.Count) { $field.Margin = New-Object System.Windows.Forms.Padding 0, (S 8), 0, 0 }
         $field.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
         $card.Controls.Add($field)
     }
+    $buttons = @(@($content.buttons) | Where-Object { $_ -and (Test-ItemShown $_) })
     if ($buttons.Count) {
         $flow = New-Object Novacore.Ui.Flow
         if ($card.Controls.Count) { $flow.Margin = New-Object System.Windows.Forms.Padding 0, (S 10), 0, 0 }
@@ -1393,42 +1345,42 @@ function New-FlyoutCard($specs, $skip) {
     $card
 }
 
-# Add a row for an item to STACK, and the card it expands into if it's a
-# submenu. A submenu's bold item, such as a site's Open, gets a button on the
-# row too.
-function Add-FlyoutRow($stack, $spec) {
+# Add a row to STACK, from a block of the panel: one that does its item, opens
+# a menu, or expands into a card, with a button for the card's main item, such
+# as a site's Open.
+function Add-FlyoutRow($stack, $block) {
+    $spec = $block.row
     $row = New-Object Novacore.Ui.Row
     $row.Title = [string] $spec.label
     $row.Detail = [string] $spec.detail
     $row.Strong = [bool] $spec.bold
     $row.Enabled = Test-ItemEnabled $spec
-    $icon = Get-ItemIcon $spec
-    if ($icon -eq 'site' -and $spec.items) {
-        $row.Avatar = [Novacore.Ui.Theme]::Initials($row.Title)
+    if ($block.avatar) {
+        $row.Avatar = [string] $block.avatar
         $row.AvatarColor = [Novacore.Ui.Theme]::AvatarColor($row.Title)
-    } elseif ($icon) {
-        $row.Icon = Get-Glyph $icon
+    } else {
+        $icon = Get-ItemIcon $spec
+        if ($icon) { $row.Icon = $icon }
     }
     $row.add_ButtonClick({ param($sender, $e) Invoke-Safely { Invoke-FlyoutAction $e.Tag } })
     $stack.Controls.Add($row)
 
-    if ($spec.items) {
+    if ($block.menu) {
         $row.Chevron = $true
-        if (Test-Choices $spec.items) {
-            # Just options, such as Xdebug's modes: pick one from a menu.
-            $row.Tag = @($spec.items)
-            $row.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
-            return
-        }
-        $main = @($spec.items | Where-Object { $_.bold -and $_.action -and (Test-ItemEnabled $_) }) | Select-Object -First 1
-        if ($main) {
+        $row.Tag = @($block.menu)
+        $row.add_Click({ Invoke-Safely { Show-ChoiceMenu $this $this.Tag } })
+    } elseif ($block.card) {
+        $row.Chevron = $true
+        $main = $block.button
+        if ($main -and $main.action -and (Test-ItemShown $main)) {
             $button = New-Object Novacore.Ui.RowButton
-            $button.Glyph = Get-Glyph $(if ($main.action.open) { 'open' } else { Get-ItemIcon $main })
+            $button.Glyph = Get-ItemIcon $main
             $button.Tip = [string] $main.label
+            $button.Enabled = Test-ItemEnabled $main
             $button.Tag = $main.action
             $row.Buttons.Add($button)
         }
-        $card = New-FlyoutCard $spec.items $main
+        $card = New-FlyoutCard $block.card
         $row.Tag = $card
         $stack.Controls.Add($card)
         $row.Expanded = $script:expanded -eq $row.Title
@@ -1461,23 +1413,7 @@ function Switch-FlyoutRow($row) {
     if ($open -and $body.AutoScroll) { $body.ScrollControlIntoView($row.Tag); $body.ScrollControlIntoView($row) }
 }
 
-# Start a section of STACK, called LABEL if it has one.
-function Add-FlyoutSection($stack, [string] $label) {
-    $n = $stack.Controls.Count
-    if ($n -and ($stack.Controls[$n - 1] -is [Novacore.Ui.Heading] -or $stack.Controls[$n - 1] -is [Novacore.Ui.Divider])) {
-        $stack.Controls[$n - 1].Dispose()
-        $n--
-    }
-    if ($label) {
-        $heading = New-Object Novacore.Ui.Heading
-        $heading.Label = $label
-        $stack.Controls.Add($heading)
-    } elseif ($n) {
-        $stack.Controls.Add((New-Object Novacore.Ui.Divider))
-    }
-}
-
-# Lay the panel out afresh from novacore's items.
+# Lay the panel out afresh from novacore's layout.
 function Update-Flyout {
     $f = $script:flyout
     $script:flyoutSignature = $script:menuSignature
@@ -1499,52 +1435,43 @@ function Update-Flyout {
     }
     if ($script:busy) { $f.Head.Controls.Add((New-Object Novacore.Ui.Progress)) }
 
-    $specs = if ($script:model) { $script:model.items } else {
-        @([pscustomobject] @{ label = 'Refresh'; action = [pscustomobject] @{ tray = 'refresh' } },
-          [pscustomobject] @{ label = 'Quit'; action = [pscustomobject] @{ tray = 'quit' } })
+    $layout = if ($script:model -and $script:model.panel) { $script:model.panel } else {
+        [pscustomobject] @{ footer = @(
+            [pscustomobject] @{ label = 'Refresh'; icon = 'refresh'; action = [pscustomobject] @{ tray = 'refresh' } },
+            [pscustomobject] @{ label = 'Quit'; icon = 'quit'; action = [pscustomobject] @{ tray = 'quit' } }) }
     }
-    # The first item, if it's the main one, such as Open Dashboard, is what
-    # clicking the header does.
-    $first = @($specs)[0]
-    if ($first -and $first.bold -and $first.action -and -not $first.items -and -not $first.action.tray) {
-        $header.Tip = ([string] $first.label).TrimEnd($Ellipsis.ToCharArray())
-        $header.Enabled = Test-ItemEnabled $first
-        $header.Tag = $first.action
+    # Clicking the header does the main item, such as Open Dashboard.
+    $main = $layout.header
+    if ($main -and $main.action) {
+        $header.Tip = ([string] $main.label).TrimEnd($Ellipsis.ToCharArray())
+        $header.Enabled = Test-ItemEnabled $main
+        $header.Tag = $main.action
         $header.add_Click($script:onFlyoutClick)
-        $specs = @($specs | Select-Object -Skip 1)
     }
-    $own = New-Object System.Collections.ArrayList
-    $bar = $null
-    foreach ($spec in $specs) {
-        if ($spec.separator) { $bar = $null; Add-FlyoutSection $f.Body ([string] $spec.label); continue }
-        if (-not (Test-ItemShown $spec)) { continue }
-        $a = $spec.action
-        if ($a -and $a.tray -and -not $spec.items) { [void] $own.Add($spec); continue }
-        if ($a -and $a.run -and -not $spec.items) {
-            if (-not $bar) {
-                $bar = New-Object Novacore.Ui.Bar
-                $f.Body.Controls.Add($bar)
+    foreach ($block in @($layout.blocks)) {
+        if (-not $block) { continue }
+        if ($null -ne $block.heading) {
+            $heading = New-Object Novacore.Ui.Heading
+            $heading.Label = [string] $block.heading
+            $f.Body.Controls.Add($heading)
+        } elseif ($block.divider) {
+            $f.Body.Controls.Add((New-Object Novacore.Ui.Divider))
+        } elseif ($block.buttons) {
+            $bar = New-Object Novacore.Ui.Bar
+            foreach ($spec in @($block.buttons)) {
+                if (Test-ItemShown $spec) { $bar.Controls.Add((New-FlyoutChip $spec)) }
             }
-            $bar.Controls.Add((New-FlyoutChip $spec))
-            continue
+            $f.Body.Controls.Add($bar)
+        } elseif ($block.row) {
+            Add-FlyoutRow $f.Body $block
         }
-        $bar = $null
-        Add-FlyoutRow $f.Body $spec
     }
-    # A command that stands alone, such as Start, is the one to press.
-    foreach ($c in @($f.Body.Controls)) {
-        if ($c -is [Novacore.Ui.Bar] -and $c.Controls.Count -eq 1) { $c.Controls[0].Primary = $true }
-    }
-    # No section without anything in it.
-    $n = $f.Body.Controls.Count
-    if ($n -and ($f.Body.Controls[$n - 1] -is [Novacore.Ui.Heading] -or $f.Body.Controls[$n - 1] -is [Novacore.Ui.Divider])) {
-        $f.Body.Controls[$n - 1].Dispose()
-    }
+    $own = @(@($layout.footer) | Where-Object { $_ -and (Test-ItemShown $_) })
 
     $f.Foot.Note = Get-FooterNote
     foreach ($spec in $own) {
         $button = New-Object Novacore.Ui.IconButton
-        $button.Icon = Get-Glyph (Get-ItemIcon $spec)
+        $button.Icon = Get-ItemIcon $spec
         $button.Tip = ([string] $spec.label).TrimEnd($Ellipsis.ToCharArray())
         $button.Enabled = Test-ItemEnabled $spec
         if ($spec.action.tray -eq 'output' -and $script:unseen) {

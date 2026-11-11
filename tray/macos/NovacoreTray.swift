@@ -324,8 +324,8 @@ class Form: NSObject, NSTextFieldDelegate {
 // MARK: - Panel views
 //
 // What a click on the icon opens: a panel in the style of macOS's Control
-// Center, laid out from the same items as the menu, as the Windows tray icon's
-// panel is (see tray/PROTOCOL.md). The views lay themselves out by hand and
+// Center, drawn from the layout novacore gives with the menu, as the Windows
+// tray icon's panel is (see "The panel" in tray/PROTOCOL.md). The views lay themselves out by hand and
 // draw with the system's colours, so they follow light and dark mode and the
 // accent colour by themselves. Tray.buildPanel fills them in.
 
@@ -397,15 +397,6 @@ func fillRounded(_ rect: NSRect, _ radius: CGFloat, _ color: NSColor) {
 
 // A faint fill of the text colour: dark on light, light on dark.
 func tint(_ alpha: CGFloat) -> NSColor { NSColor.labelColor.withAlphaComponent(alpha) }
-
-// One or two letters for NAME's avatar: blog -> B, my-site -> MS.
-func initials(_ name: String) -> String {
-    let parts = name.split { "-_. ".contains($0) }
-    guard let first = parts.first?.first else { return "?" }
-    var s = String(first)
-    if parts.count > 1, let second = parts[1].first { s.append(second) }
-    return s.uppercased()
-}
 
 let avatarColors: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemOrange, .systemGreen,
                                .systemPink, .systemIndigo, .systemRed, .systemBrown]
@@ -1642,14 +1633,10 @@ class Tray: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, U
 
 // MARK: - The panel's contents
 //
-// Laid out from the same items as the menu. The status goes at the top, with
-// any problem under it. Each item is a row, and separators with a label start
-// sections. A submenu's row expands into a card of its items as links, with
-// destructive ones, such as Remove, as buttons, and groups of options, such
-// as PHP versions, as a pop-up button; a submenu of
-// only options, such as Xdebug's, opens them as a menu. Commands to run that
-// sit together, such as Stop and Restart, share a row of buttons, and the
-// icon's own commands (Show Output, Refresh, Quit) go along the bottom.
+// Drawn from the layout novacore gives (see "The panel" in tray/PROTOCOL.md),
+// so what goes where is decided there, not here. The status goes at the top,
+// with any problem under it, and the icon's own commands (Show Output,
+// Refresh, Quit) along the bottom.
 
 extension Tray {
     func showPanel() {
@@ -1678,42 +1665,10 @@ extension Tray {
         return "Updated \(DateFormatter.localizedString(from: checkedAt, dateStyle: .none, timeStyle: .short))"
     }
 
-    // The name of an item's icon: its own (see tray/PROTOCOL.md), else one
-    // for what it does.
-    func itemIcon(_ spec: JSON) -> String {
-        if let icon = spec["icon"] as? String { return icon }
-        guard let a = spec["action"] as? JSON else { return "" }
-        if a["open"] != nil { return "site" }
-        if a["folder"] != nil { return "folder" }
-        if a["editor"] != nil { return "code" }
-        if a["terminal"] != nil || a["console"] != nil { return "terminal" }
-        if a["dialog"] as? String == "info" { return "info" }
-        if a["dialog"] as? String == "form" { return a["destructive"] as? Bool == true ? "remove" : "add" }
-        return a["tray"] as? String ?? ""
-    }
-
-    // ITEMS split at their separators: each group's items, with their
-    // positions, and the label of the separator before it.
-    func itemGroups(_ items: [JSON]) -> [(label: String, items: [(Int, JSON)])] {
-        var groups: [(label: String, items: [(Int, JSON)])] = []
-        var group: (label: String, items: [(Int, JSON)]) = ("", [])
-        for (i, spec) in items.enumerated() {
-            if spec["separator"] as? Bool == true {
-                if !group.items.isEmpty { groups.append(group) }
-                group = (spec["label"] as? String ?? "", [])
-            } else if isShown(spec) {
-                group.items.append((i, spec))
-            }
-        }
-        if !group.items.isEmpty { groups.append(group) }
-        return groups
-    }
-
-    // Whether ITEMS are options to pick one of, such as PHP versions: one is
-    // checked, and none has a picture.
-    func isChoices(_ items: [JSON]) -> Bool {
-        let items = items.filter { $0["separator"] as? Bool != true }
-        return items.contains { $0["checked"] as? Bool == true } && !items.contains { !itemIcon($0).isEmpty }
+    // A spec's picture, as tray/PROTOCOL.md names them, if it has one.
+    func icon(of spec: JSON) -> String? {
+        let icon = spec["icon"] as? String ?? ""
+        return icon.isEmpty ? nil : icon
     }
 
     // ITEMS as a menu under VIEW.
@@ -1724,7 +1679,8 @@ extension Tray {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
     }
 
-    // Lay the panel out afresh from novacore's items.
+    // Lay the panel out afresh from the layout novacore gives (see "The
+    // panel" in tray/PROTOCOL.md). Where everything goes is decided there.
     func buildPanel() {
         panelSignature = menuSignature
         let scrolled = panel.scroll.contentView.bounds.origin
@@ -1737,51 +1693,43 @@ extension Tray {
         if !problemText.isEmpty { panel.head.add(Banner(problemText), top: 2, side: 6, bottom: 4) }
         if busy { panel.head.add(Progress(), top: 2, side: 10, bottom: 4) }
 
-        var specs = model?["items"] as? [JSON]
-            ?? [["label": "Refresh", "action": ["tray": "refresh"]], ["label": "Quit", "action": ["tray": "quit"]]]
-        // The first item, if it's the main one, such as Open Dashboard, is
-        // what clicking the header does.
-        if let first = specs.first, first["bold"] as? Bool == true, first["items"] == nil,
-           let action = first["action"] as? JSON, action["tray"] == nil {
-            header.toolTip = (first["label"] as? String ?? "").withoutLabelEllipsis
-            header.isEnabled = isEnabled(first)
+        let fallback: [JSON] = [
+            ["label": "Refresh", "action": ["tray": "refresh"], "icon": "refresh"],
+            ["label": "Quit", "action": ["tray": "quit"], "icon": "quit"],
+        ]
+        let layout = model?["panel"] as? JSON ?? ["footer": fallback]
+        // Clicking the header does the main item, such as Open Dashboard.
+        if let main = layout["header"] as? JSON, let action = main["action"] as? JSON {
+            header.toolTip = (main["label"] as? String ?? "").withoutLabelEllipsis
+            header.isEnabled = isEnabled(main)
             header.onClick = { [weak self] in self?.perform(action) }
-            specs.removeFirst()
         }
 
-        var own: [JSON] = []
-        var bar: Bar?
-        for spec in specs {
-            if spec["separator"] as? Bool == true {
-                bar = nil
-                addSection(spec["label"] as? String ?? "")
-                continue
-            }
-            if !isShown(spec) { continue }
-            let action = spec["action"] as? JSON
-            let isSubmenu = spec["items"] != nil
-            if action?["tray"] != nil && !isSubmenu {
-                own.append(spec)
-            } else if action?["run"] != nil && !isSubmenu {
-                if bar == nil {
-                    bar = Bar()
-                    panel.body.add(bar!, top: 2, side: 8, bottom: 4)
+        let body = panel.body
+        for block in layout["blocks"] as? [JSON] ?? [] {
+            if let label = block["heading"] as? String {
+                let heading = Heading()
+                heading.label = label
+                body.add(heading)
+            } else if block["divider"] as? Bool == true {
+                body.add(Divider())
+            } else if let specs = block["buttons"] as? [JSON] {
+                let bar = Bar()
+                for spec in specs where isShown(spec) {
+                    let button = chip(spec)
+                    button.primary = spec["primary"] as? Bool == true
+                    bar.addSubview(button)
                 }
-                bar?.addSubview(chip(spec))
-            } else {
-                bar = nil
-                addRow(spec)
+                body.add(bar, top: 2, side: 8, bottom: 4)
+            } else if block["row"] is JSON {
+                addRow(block)
             }
         }
-        // A command that stands alone, such as Start, is the one to press.
-        for case let b as Bar in panel.body.subviews where b.chips.count == 1 { b.chips[0].primary = true }
-        // No section without anything in it.
-        if let last = panel.body.subviews.last, last is Heading || last is Divider { last.removeFromSuperview() }
 
-        panel.foot.buttons = own.map { spec in
+        panel.foot.buttons = (layout["footer"] as? [JSON] ?? []).filter(isShown).map { spec in
             let button = IconButton()
             let action = spec["action"] as? JSON ?? [:]
-            button.icon = itemIcon(spec)
+            button.icon = icon(of: spec) ?? ""
             button.toolTip = (spec["label"] as? String ?? "").withoutLabelEllipsis
             button.isEnabled = isEnabled(spec)
             if action["tray"] as? String == "output" && !unseen.isEmpty {
@@ -1800,26 +1748,12 @@ extension Tray {
         }
     }
 
-    // Start a section of the panel, called LABEL if it has one.
-    func addSection(_ label: String) {
-        let body = panel.body
-        if let last = body.subviews.last, last is Heading || last is Divider { last.removeFromSuperview() }
-        if !label.isEmpty {
-            let heading = Heading()
-            heading.label = label
-            body.add(heading)
-        } else if !body.subviews.isEmpty {
-            body.add(Divider())
-        }
-    }
-
-    // A button for an item, for an expanded row or a row of buttons.
+    // A button for an item, for a row of buttons or a card.
     func chip(_ spec: JSON) -> Chip {
         let chip = Chip()
         chip.title = spec["label"] as? String ?? ""
-        let icon = itemIcon(spec)
-        if !icon.isEmpty { chip.icon = icon }
-        chip.danger = isDestructive(spec)
+        chip.icon = icon(of: spec)
+        chip.danger = spec["danger"] as? Bool == true
         chip.checked = spec["checked"] as? Bool == true
         chip.strong = spec["bold"] as? Bool == true
         chip.isEnabled = isEnabled(spec)
@@ -1831,47 +1765,44 @@ extension Tray {
         return chip
     }
 
-    // Add a row for an item, and the card it expands into if it's a submenu.
-    // A submenu's bold item, such as a site's Open, gets a button on the row.
-    func addRow(_ spec: JSON) {
+    // Add a row, from a block of the panel: one that does its item, opens a
+    // menu, or expands into a card, with a button for the card's main item,
+    // such as a site's Open.
+    func addRow(_ block: JSON) {
         let body = panel.body
+        let spec = block["row"] as? JSON ?? [:]
         let row = Row()
         row.title = spec["label"] as? String ?? ""
         row.detail = spec["detail"] as? String ?? ""
         row.strong = spec["bold"] as? Bool == true
         row.isEnabled = isEnabled(spec)
-        let icon = itemIcon(spec)
-        let items = spec["items"] as? [JSON]
-        if icon == "site" && items != nil {
-            row.avatar = initials(row.title)
+        if let avatar = block["avatar"] as? String {
+            row.avatar = avatar
             row.avatarColor = avatarColor(row.title)
-        } else if !icon.isEmpty {
-            row.icon = icon
+        } else {
+            row.icon = icon(of: spec)
         }
         body.add(row)
 
-        guard let items else {
-            if let action = spec["action"] as? JSON { row.onClick = { [weak self] in self?.perform(action) } }
-            return
-        }
-        if isChoices(items) {
-            // Just options, such as Xdebug's modes: pick one from a menu.
+        if let items = block["menu"] as? [JSON] {
             row.chevron = "updown"
             row.onClick = { [weak self, weak row] in if let row { self?.popUpMenu(items, under: row) } }
             return
         }
-        row.chevron = "right"
-        let main = items.firstIndex {
-            $0["bold"] as? Bool == true && $0["action"] is JSON && isShown($0) && isEnabled($0)
+        guard let content = block["card"] as? JSON else {
+            if let action = spec["action"] as? JSON { row.onClick = { [weak self] in self?.perform(action) } }
+            return
         }
-        if let main, let action = items[main]["action"] as? JSON {
+        row.chevron = "right"
+        if let main = block["button"] as? JSON, isShown(main), let action = main["action"] as? JSON {
             let button = IconButton()
-            button.icon = action["open"] != nil ? "open" : itemIcon(items[main])
-            button.toolTip = (items[main]["label"] as? String ?? "").withoutLabelEllipsis
+            button.icon = icon(of: main) ?? ""
+            button.toolTip = (main["label"] as? String ?? "").withoutLabelEllipsis
+            button.isEnabled = isEnabled(main)
             button.onClick = { [weak self] in self?.perform(action) }
             row.buttons = [button]
         }
-        let card = makeCard(items, skip: main)
+        let card = makeCard(content)
         body.add(card, top: 2, side: 8, bottom: 6)
         row.card = card
         row.expanded = expanded == row.title
@@ -1879,17 +1810,11 @@ extension Tray {
         row.onClick = { [weak self, weak row] in if let row { self?.toggle(row) } }
     }
 
-    // Whether an item is one to think twice about, such as Remove.
-    func isDestructive(_ spec: JSON) -> Bool {
-        itemIcon(spec) == "remove" || (spec["action"] as? JSON)?["destructive"] as? Bool == true
-    }
-
-    // A link for an item, for an expanded row.
+    // A link for an item, for a card.
     func link(_ spec: JSON) -> Link {
         let link = Link()
         link.title = spec["label"] as? String ?? ""
-        let icon = itemIcon(spec)
-        if !icon.isEmpty { link.icon = icon }
+        link.icon = icon(of: spec)
         link.toolTip = link.title.withoutLabelEllipsis
         link.isEnabled = isEnabled(spec)
         if let items = spec["items"] as? [JSON] {
@@ -1900,25 +1825,17 @@ extension Tray {
         return link
     }
 
-    // What an expanded row shows: its submenu's items as links, two to a
-    // line, leaving out the one at SKIP, which is on the row already. Groups
-    // of options, such as PHP versions, are a pop-up button instead,
-    // captioned with their separator's label, and destructive items, such as
-    // Remove, are buttons at the bottom.
-    func makeCard(_ items: [JSON], skip: Int?) -> Card {
+    // What an expanded row shows: its links, two to a line, each group
+    // starting a new one, its options as pop-up buttons, captioned, and its
+    // buttons, such as Remove, at the bottom.
+    func makeCard(_ content: JSON) -> Card {
         let card = Card()
         card.padding = NSEdgeInsets(top: 8, left: 10, bottom: 10, right: 10)
-        let groups = itemGroups(items)
 
         var grid: Grid?
-        var buttons: [JSON] = []
-        for group in groups where !isChoices(group.items.map { $0.1 }) {
+        for group in content["links"] as? [[JSON]] ?? [] {
             var first = true
-            for (i, spec) in group.items where i != skip {
-                if isDestructive(spec) {
-                    buttons.append(spec)
-                    continue
-                }
+            for spec in group where isShown(spec) {
                 let g = grid ?? Grid()
                 if grid == nil {
                     grid = g
@@ -1928,10 +1845,11 @@ extension Tray {
                 first = false
             }
         }
-        for group in groups where isChoices(group.items.map { $0.1 }) {
-            let field = Field(group.label)
+        for group in content["choices"] as? [JSON] ?? [] {
+            let items = group["items"] as? [JSON] ?? []
+            let field = Field(group["label"] as? String ?? "")
             let popup = field.popup
-            for (_, spec) in group.items {
+            for spec in items {
                 let item = NSMenuItem(title: spec["label"] as? String ?? "", action: nil, keyEquivalent: "")
                 let action = spec["action"] as? JSON
                 item.representedObject = action
@@ -1939,11 +1857,12 @@ extension Tray {
                 popup.menu?.addItem(item)
                 if spec["checked"] as? Bool == true { popup.select(item) }
             }
-            popup.isEnabled = group.items.contains { $0.1["action"] != nil && isEnabled($0.1) }
+            popup.isEnabled = items.contains { $0["action"] != nil && isEnabled($0) }
             popup.target = self
             popup.action = #selector(choicePicked(_:))
             card.add(field, top: card.subviews.isEmpty ? 0 : 8)
         }
+        let buttons = (content["buttons"] as? [JSON] ?? []).filter(isShown)
         if !buttons.isEmpty {
             let flow = Flow()
             buttons.forEach { flow.addSubview(chip($0)) }

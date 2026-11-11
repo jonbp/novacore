@@ -5,16 +5,12 @@ import org.kde.plasma.components as PlasmaComponents3
 import org.kde.plasma.extras as PlasmaExtras
 import org.kde.kirigami as Kirigami
 
-// The popup: the panel the macOS and Windows tray icons open, laid out from
-// the same items as their menu (see "The menu" in tray/PROTOCOL.md). The
-// status goes at the top, with any problem under it, and clicking it opens the
-// dashboard. Separators with a label start sections. A submenu's row expands
-// into a card of its items as links, with destructive ones, such as Remove,
-// as buttons, and groups of options, such as PHP versions, as a box to pick
-// from; a submenu of only options, such as Xdebug's, opens them as a menu.
-// Commands to run that sit together, such as Stop and Restart, share a row of
-// buttons, and the widget's own (Show Output, Refresh) go along the bottom.
-// Dialogs, and the output of the last command, are pages in front of it.
+// The popup: the panel the macOS and Windows tray icons open, drawn from the
+// layout `novacore tray menu` gives (see "The panel" in tray/PROTOCOL.md), so
+// what goes where is decided there, not here. The status goes at the top,
+// with any problem under it, and clicking it does the panel's header item,
+// opening the dashboard. Dialogs, and the output of the last command, are
+// pages in front of it.
 PlasmaExtras.Representation {
     id: full
 
@@ -41,13 +37,6 @@ PlasmaExtras.Representation {
             : Kirigami.Theme.disabledTextColor
     }
 
-    // One or two letters for NAME's avatar: blog -> B, my-site -> MS.
-    function initials(name) {
-        const parts = name.split(/[-_. ]+/).filter(p => p)
-        if (!parts.length) return "?"
-        return (parts[0][0] + (parts.length > 1 ? parts[1][0] : "")).toUpperCase()
-    }
-
     // A colour for NAME's avatar, the same each time, as on macOS.
     readonly property var avatarColors: ["#3daee9", "#9b59b6", "#1abc9c", "#f67400", "#27ae60",
                                          "#e93a9a", "#2c5fd5", "#da4453", "#a0785a"]
@@ -57,92 +46,27 @@ PlasmaExtras.Representation {
         return avatarColors[(h & 0x7FFFFFFF) % avatarColors.length]
     }
 
-    // The panel's parts, from the menu's items: the main item, which the
-    // header does, the blocks of the body (headings, dividers, rows and bars
-    // of buttons), and the widget's own commands for the footer.
+    // The panel novacore laid out, less what the widget leaves out: editors
+    // that aren't installed, and Quit, as it's part of Plasma.
     function buildLayout(model, editors) {
-        let items = (model && model.items) || [{label: i18n("Refresh"), action: {tray: "refresh"}}]
-        let main = null
-        const first = items[0]
-        if (first && first.bold && !first.items && first.action && !first.action.tray) {
-            main = first
-            items = items.slice(1)
-        }
-        const blocks = [], own = []
-        let bar = null
-        const trim = () => {
-            while (blocks.length && ["heading", "divider"].includes(blocks[blocks.length - 1].kind)) blocks.pop()
-        }
-        for (const spec of items) {
-            if (spec.separator) {
-                bar = null
-                trim()
-                if (spec.label) blocks.push({kind: "heading", label: spec.label})
-                else if (blocks.length) blocks.push({kind: "divider"})
-                continue
-            }
-            if (!tray.isShown(spec)) continue
-            const a = spec.action, isSubmenu = !!spec.items
-            if (a && a.tray && !isSubmenu) {
-                own.push(spec)
-            } else if (a && a.run && !isSubmenu) {
-                if (!bar) {
-                    bar = {kind: "bar", specs: []}
-                    blocks.push(bar)
-                }
-                bar.specs.push(spec)
-            } else {
-                bar = null
-                blocks.push({kind: "row", spec: spec})
-            }
-        }
-        trim()
-        return {main: main, blocks: blocks, own: own}
+        const panel = (model && model.panel)
+            || {blocks: [], footer: [{label: i18n("Refresh"), action: {tray: "refresh"}, icon: "refresh"}]}
+        return {main: panel.header || null, blocks: panel.blocks || [], own: shown(panel.footer)}
     }
 
-    // Whether SPECS are options to pick one of, such as PHP versions: one is
-    // checked, and none has a picture.
-    function isChoices(specs) {
-        const items = specs.filter(s => !s.separator)
-        return items.some(s => s.checked) && !items.some(s => tray.itemIcon(s) !== "")
+    function shown(specs) {
+        return (specs || []).filter(s => tray.isShown(s))
     }
 
-    // What a submenu's card shows: its main item, which gets a button on the
-    // row, its other items as lines of up to two links, each group its
-    // separators make starting a new line, its groups of options, and its
-    // destructive items as buttons.
-    function cardFor(items) {
-        const main = items.findIndex(s => s.bold && s.action && s.enabled !== false && tray.isShown(s))
-        const groups = []
-        let group = {label: "", specs: []}
-        items.forEach((spec, i) => {
-            if (spec.separator) {
-                if (group.specs.length) groups.push(group)
-                group = {label: spec.label || "", specs: []}
-            } else if (tray.isShown(spec) && i !== main) {
-                group.specs.push(spec)
-            }
-        })
-        if (group.specs.length) groups.push(group)
-
-        const lines = [], choices = [], buttons = []
-        for (const g of groups) {
-            if (isChoices(g.specs)) {
-                choices.push(g)
-                continue
-            }
-            let starts = true
-            for (const spec of g.specs) {
-                if (tray.isDestructive(spec)) {
-                    buttons.push(spec)
-                    continue
-                }
-                if (starts || !lines.length || lines[lines.length - 1].length === 2) lines.push([spec])
-                else lines[lines.length - 1].push(spec)
-                starts = false
-            }
+    // What an expanded row's card shows: its links two to a line, each group
+    // starting a new line, its boxes to pick from, and its buttons.
+    function cardFor(card) {
+        const lines = []
+        for (const group of card.links || []) {
+            const specs = shown(group)
+            for (let i = 0; i < specs.length; i += 2) lines.push(specs.slice(i, i + 2))
         }
-        return {main: main >= 0 ? items[main] : null, lines: lines, choices: choices, buttons: buttons}
+        return {lines: lines, choices: card.choices || [], buttons: shown(card.buttons)}
     }
 
     Keys.onEscapePressed: event => {
@@ -346,9 +270,9 @@ PlasmaExtras.Representation {
                             required property var modelData
                             Layout.fillWidth: true
                             onLoaded: item.block = Qt.binding(() => modelData)
-                            sourceComponent: modelData.kind === "heading" ? headingBlock
-                                : modelData.kind === "divider" ? dividerBlock
-                                : modelData.kind === "bar" ? barBlock
+                            sourceComponent: modelData.heading !== undefined ? headingBlock
+                                : modelData.divider ? dividerBlock
+                                : modelData.buttons ? barBlock
                                 : rowBlock
                         }
                     }
@@ -383,7 +307,7 @@ PlasmaExtras.Representation {
                         id: ownButton
                         required property var modelData
                         readonly property bool badged: modelData.action.tray === "output" && full.tray.unseen !== ""
-                        icon.name: full.tray.themeIcon(full.tray.itemIcon(modelData))
+                        icon.name: full.tray.themeIcon(modelData.icon)
                         enabled: full.tray.isEnabled(modelData)
                         display: PlasmaComponents3.AbstractButton.IconOnly
                         text: full.tray.withoutEllipsis(modelData.label)
@@ -417,7 +341,7 @@ PlasmaExtras.Representation {
 
         PlasmaComponents3.Label {
             property var block: ({})
-            text: block.label || ""
+            text: block.heading || ""
             font.weight: Font.DemiBold
             font.pointSize: Kirigami.Theme.smallFont.pointSize
             opacity: 0.7
@@ -446,14 +370,14 @@ PlasmaExtras.Representation {
         }
     }
 
-    // Commands side by side, sharing the width, such as Stop and Restart. One
-    // that stands alone, such as Start, is the one to press.
+    // Commands side by side, sharing the width, such as Stop and Restart, with
+    // the one to press, such as Start, filled in.
     Component {
         id: barBlock
 
         Item {
-            property var block: ({specs: []})
-            readonly property var specs: block.specs
+            property var block: ({buttons: []})
+            readonly property var specs: block.buttons
             implicitHeight: bar.implicitHeight + Kirigami.Units.smallSpacing * 2
 
             RowLayout {
@@ -471,7 +395,7 @@ PlasmaExtras.Representation {
                     delegate: Chip {
                         required property var modelData
                         spec: modelData
-                        primary: parent.parent.specs.length === 1
+                        primary: !!modelData.primary
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
                     }
@@ -481,19 +405,20 @@ PlasmaExtras.Representation {
     }
 
     // A row for an item: a picture in a circle, or a site's initials, its
-    // label and detail. A submenu's row expands into a card of its items.
+    // label and detail. Clicking it does the item, opens its menu, or expands
+    // it into its card.
     Component {
         id: rowBlock
 
         ColumnLayout {
             id: rowBox
-            property var block: ({spec: {label: ""}})
-            readonly property var spec: block.spec
-            readonly property var items: spec.items || null
-            readonly property bool choicesOnly: items !== null && full.isChoices(items)
-            readonly property var card: items !== null && !choicesOnly ? full.cardFor(items) : null
+            property var block: ({row: {label: ""}})
+            readonly property var spec: block.row
+            readonly property var menu: block.menu || null
+            readonly property var card: block.card ? full.cardFor(block.card) : null
+            readonly property var main: block.button || null
             readonly property bool expanded: card !== null && full.tray.expandedRow === spec.label
-            readonly property string icon: full.tray.itemIcon(spec)
+            readonly property string icon: spec.icon || ""
             spacing: 0
 
             Hoverable {
@@ -502,10 +427,10 @@ PlasmaExtras.Representation {
                 Layout.leftMargin: Kirigami.Units.smallSpacing
                 Layout.rightMargin: Kirigami.Units.smallSpacing
                 implicitHeight: Kirigami.Units.gridUnit * (rowBox.spec.detail ? 2.6 : 2.1)
-                active: full.tray.isEnabled(rowBox.spec) && (rowBox.items !== null || !!rowBox.spec.action)
+                active: full.tray.isEnabled(rowBox.spec) && (rowBox.menu !== null || rowBox.card !== null || !!rowBox.spec.action)
                 opacity: full.tray.isEnabled(rowBox.spec) ? 1 : 0.5
                 onClicked: {
-                    if (rowBox.choicesOnly) itemsMenu.show(rowBox.items, row)
+                    if (rowBox.menu) itemsMenu.show(rowBox.menu, row)
                     else if (rowBox.card) full.tray.expandedRow = rowBox.expanded ? "" : rowBox.spec.label
                     else full.tray.perform(rowBox.spec.action)
                 }
@@ -520,14 +445,14 @@ PlasmaExtras.Representation {
                         implicitWidth: Math.round(Kirigami.Units.gridUnit * 1.55)
                         implicitHeight: implicitWidth
                         radius: width / 2
-                        readonly property bool avatar: rowBox.icon === "site" && rowBox.items !== null
+                        readonly property bool avatar: !!rowBox.block.avatar
                         color: avatar ? full.avatarColor(rowBox.spec.label) : full.tint(0.08)
                         visible: avatar || rowBox.icon !== ""
 
                         PlasmaComponents3.Label {
                             anchors.centerIn: parent
                             visible: parent.avatar
-                            text: full.initials(rowBox.spec.label)
+                            text: rowBox.block.avatar || ""
                             color: "white"
                             font.weight: Font.DemiBold
                             font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -565,10 +490,10 @@ PlasmaExtras.Representation {
 
                     // A submenu's main item, such as a site's Open.
                     PlasmaComponents3.ToolButton {
-                        readonly property var main: rowBox.card ? rowBox.card.main : null
+                        readonly property var main: rowBox.main
                         visible: main !== null
-                        icon.name: main && main.action.open !== undefined ? "open-link-symbolic"
-                            : main ? full.tray.themeIcon(full.tray.itemIcon(main)) : ""
+                        enabled: main !== null && full.tray.isEnabled(main)
+                        icon.name: main ? full.tray.themeIcon(main.icon) : ""
                         display: PlasmaComponents3.AbstractButton.IconOnly
                         text: main ? full.tray.withoutEllipsis(main.label) : ""
                         onClicked: full.tray.perform(main.action)
@@ -578,8 +503,8 @@ PlasmaExtras.Representation {
                     }
 
                     Kirigami.Icon {
-                        visible: rowBox.items !== null
-                        source: rowBox.choicesOnly ? "arrow-down" : "arrow-right"
+                        visible: rowBox.menu !== null || rowBox.card !== null
+                        source: rowBox.menu ? "arrow-down" : "arrow-right"
                         rotation: rowBox.expanded ? 90 : 0
                         opacity: 0.5
                         Layout.preferredWidth: Kirigami.Units.iconSizes.small
@@ -656,7 +581,7 @@ PlasmaExtras.Representation {
 
                     delegate: RowLayout {
                         required property var modelData
-                        readonly property var specs: modelData.specs
+                        readonly property var specs: modelData.items
                         Layout.fillWidth: true
                         Layout.topMargin: Kirigami.Units.smallSpacing
                         spacing: Kirigami.Units.largeSpacing
@@ -728,7 +653,7 @@ PlasmaExtras.Representation {
         id: chip
         property var spec
         property bool primary: false
-        readonly property bool danger: full.tray.isDestructive(spec)
+        readonly property bool danger: !!spec.danger
         readonly property color textColor: primary ? Kirigami.Theme.highlightedTextColor
             : danger ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
         highlight: false
@@ -759,7 +684,7 @@ PlasmaExtras.Representation {
             spacing: Kirigami.Units.smallSpacing
 
             Kirigami.Icon {
-                readonly property string name: full.tray.themeIcon(full.tray.itemIcon(chip.spec))
+                readonly property string name: full.tray.themeIcon(chip.spec.icon)
                 visible: name !== ""
                 source: name
                 color: chip.textColor
@@ -805,7 +730,7 @@ PlasmaExtras.Representation {
             spacing: Kirigami.Units.smallSpacing
 
             Kirigami.Icon {
-                readonly property string name: link.spec ? full.tray.themeIcon(full.tray.itemIcon(link.spec)) : ""
+                readonly property string name: link.spec ? full.tray.themeIcon(link.spec.icon) : ""
                 visible: name !== ""
                 source: name
                 opacity: 0.7

@@ -11,8 +11,8 @@ import org.kde.kirigami as Kirigami
 // macOS and Windows tray icons open. It can also sit on a panel or the desktop.
 //
 // Like the tray icons, it draws what the CLI describes: `novacore tray menu`
-// gives every item and what it does (see tray/PROTOCOL.md), so new features
-// belong in the CLI, not here. Commands that change something run through
+// gives every item, what it does and where it goes in the panel (see
+// tray/PROTOCOL.md), so new features belong in the CLI, not here. Commands that change something run through
 // `novacore tray run`, detached from plasmashell so a long build survives a
 // Plasma restart, and `novacore tray poll` says how one is doing.
 PlasmoidItem {
@@ -224,20 +224,6 @@ if [ $# -eq 0 ]; then exec "\${SHELL:-bash}"; fi
 
     // --- Actions (see "Actions" in tray/PROTOCOL.md) ---------------------
 
-    // The name of an item's icon: its own, else one for what it does.
-    function itemIcon(spec) {
-        if (spec.icon) return spec.icon
-        const a = spec.action
-        if (!a) return ""
-        if (a.open !== undefined) return "site"
-        if (a.folder !== undefined) return "folder"
-        if (a.editor !== undefined) return "code"
-        if (a.terminal !== undefined || a.console !== undefined) return "terminal"
-        if (a.dialog === "info") return "info"
-        if (a.dialog === "form") return a.destructive ? "remove" : "add"
-        return a.tray || ""
-    }
-
     // Breeze icons for the names in tray/PROTOCOL.md, and the panel's own.
     readonly property var iconNames: ({
         dashboard: "go-home", site: "globe", open: "open-link-symbolic", git: "vcs-branch",
@@ -249,7 +235,7 @@ if [ $# -eq 0 ]; then exec "\${SHELL:-bash}"; fi
     })
 
     function themeIcon(name) {
-        return iconNames[name] || ""
+        return iconNames[name || ""] || ""
     }
 
     function isShown(spec) {
@@ -265,10 +251,6 @@ if [ $# -eq 0 ]; then exec "\${SHELL:-bash}"; fi
         if (busy && spec.idle) return false
         if (spec.action && spec.action.tray === "output" && output.length === 0) return false
         return true
-    }
-
-    function isDestructive(spec) {
-        return itemIcon(spec) === "remove" || !!(spec.action && spec.action.destructive)
     }
 
     function perform(action) {

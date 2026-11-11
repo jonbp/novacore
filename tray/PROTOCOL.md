@@ -1,14 +1,31 @@
 # Tray icon protocol
 
-Novacore has four tray icons: the Linux tray icon (`tray/linux/novacore-tray.py`), the KDE Plasma widget, which takes its place in Plasma's system tray (`tray/plasmoid/`), the macOS menu bar icon (`tray/macos/NovacoreTray.swift`) and the Windows tray icon (`tray/windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
+Novacore has four tray icons: the Linux tray icon (`tray/linux/novacore-tray.py`), the KDE Plasma widget, which takes its place in Plasma's system tray (`tray/plasmoid/`), the macOS menu bar icon (`tray/macos/NovacoreTray.swift`) and the Windows tray icon (`tray/windows/novacore-tray.ps1`). Each one only draws things and carries out actions. The CLI decides what goes in the menu, what each item does, where it goes in a panel and which dialogs to show, so most new features only need a change in `bin/novacore`. Every icon picks it up straight away.
 
 ## Adding a feature
 
-1. **A menu item that runs a command:** add it in `tray_menu` in `bin/novacore`, with `act_run` for its action. That's all. Every icon shows it, grey it out while another command runs (`idle`), and notify you when it finishes.
+1. **A menu item that runs a command:** add it in `tray_menu` in `bin/novacore`, with `act_run` for its action, and pass it to the `add_` or `sub_` function for where it goes (see "Building the menu" below). That's all. Every icon shows it, greys it out while another command runs (`idle`), and notifies you when it finishes.
 2. **A dialog that asks for something:** describe it as a form (see below), with an action that runs `tray submit <form>`. Then add a case to `tray_submit` that turns the answers into the real command.
-3. **Something an icon can't do yet**, such as a new kind of action or field: add it to every icon and document it here. Keep the description generic, so the next feature that needs it can use it too.
+3. **Something an icon can't do yet**, such as a new kind of action, field or block: add it to every icon and document it here. Keep the description generic, so the next feature that needs it can use it too.
 
 To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
+
+## Building the menu
+
+`tray_menu` says once what each item is for, and gets both the menu's `items` and the `panel` from that:
+
+| Function | Menu | Panel |
+|---|---|---|
+| `add_main ITEM` | The first item. | What clicking the heading does. |
+| `add_section LABEL` | A separator with a heading. | A heading. |
+| `add_divider` | A separator. | A line. |
+| `add_row ITEM` | An item. | A row. |
+| `add_button ITEM` | An item. | A button. Ones added one after another share a row. |
+| `add_own ITEM` | An item. | A button along the bottom. |
+| `sub_start`, then `sub_` functions, then `add_card LABEL` | A submenu. | A row that expands into a card. |
+| `sub_start`, then `sub_choice`s, then `add_picker LABEL` | A submenu. | A row that opens the options as a menu. |
+
+Inside a submenu: `sub_main` (a button on the row, such as a site's Open), `sub_link` (a link), `sub_break` (a separator: the next links start a new line), `sub_choices LABEL` and `sub_choice` (a separator, then options to pick one of), and `sub_danger` (a button at the bottom, such as Remove).
 
 ## Commands
 
@@ -27,13 +44,15 @@ To see what the icons get, run `novacore tray menu | python3 -m json.tool`.
   "state": "running",
   "status": "Running, 3 sites",
   "problem": "Can't reach the Docker daemon. Is Docker Desktop or OrbStack running?",
-  "items": [ … ]
+  "items": [ … ],
+  "panel": { … }
 }
 ```
 
 - `state` is `running`, `stopped` or `error`. It sets the badge colour. The icons also have a `busy` state of their own while a command runs.
 - `status` follows "Novacore ·" in the first line of the menu. `problem`, if present, goes on the line below it.
-- The icons add that heading and the separator under it. `items` is everything else.
+- The icons add that heading and the separator under it. `items` is everything else, for an icon that draws a menu.
+- `panel` is the same items laid out for an icon that draws a panel (see "The panel" below).
 
 An item is either a separator, `{"separator": true}`, or an item. A separator with a `label` starts a section with that heading. Icons that draw a menu can leave the heading out and just draw a line.
 
@@ -48,12 +67,45 @@ An item has these keys:
 | `idle` | `true` greys it out while a command from the tray runs. Use it for anything that changes something. |
 | `checked` | `true` shows a check mark. |
 | `bold` | `true` shows it in bold, for the main thing a menu does. |
-| `icon` | The name of a picture to show beside it (see below). |
+| `icon` | The name of a picture to show beside it in a panel (see below). |
 | `detail` | A second line of text under the label, such as a site's URL and PHP version. |
 
-`icon` and `detail` are for icons that draw a panel rather than a menu: the Plasma widget, and the Windows and macOS ones. The Linux one leaves them out. Without an `icon`, a panel picks a picture from the item's action. The names are `dashboard`, `site` (a submenu for a site, shown with its initials), `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
+`icon` and `detail` are for icons that draw a panel: the Plasma widget, and the Windows and macOS ones. The Linux one leaves them out. `mitem` picks an `icon` from the item's action, unless it's given one. The names are `dashboard`, `site`, `open`, `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
 
-The panels lay the menu out like this, so it suits any menu that follows these conventions: if the first item is bold and has an action, clicking the panel's heading does it, instead of it having a row; commands that run (`run`) next to each other become a row of buttons; the icon's own commands (`tray`) go along the bottom; a submenu's bold item becomes a button on its row. A group of options, one of them checked and none with an `icon`, such as PHP versions, is a box to pick from (a pop-up button on macOS), captioned with the label of the separator before it. A submenu that is only options, such as Xdebug's, opens them as a menu. Any other submenu is a row that expands to show its items as links, two to a line, each group that its separators make starting a new line. A destructive item, one whose `icon` is `remove` or whose form is `destructive`, is a button at the bottom instead.
+## The panel
+
+```json
+{
+  "header": ITEM,
+  "blocks": [ … ],
+  "footer": [ITEM, …]
+}
+```
+
+The CLI has already decided where everything goes, so a panel draws these in order and doesn't rearrange them. `header` is what clicking the panel's heading does, if there is one. `footer` is the icon's own commands (`tray`), along the bottom. `blocks` is the rest, each one of these:
+
+| Block | Draw it as |
+|---|---|
+| `{"heading": LABEL}` | The heading of a section. |
+| `{"divider": true}` | A line between sections. |
+| `{"buttons": [ITEM, …]}` | A row of buttons sharing the width. An item with `"primary": true` is the one to press, in the accent colour. |
+| `{"row": ITEM}` | A row that does ITEM's action. |
+| `{"row": ITEM, "menu": [ITEM, …]}` | A row that opens the ITEMs as a menu, such as Xdebug's modes. |
+| `{"row": ITEM, "card": CARD, "button": ITEM, "avatar": "MS"}` | A row that expands into CARD, such as a site's. `button`, if present, is a button on the row, and `avatar`, if present, is shown in a coloured circle in place of ITEM's picture. Only one row is expanded at a time. |
+
+A card is:
+
+```json
+{
+  "links": [[ITEM, …], …],
+  "choices": [{"label": "PHP version", "items": [ITEM, …]}],
+  "buttons": [ITEM, …]
+}
+```
+
+`links` are groups of links, two to a line, each group starting a new line. `choices` are boxes to pick one of their items from (a pop-up button on macOS), captioned with `label`. The checked item is the current one. `buttons` go at the bottom, and one with `"danger": true` is in red. Any of the three can be missing.
+
+The items in a panel are menu items like any other, and an item with `items` opens them as a menu. A panel still decides for itself whether to show an item (it leaves out editors that aren't installed, and the Plasma widget leaves out `quit`) and whether it's greyed out (`enabled`, `idle`).
 
 ## Actions
 
