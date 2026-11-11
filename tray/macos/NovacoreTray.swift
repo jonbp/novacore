@@ -338,7 +338,7 @@ let symbolNames: [String: String] = [
     "code": "square.and.pencil", "terminal": "terminal", "log": "doc.text", "remove": "trash",
     "add": "plus", "start": "play.fill", "stop": "stop.fill", "restart": "arrow.clockwise",
     "bug": "ladybug", "tools": "wrench.and.screwdriver", "database": "cylinder.split.1x2",
-    "output": "terminal", "refresh": "arrow.clockwise", "quit": "power",
+    "output": "terminal", "refresh": "arrow.clockwise", "update": "arrow.down.circle", "quit": "power",
     "error": "exclamationmark.triangle.fill", "right": "chevron.right", "down": "chevron.down",
     "updown": "chevron.up.chevron.down",
 ]

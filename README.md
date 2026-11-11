@@ -146,6 +146,19 @@ Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '127
 
 Running `wp` on your machine needs PHP with `mysqli` (and the `mysql`/`mariadb` client for `wp db export`). If your PHP version behaves differently, use `novacore wp`.
 
+## Updates
+
+Novacore follows upstream's images (`php:8.4-fpm`, `mariadb:11.8`, `nginx:stable-alpine`), which get patch releases and security fixes all the time. Docker keeps whichever copy it downloaded first, so bring them up to date with:
+
+```sh
+novacore update --check   # list what's behind, e.g. PHP 8.4.27 → 8.4.28
+novacore update           # pull or rebuild those images, and restart their containers
+```
+
+It updates the PHP versions you have images for, MariaDB and nginx, and removes the images they replace. Rebuilding a PHP image also brings its extensions, Composer and WP-CLI up to date. Checking only asks Docker Hub what each tag points to now, so it costs next to nothing against Docker Hub's limits. The tray icon checks once a day and lists what's behind under **Updates**, and `novacore up` mentions it too.
+
+MariaDB stays on its release series (11.8): its patch releases upgrade your databases in place when they start. A new series, or a new PHP version, is a change to Novacore itself.
+
 ## SSH from PHP
 
 Commands in the PHP containers (WP-CLI sync packages, private Composer packages, `git` over SSH) can use your keys through your **SSH agent**. Private keys never enter the containers; only the agent and read-only copies of `~/.ssh/known_hosts` and `~/.ssh/config` are shared. Load your keys with `ssh-add`, or `AddKeysToAgent yes` in `~/.ssh/config`. `novacore up` warns if the agent is empty.
@@ -172,11 +185,12 @@ Novacore has one tray icon, the same everywhere: a globe whose pill shows the st
 | <picture><source media="(prefers-color-scheme: dark)" srcset="tray/previews/busy-dark.svg"><img alt="Busy" src="tray/previews/busy-light.svg" width="32"></picture> | **Busy** | A command started from the icon is running, such as Start or a PHP switch. |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="tray/previews/error-dark.svg"><img alt="Error" src="tray/previews/error-light.svg" width="32"></picture> | **Error** | Docker can't be reached. The panel says why. |
 
-Click it for a panel with Novacore's status, your sites, Start/Stop/Restart, Xdebug and Tools. Right-click for the same as a menu (the Linux Qt icon only has the menu). It covers most of the CLI:
+Click it for a panel with Novacore's status, your sites, Start/Stop/Restart, Xdebug, Tools and Updates. Right-click for the same as a menu (the Linux Qt icon only has the menu). It covers most of the CLI:
 
 - **Add Site…** asks for a name, PHP version, document root, and whether to create a database.
 - **Each site** expands to open it, its git remote, its folder, VS Code or Zed, a terminal, a PHP shell or its error log, switch its PHP version, show its **Info…** (with copy buttons), or remove it.
 - **Xdebug** sets the mode; **Tools** opens a database shell, container logs or the sites folder.
+- **Updates** lists newer PHP, MariaDB and nginx releases, with a button to install them.
 
 ```sh
 novacore tray install     # on Windows, run inside WSL

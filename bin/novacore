@@ -712,9 +712,17 @@ cmd_up() {
     detail Sites "${#SITE_NAMES[@]}"
     detail Xdebug "$XDEBUG_MODE"
     ssh_agent_status
-    if [[ -n $SSH_HINT || ! -f $DATA_DIR/.trusted ]]; then
+    local updates="" i names=()
+    if load_updates && (( UPD_PENDING )); then
+        for (( i = 0; i < ${#UPD_KEY[@]}; i++ )); do
+            [[ ${UPD_STATUS[i]} != update && ${UPD_STATUS[i]} != rebuild ]] || names+=("${UPD_NAME[i]}")
+        done
+        updates="Updates are ready for $(join ', ' "${names[@]}"). Run novacore update to install them"
+    fi
+    if [[ -n $SSH_HINT || -n $updates || ! -f $DATA_DIR/.trusted ]]; then
         echo
         [[ -z $SSH_HINT ]] || hint "$SSH_HINT"
+        [[ -z $updates ]] || hint "$updates"
         [[ -f $DATA_DIR/.trusted ]] || hint "Run novacore trust once so your browser accepts Novacore's certificates"
     fi
     echo
@@ -842,6 +850,8 @@ cmd_build() {
     heading Images
     run compose build --pull "${services[@]}" || fail "Couldn't build the images"
     result "Built $(join ', ' "${services[@]}")"
+    # What was behind may not be now. The tray checks again when it's gone.
+    rm -f "$UPDATES_FILE"
     apply_containers
     complete Built
     echo
@@ -908,6 +918,330 @@ cmd_prune() {
     complete "Freed $(bytes $(( before - $(docker_bytes) )))"
     echo
     (( cache )) || hint "novacore prune --cache also clears Docker's unused build cache, which only speeds up rebuilds"
+    echo
+}
+
+# --- Updates ---
+#
+# Novacore's images follow upstream tags (php:8.4-fpm, mariadb:11.8,
+# nginx:stable-alpine), which get patch releases and security fixes all the
+# time, but Docker keeps whichever copy it first downloaded. novacore update
+# asks Docker Hub what the tags point to now, and pulls or rebuilds whatever is
+# behind. The last check is kept in data/updates for the tray and novacore up.
+
+UPDATES_FILE="$DATA_DIR/updates"
+UPDATES_PID="$DATA_DIR/updates.pid"
+UPDATES_MAX_AGE=86400
+
+# The images to keep up to date, one per line: KEY, NAME, the upstream image,
+# Novacore's image made from it, and the variable holding its version. PHP
+# versions without an image are left out, as they're built fresh when needed.
+update_targets() {
+    local mariadb nginx v
+    mariadb=$(sed -n 's/^ *image: *\(mariadb:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1)
+    nginx=$(sed -n 's/^FROM *\([^ ]*\).*/\1/p' docker/nginx/Dockerfile | head -n 1)
+    printf '%s\t%s\t%s\t%s\t%s\n' mariadb MariaDB "$mariadb" "$mariadb" MARIADB_VERSION
+    printf '%s\t%s\t%s\t%s\t%s\n' nginx nginx "$nginx" novacore/nginx NGINX_VERSION
+    load_built_php
+    for v in "${SUPPORTED_PHP[@]}"; do
+        php_built "$v" || continue
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(php_service "$v")" "PHP $v" "php:$v-fpm" "novacore/php:$v" PHP_VERSION
+    done
+}
+
+# short_version VERSION — e.g. 11.8.9 from MariaDB's 1:11.8.9+maria~ubu2404.
+short_version() { local v=${1#*:}; echo "${v%%[+~-]*}"; }
+
+# --- Docker Hub
+#
+# Asked directly, with curl, so a check costs next to nothing against Docker
+# Hub's limit on anonymous pulls: HEAD requests are free, and the two that
+# count are only made for an image whose tag has moved since the last check.
+
+HUB_ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+
+# hub_repo IMAGE — REPLY = its repository and tag, e.g. library/php 8.4-fpm.
+hub_repo() {
+    local repo=${1%:*} tag=${1##*:}
+    [[ $repo == */* ]] || repo=library/$repo
+    REPLY="$repo $tag"
+}
+
+# hub_token REPO — a token to read REPO with.
+hub_token() {
+    curl -fsS --max-time 20 --retry 3 2>/dev/null "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$1:pull" |
+        sed -n 's/.*"token": *"\([^"]*\)".*/\1/p'
+}
+
+# hub TOKEN REPO PATH [CURL OPTION...] — GET (or with -I, HEAD) a registry path.
+hub() {
+    local token=$1 repo=$2 path=$3
+    shift 3
+    curl -fsSL --max-time 30 --retry 3 -H "Authorization: Bearer $token" -H "Accept: $HUB_ACCEPT" \
+        "$@" "https://registry-1.docker.io/v2/$repo/$path" 2>/dev/null
+}
+
+# hub_platform_manifest INDEX OS ARCH — the digest of the manifest for that
+# platform in an index's JSON.
+hub_platform_manifest() {
+    # Drop the annotations, which are objects of their own, so each manifest is
+    # an object holding one other: its platform.
+    printf '%s' "$1" | tr -d '\n' | sed 's/"annotations": *{[^}]*}//g' |
+        grep -o '{[^{}]*{[^{}]*}[^{}]*}' |
+        grep "\"os\": *\"$2\"" | grep "\"architecture\": *\"$3\"" |
+        grep -o '"digest": *"sha256:[0-9a-f]*"' | head -n 1 | grep -o 'sha256:[0-9a-f]*'
+}
+
+# check_target KEY NAME UPSTREAM LOCAL VARIABLE OS ARCH [PREVIOUS] — one line
+# of data/updates, with tabs between: KEY, NAME, the version there is, the
+# version upstream, the status, the upstream tag's digest and LOCAL's image
+# ID. Empty fields are "-". The status is ok, update (a new version), rebuild
+# (the same version on newer system packages), missing (no image yet) or
+# error. PREVIOUS is this image's line from the last check, reused when
+# neither the tag nor the image has changed since.
+check_target() {
+    local key=$1 name=$2 upstream=$3 local=$4 var=$5 os=$6 arch=$7 prev=${8:-}
+    local id env layers cur repo tag token digest index manifest config blob new last status
+    local p_key p_name p_cur p_new p_status p_digest p_id
+    if ! id=$(docker image inspect "$local" --format '{{.Id}}' 2>/dev/null); then
+        printf '%s\t%s\t-\t-\tmissing\t-\t-\n' "$key" "$name"
+        return
+    fi
+    env=$(docker image inspect "$local" --format '{{range .Config.Env}}{{println .}}{{end}}')
+    cur=$(short_version "$(printf '%s\n' "$env" | sed -n "s/^$var=//p")")
+    hub_repo "$upstream"; read -r repo tag <<<"$REPLY"
+
+    target_error() { printf '%s\t%s\t%s\t-\terror\t-\t%s\n' "$key" "$name" "${cur:--}" "$id"; }
+    token=$(hub_token "$repo") && [[ -n $token ]] || { target_error; return; }
+    digest=$(hub "$token" "$repo" "manifests/$tag" -I | tr -d '\r' |
+        sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tail -n 1)
+    [[ -n $digest ]] || { target_error; return; }
+
+    # Nothing has moved since the last check.
+    if [[ -n $prev ]]; then
+        IFS=$'\t' read -r p_key p_name p_cur p_new p_status p_digest p_id <<<"$prev"
+        if [[ $p_digest == "$digest" && $p_id == "$id" && $p_status != error ]]; then
+            printf '%s\n' "$prev"
+            return
+        fi
+    fi
+    # A pulled image that is the tag, such as MariaDB's.
+    if docker image inspect "$local" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
+        grep -q "@$digest\$"; then
+        printf '%s\t%s\t%s\t%s\tok\t%s\t%s\n' "$key" "$name" "${cur:--}" "${cur:--}" "$digest" "$id"
+        return
+    fi
+
+    # Otherwise compare the layers: an image built on, or pulled from, the tag
+    # has its last layer.
+    index=$(hub "$token" "$repo" "manifests/$digest") || { target_error; return; }
+    if [[ $index == *'"manifests"'* ]]; then
+        manifest=$(hub_platform_manifest "$index" "$os" "$arch") && [[ -n $manifest ]] || { target_error; return; }
+        index=$(hub "$token" "$repo" "manifests/$manifest") || { target_error; return; }
+    fi
+    config=$(printf '%s' "$index" | tr -d '\n' | grep -o '"config": *{[^}]*}' | grep -o 'sha256:[0-9a-f]*' | head -n 1)
+    [[ -n $config ]] && blob=$(hub "$token" "$repo" "blobs/$config") || { target_error; return; }
+    new=$(short_version "$(printf '%s' "$blob" | grep -o "\"$var=[^\"]*\"" | head -n 1 | sed "s/^\"$var=//; s/\"\$//")")
+    last=$(printf '%s' "$blob" | tr -d '\n' | grep -o '"diff_ids": *\[[^]]*\]' | grep -o 'sha256:[0-9a-f]*' | tail -n 1)
+    layers=$(docker image inspect "$local" --format '{{range .RootFS.Layers}}{{println .}}{{end}}')
+    if [[ -n $last ]] && has_line "$layers" "$last"; then status=ok
+    elif [[ $cur != "$new" ]]; then status=update
+    else status=rebuild
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "$name" "${cur:--}" "${new:--}" "$status" "$digest" "$id"
+}
+
+# Check every image at once, and save the results to data/updates. Fails if
+# none could be checked, such as when offline.
+check_updates() {
+    local tmp os arch key name upstream local var i=0 ok=0 prev status
+    command -v curl >/dev/null || fail "Checking for updates needs curl"
+    read -r os arch <<<"$(docker version --format '{{.Server.Os}} {{.Server.Arch}}')"
+    tmp=$(mktemp -d)
+    while IFS=$'\t' read -r key name upstream local var; do
+        prev=$(grep "^$key"$'\t' "$UPDATES_FILE" 2>/dev/null | head -n 1) || true
+        check_target "$key" "$name" "$upstream" "$local" "$var" "$os" "$arch" "$prev" > "$tmp/$(printf '%02d' $i)" &
+        (( ++i ))
+    done < <(update_targets)
+    wait
+    {
+        echo "checked $(date +%s)"
+        cat "$tmp"/[0-9]* 2>/dev/null || true
+    } > "$tmp/all"
+    while IFS=$'\t' read -r _ _ _ _ status _; do
+        [[ $status == error ]] || (( ++ok ))
+    done < <(tail -n +2 "$tmp/all")
+    mkdir -p "$DATA_DIR"
+    # Keep an earlier result rather than forget it when this one failed.
+    if (( ok )) || [[ ! -f $UPDATES_FILE ]]; then mv "$tmp/all" "$UPDATES_FILE"; fi
+    rm -rf "$tmp"
+    (( ok ))
+}
+
+# Read data/updates into UPD_ arrays: UPD_KEY, UPD_NAME, UPD_CUR, UPD_NEW and
+# UPD_STATUS, with UPD_CHECKED, when it was checked, and UPD_PENDING, how many
+# are behind. Fails if it's never been checked.
+load_updates() {
+    UPD_KEY=() UPD_NAME=() UPD_CUR=() UPD_NEW=() UPD_STATUS=() UPD_CHECKED=0 UPD_PENDING=0
+    [[ -f $UPDATES_FILE ]] || return 1
+    local key name cur new status first
+    {
+        read -r first UPD_CHECKED || return 1
+        while IFS=$'\t' read -r key name cur new status _; do
+            [[ $cur != - ]] || cur=""
+            [[ $new != - ]] || new=""
+            UPD_KEY+=("$key") UPD_NAME+=("$name") UPD_CUR+=("$cur") UPD_NEW+=("$new") UPD_STATUS+=("$status")
+            [[ $status != update && $status != rebuild ]] || (( ++UPD_PENDING ))
+        done
+    } < "$UPDATES_FILE"
+    [[ $first == checked && $UPD_CHECKED =~ ^[0-9]+$ ]]
+}
+
+# update_change INDEX — REPLY = what an update to UPD_ INDEX brings, e.g.
+# "8.4.27 → 8.4.28", or "8.4.27, system updates".
+update_change() {
+    case ${UPD_STATUS[$1]} in
+        update)  REPLY="${UPD_CUR[$1]} → ${UPD_NEW[$1]}" ;;
+        rebuild) REPLY="${UPD_CUR[$1]}, system updates" ;;
+        error)   REPLY="${UPD_CUR[$1]}${UPD_CUR[$1]:+, }couldn't check" ;;
+        *)       REPLY=${UPD_CUR[$1]} ;;
+    esac
+}
+
+# ago EPOCH — REPLY = how long ago that was, e.g. "3 hours ago".
+ago() {
+    local s=$(( $(date +%s) - $1 ))
+    if (( s < 60 )); then REPLY="just now"
+    elif (( s < 3600 )); then REPLY="$(count $(( s / 60 )) minute minutes) ago"
+    elif (( s < 86400 )); then REPLY="$(count $(( s / 3600 )) hour hours) ago"
+    else REPLY="$(count $(( s / 86400 )) day days) ago"
+    fi
+}
+
+# Whether a check is running in the background, started by the tray.
+updates_checking() {
+    local pid
+    pid=$(cat "$UPDATES_PID" 2>/dev/null) && [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Check for updates in the background if the last check is a day old.
+check_updates_if_due() {
+    (( $(date +%s) - UPD_CHECKED >= UPDATES_MAX_AGE )) || return 0
+    updates_checking && return 0
+    mkdir -p "$DATA_DIR"
+    nohup "$NOVACORE_ROOT/bin/novacore" update --quiet </dev/null >/dev/null 2>&1 &
+    echo $! > "$UPDATES_PID"
+}
+
+# End a check that failed, saying whether Docker Hub turned it away.
+updates_failed() {
+    local token code
+    token=$(hub_token library/mariadb) || true
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -I -H "Authorization: Bearer $token" \
+        -H "Accept: $HUB_ACCEPT" https://registry-1.docker.io/v2/library/mariadb/manifests/latest 2>/dev/null) || true
+    if [[ $code == 429 ]]; then
+        fail "Docker Hub's rate limit was reached" "It allows 100 requests an hour without logging in. Try again later"
+    fi
+    fail "Couldn't check for updates" "Can this machine reach Docker Hub?"
+}
+
+# List the images and how up to date each one is.
+print_updates() {
+    local i mark
+    for (( i = 0; i < ${#UPD_KEY[@]}; i++ )); do
+        [[ ${UPD_STATUS[i]} != missing ]] || continue
+        update_change "$i"
+        case ${UPD_STATUS[i]} in
+            ok)    mark=$(color "✔ $(printf '%-10s' "${UPD_NAME[i]}")" 32) ;;
+            error) mark=$(color "! $(printf '%-10s' "${UPD_NAME[i]}")" 33) ;;
+            *)     mark=$(color "↑ $(printf '%-10s' "${UPD_NAME[i]}")" 36) ;;
+        esac
+        printf '  %s  %s\n' "$mark" "$(color "$REPLY" 90)"
+    done
+}
+
+# novacore update [--check] — bring the images up to date, or with --check,
+# only say which are behind. --quiet is for the tray: check, and say nothing.
+cmd_update() {
+    local arg check=0 quiet=0 i pulls=() builds=() names=() old=() ids=() id
+    for arg in "$@"; do
+        case $arg in
+            --check) check=1 ;;
+            --quiet) quiet=1 ;;
+            *)       fail "Unknown option '$arg'" "Usage: novacore update [--check]" ;;
+        esac
+    done
+
+    if (( quiet )); then
+        echo $$ > "$UPDATES_PID"
+        trap 'rm -f "$UPDATES_PID"' EXIT
+        check_updates >/dev/null 2>&1 || true
+        return
+    fi
+
+    if (( check )); then
+        heading Updates
+        check_updates || updates_failed
+        load_updates || true
+        print_updates
+        echo
+        if (( UPD_PENDING )); then hint "Run novacore update to install them"; else note "Everything is up to date"; fi
+        echo
+        return
+    fi
+
+    header Updating
+    heading "Checking for updates"
+    check_updates || updates_failed
+    load_updates || true
+    print_updates
+    for (( i = 0; i < ${#UPD_KEY[@]}; i++ )); do
+        [[ ${UPD_STATUS[i]} == update || ${UPD_STATUS[i]} == rebuild ]] || continue
+        if [[ ${UPD_KEY[i]} == mariadb ]]; then pulls+=(mariadb); else builds+=("${UPD_KEY[i]}"); fi
+        names+=("${UPD_NAME[i]}")
+    done
+    if (( ! ${#names[@]} )); then
+        complete "Already up to date"
+        echo
+        return
+    fi
+
+    # The images being replaced, to remove once nothing uses them.
+    for id in ${pulls[@]+"${pulls[@]}"} ${builds[@]+"${builds[@]}"}; do
+        case $id in
+            mariadb) id=$(sed -n 's/^ *image: *\(mariadb:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1) ;;
+            nginx)   id=novacore/nginx ;;
+            *)       id=novacore/php:$(service_php "$id") ;;
+        esac
+        ids+=("$id")
+        old+=("$(docker image inspect "$id" --format '{{.Id}}' 2>/dev/null || true)")
+    done
+
+    heading Images
+    if (( ${#pulls[@]} )); then
+        run compose pull "${pulls[@]}" || fail "Couldn't download the new images"
+    fi
+    if (( ${#builds[@]} )); then
+        run compose build --pull "${builds[@]}" || fail "Couldn't build the new images"
+    fi
+    result "Updated $(join ', ' "${names[@]}")"
+
+    # Restarts the containers whose image changed.
+    apply_containers
+
+    for (( i = 0; i < ${#ids[@]}; i++ )); do
+        id=$(docker image inspect "${ids[i]}" --format '{{.Id}}' 2>/dev/null || true)
+        if [[ -n ${old[i]} && ${old[i]} != "$id" ]]; then
+            docker image rm "${old[i]}" >/dev/null 2>&1 || true
+        fi
+    done
+    check_updates >/dev/null 2>&1 || true
+
+    complete Updated
+    if (( ! APPLIED )); then
+        echo
+        hint "The new versions run when you next run novacore up"
+    fi
     echo
 }
 
@@ -1794,6 +2128,43 @@ xdebug_menu() {
     add_picker Xdebug icon bug detail "$current"
 }
 
+# Add the Updates section: what's behind and a button to update it, or when
+# it was last checked. It checks in the background once a day.
+updates_menu() {
+    local i n=0 checking=0 detail check
+    load_updates || true
+    check_updates_if_due
+    updates_checking && checking=1
+    add_section Updates
+    for (( i = 0; i < ${#UPD_KEY[@]}; i++ )); do
+        [[ ${UPD_STATUS[i]} == update || ${UPD_STATUS[i]} == rebuild ]] || continue
+        # A PHP version pruned since the check doesn't need updating.
+        [[ ${UPD_KEY[i]} != php* ]] || php_built "$(service_php "${UPD_KEY[i]}")" || continue
+        update_change "$i"
+        # PHP 8.4.27 → 8.4.28: the product, not the image's version line.
+        mitem "${UPD_NAME[i]%% *} $REPLY" "" icon=update; add_row "$REPLY"
+        (( ++n ))
+    done
+    act_run "Checking for updates…" "Finished checking for updates" "" update --check
+    check=$REPLY
+    if (( n )); then
+        act_run "Updating Novacore…" "Novacore is up to date" "" update
+        mitem "Update Now" "$REPLY" idle icon=update; jwith "$REPLY" '"primary":true'; add_button "$REPLY"
+        mitem "Check Again" "$check" idle icon=refresh; add_button "$REPLY"
+    elif (( checking )); then
+        mitem "Checking for updates…" "" off icon=refresh; add_row "$REPLY"
+    else
+        if (( ! UPD_CHECKED )); then detail="Not checked yet"
+        else
+            ago "$UPD_CHECKED"
+            if [[ " ${UPD_STATUS[*]} " == *" error "* ]]; then detail="Couldn't check them all, $REPLY"
+            else detail="Up to date, checked $REPLY"
+            fi
+        fi
+        mitem "Check for Updates" "$check" idle icon=refresh; mextra detail "$detail"; add_row "$REPLY"
+    fi
+}
+
 # tray menu — the tray icon's menu, and the panel made of it, as JSON (see
 # tray/PROTOCOL.md).
 tray_menu() {
@@ -1842,6 +2213,8 @@ tray_menu() {
         act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub_link "$REPLY"
         add_card Tools icon tools
     fi
+
+    [[ $state == error ]] || updates_menu
 
     act tray output; mitem "Show Output…" "$REPLY"; add_own "$REPLY"
     act tray refresh; mitem Refresh "$REPLY" idle; add_own "$REPLY"
@@ -2374,6 +2747,7 @@ Stack:
   reload                      Regenerate config from sites.conf and apply it
   logs [service]              Follow container logs (nginx, mariadb, php84, ...)
   build [--all]               Rebuild images (--all builds every PHP version)
+  update [--check]            Install new PHP, MariaDB and nginx releases (--check only lists them)
   prune [--cache]             Remove images of PHP versions no site uses
   trust                       Trust Novacore's local CA (one-off, uses sudo)
   tray [install|uninstall]    Add Novacore to the tray (Linux, Windows via WSL) or menu bar (macOS)
@@ -2430,6 +2804,7 @@ main() {
         logs)         cmd_logs "$@" ;;
         errors)       cmd_errors "$@" ;;
         build)        cmd_build "$@" ;;
+        update)       cmd_update "$@" ;;
         prune)        cmd_prune "$@" ;;
         trust)        cmd_trust ;;
         site)         cmd_site "$@" ;;

@@ -64,6 +64,9 @@ services:
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
       MARIADB_USER: ${DB_USER:-novacore}
       MARIADB_PASSWORD: ${DB_PASSWORD:-novacore}
+      # Upgrade the system tables when a newer MariaDB starts on older data,
+      # as after novacore update. It backs them up first.
+      MARIADB_AUTO_UPGRADE: "1"
     ports:
       - ${BIND_ADDRESS:-127.0.0.1}:${DB_PORT:-3306}:3306
     volumes:

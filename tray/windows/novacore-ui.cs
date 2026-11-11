@@ -128,6 +128,7 @@ public static class Theme {
             case "database":  return "\uEE94";  // Database
             case "output":    return "\uE756";  // CommandPrompt
             case "refresh":   return "\uE72C";  // Refresh
+            case "update":    return "\uE896";  // Download
             case "quit":      return "\uE7E8";  // PowerButton
             case "busy":      return "\uE895";  // Sync
             case "error":     return "\uEA39";  // ErrorBadge

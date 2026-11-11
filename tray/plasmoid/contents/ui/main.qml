@@ -231,7 +231,7 @@ if [ $# -eq 0 ]; then exec "\${SHELL:-bash}"; fi
         terminal: "utilities-terminal", log: "view-list-text", remove: "edit-delete", add: "list-add",
         start: "media-playback-start", stop: "media-playback-stop", restart: "view-refresh",
         bug: "tools-report-bug", tools: "tools", database: "server-database", output: "dialog-scripts",
-        refresh: "view-refresh", quit: "application-exit",
+        refresh: "view-refresh", update: "system-software-update", quit: "application-exit",
     })
 
     function themeIcon(name) {

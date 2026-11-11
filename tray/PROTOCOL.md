@@ -70,7 +70,7 @@ An item has these keys:
 | `icon` | The name of a picture to show beside it in a panel (see below). |
 | `detail` | A second line of text under the label, such as a site's URL and PHP version. |
 
-`icon` and `detail` are for icons that draw a panel: the Plasma widget, and the Windows and macOS ones. The Linux one leaves them out. `mitem` picks an `icon` from the item's action, unless it's given one. The names are `dashboard`, `site`, `open`, `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh` and `quit`. An icon that doesn't know a name shows none.
+`icon` and `detail` are for icons that draw a panel: the Plasma widget, and the Windows and macOS ones. The Linux one leaves them out. `mitem` picks an `icon` from the item's action, unless it's given one. The names are `dashboard`, `site`, `open`, `git`, `info`, `folder`, `code`, `terminal`, `log`, `remove`, `add`, `start`, `stop`, `restart`, `bug`, `tools`, `database`, `output`, `refresh`, `update` and `quit`. An icon that doesn't know a name shows none.
 
 ## The panel
 
