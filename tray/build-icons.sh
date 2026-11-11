@@ -4,6 +4,9 @@
 #   status status-icons.png, every tray icon's status icon, from status.svg. A
 #          sheet of each status and theme at each size (see below).
 #
+#   previews  tray/previews/<status>-<theme>.svg, the status icon in each
+#          status and theme, for the README. These need only Python.
+#
 # and the Windows app icon from novacore.svg, Novacore's project icon from
 # jonbp.github.io/project-icons/novacore.svg without its animation:
 #
@@ -16,23 +19,26 @@
 # Each size is rendered straight from the SVG by headless Chrome, which
 # antialiases far better than drawing it at runtime. Set CHROME to use a
 # particular one. Run it after changing an SVG, and commit the results. With no
-# arguments it builds both.
+# arguments it builds all three.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 targets=("$@")
-(( ${#targets[@]} )) || targets=(status ico)
+(( ${#targets[@]} )) || targets=(status previews ico)
 
 chrome=${CHROME:-}
-[[ -n $chrome ]] || chrome=$(command -v google-chrome || command -v chromium || command -v chromium-browser ||
-    ls "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null) ||
-    { echo "Needs Chrome or Chromium to render the SVG" >&2; exit 1; }
+find_chrome() {
+    [[ -n $chrome ]] || chrome=$(command -v google-chrome || command -v chromium || command -v chromium-browser ||
+        ls "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null) ||
+        { echo "Needs Chrome or Chromium to render the SVG" >&2; exit 1; }
+}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cp novacore.svg "$tmp/"
 
 # shot WIDTH HEIGHT OUT — a screenshot of $tmp/page.html.
 shot() {
+    find_chrome
     "$chrome" --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 \
         --default-background-color=00000000 --window-size="$1,$2" \
         --screenshot="$3" "file://$tmp/page.html" 2>/dev/null
@@ -112,6 +118,23 @@ open(out, "wb").write(png[:8] + chunk(b"IHDR", struct.pack(">II", width, height)
 EOF
             echo "Wrote tray/status-icons.png"
             ;;
+        previews)
+            # The same palette as the sheet above, at 32px, without the comment.
+            mkdir -p previews
+            python3 - <<'EOF'
+source = open("status.svg").read()
+source = source[:source.index("<!--")] + source[source.index("-->") + 3:].lstrip()
+themes = {"dark": ("#ffffff", "1", ["#17D4A4", "#768087", "#FEC82C", "#FE2C62"]),
+          "light": ("#000000", "0.85", ["#009672", "#58626A", "#C48C00", "#DE184C"])}
+for theme, (globe, opacity, badges) in themes.items():
+    for state, badge in zip(["running", "stopped", "busy", "error"], badges):
+        svg = (source.replace("{{GLOBE}}", globe).replace("{{GLOBE_OPACITY}}", opacity)
+               .replace("{{BADGE}}", badge)
+               .replace('width="24" height="24"', 'width="32" height="32"'))
+        open(f"previews/{state}-{theme}.svg", "w").write(svg)
+EOF
+            echo "Wrote tray/previews/"
+            ;;
         ico)
             sizes=(16 20 24 32 40 48 64 256)
             for n in "${sizes[@]}"; do render "$n" 1 "$tmp/$n.png"; done
@@ -133,6 +156,6 @@ open("windows/novacore.ico", "wb").write(out + b"".join(images))
 EOF
             echo "Wrote tray/windows/novacore.ico"
             ;;
-        *) echo "Unknown target '$target': use status or ico" >&2; exit 1 ;;
+        *) echo "Unknown target '$target': use status, previews or ico" >&2; exit 1 ;;
     esac
 done
