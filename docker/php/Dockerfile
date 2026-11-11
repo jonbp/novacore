@@ -31,6 +31,9 @@ RUN groupmod -o -g "${GID}" www-data \
     && usermod -o -u "${UID}" -g "${GID}" www-data \
     && chown www-data:www-data /var/www
 
+# Mailpit's sendmail, which PHP's mail() uses to hand messages to Mailpit.
+COPY --from=axllent/mailpit:v1 /mailpit /usr/local/bin/mailpit
+
 COPY conf.d/ /usr/local/etc/php/conf.d/
 COPY entrypoint.sh /usr/local/bin/novacore-entrypoint
 

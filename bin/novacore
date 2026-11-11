@@ -625,7 +625,7 @@ require_running() { is_running || fail "Novacore isn't running" "Start it with n
 start_services() {
     local services
     # shellcheck disable=SC2207
-    services=(nginx mariadb $(needed_services))
+    services=(nginx mariadb mailpit $(needed_services))
     run compose up -d --wait --remove-orphans "${services[@]}" ||
         fail "Couldn't start the containers" "Run novacore logs to see why"
     compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
@@ -709,6 +709,7 @@ cmd_up() {
     complete Ready
     echo
     detail Dashboard https://localhost
+    detail Mail https://localhost/mail/
     detail Sites "${#SITE_NAMES[@]}"
     detail Xdebug "$XDEBUG_MODE"
     ssh_agent_status
@@ -1598,7 +1599,9 @@ cmd_shell() {
 
 cmd_open() {
     local url=https://localhost
-    if [[ -n ${1:-} ]]; then
+    if [[ ${1:-} == --mail ]]; then
+        url=https://localhost/mail/
+    elif [[ -n ${1:-} ]]; then
         require_site "$1"
         url="https://${SITE_DOMAIN[SITE]}"
     fi
@@ -2208,6 +2211,7 @@ tray_menu() {
 
     if [[ $state != error ]]; then
         xdebug_menu
+        act open https://localhost/mail/; mitem "Open Mail" "$REPLY" "$off"; sub_link "$REPLY"
         act_console "Novacore · database" db shell; mitem "Database Shell" "$REPLY" "$off" icon=database; sub_link "$REPLY"
         act_console "Novacore · logs" logs; mitem "Container Logs" "$REPLY" icon=log; sub_link "$REPLY"
         act folder "$SITES_PATH"; mitem "Open Sites Folder" "$REPLY"; sub_link "$REPLY"
@@ -2760,6 +2764,7 @@ Sites:
   site info <name>            Show a site's URL, paths and database settings
   errors [site] [--clear]     Follow a site's PHP error log (logs/<site>.log), or all of them
   open [site]                 Open a site (or the dashboard) in your browser
+  mail                        Open Mailpit, which catches every email PHP sends
 
 PHP:
   php list                    Show available PHP versions
@@ -2810,6 +2815,7 @@ main() {
         site)         cmd_site "$@" ;;
         sites)        site_list ;;
         open)         cmd_open "$@" ;;
+        mail)         cmd_open --mail ;;
         php)          cmd_php "$@" ;;
         xdebug)       cmd_xdebug "$@" ;;
         shell)        cmd_shell "$@" ;;

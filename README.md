@@ -7,11 +7,12 @@
 
 ## About
 
-A local LEMP stack in Docker for PHP sites: nginx, PHP-FPM 7.4–8.5 with Xdebug, and MariaDB, driven by a small CLI.
+A local LEMP stack in Docker for PHP sites: nginx, PHP-FPM 7.4–8.5 with Xdebug, MariaDB and a mail catcher, driven by a small CLI.
 
 - **No hosts-file edits.** Sites live at `https://<name>.localhost`, which already resolves to 127.0.0.1.
 - **Trusted HTTPS.** A local certificate authority issues a certificate per site. Trust it once.
 - **PHP version per site**, switched with one command. Xdebug is built into every version.
+- **Every email caught.** Mail sent from PHP lands in an inbox at `https://localhost/mail/`, never a real one.
 - **One line of config per site**, and the CLI writes it for you.
 - **A tray icon** on Linux, KDE Plasma, macOS and Windows.
 
@@ -146,6 +147,12 @@ Config::define( 'DB_HOST', env( 'NOVACORE_DB_HOST' ) ?: env( 'DB_HOST' ) ?: '127
 
 Running `wp` on your machine needs PHP with `mysqli` (and the `mysql`/`mariadb` client for `wp db export`). If your PHP version behaves differently, use `novacore wp`.
 
+## Mail
+
+Every email PHP sends with `mail()` goes to [Mailpit](https://mailpit.axllent.org) instead of out to the internet, so it's safe to test sign-ups, password resets and order emails with real addresses. Read them at <https://localhost/mail/>, or run `novacore mail`. WordPress, and anything else built on `mail()`, needs no setup.
+
+Apps with their own SMTP settings (Laravel, Symfony Mailer, WP Mail SMTP) can send to host `mailpit`, port `1025`, without encryption. Any username and password are accepted. Caught mail is kept between restarts; Mailpit keeps the newest 500 messages.
+
 ## Updates
 
 Novacore follows upstream's images (`php:8.4-fpm`, `mariadb:11.8`, `nginx:stable-alpine`), which get patch releases and security fixes all the time. Docker keeps whichever copy it downloaded first, so bring them up to date with:
@@ -189,7 +196,7 @@ Click it for a panel with Novacore's status, your sites, Start/Stop/Restart, Xde
 
 - **Add Site…** asks for a name, PHP version, document root, and whether to create a database.
 - **Each site** expands to open it, its git remote, its folder, VS Code or Zed, a terminal, a PHP shell or its error log, switch its PHP version, show its **Info…** (with copy buttons), or remove it.
-- **Xdebug** sets the mode; **Tools** opens a database shell, container logs or the sites folder.
+- **Xdebug** sets the mode; **Tools** opens the caught mail, a database shell, container logs or the sites folder.
 - **Updates** lists newer PHP, MariaDB and nginx releases, with a button to install them.
 
 ```sh
@@ -232,7 +239,7 @@ novacore help
 
 ```
 bin/novacore               the CLI
-docker-compose.yml         nginx, mariadb, php74 … php85
+docker-compose.yml         nginx, mariadb, mailpit, php74 … php85
 docker/                    nginx, PHP-FPM and MariaDB images and config
 sites.conf                 your sites
 data/                      generated: vhosts, certificates, dashboard, compose overrides

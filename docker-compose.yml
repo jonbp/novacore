@@ -80,6 +80,22 @@ services:
       start_period: 10s
     networks: [novacore]
 
+  # Catches every email PHP sends, shown at https://localhost/mail/. PHP's
+  # mail() hands messages to it (see sendmail_path in zz-novacore.ini), and
+  # apps with their own SMTP settings can use mailpit:1025.
+  mailpit:
+    container_name: novacore-mailpit
+    image: axllent/mailpit:v1
+    restart: unless-stopped
+    environment:
+      MP_WEBROOT: /mail/
+      MP_DATABASE: /data/mailpit.db
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    volumes:
+      - mail-data:/data
+    networks: [novacore]
+
   php74:
     <<: *php
     container_name: novacore-php74
@@ -121,3 +137,4 @@ networks:
 
 volumes:
   db-data:
+  mail-data:
