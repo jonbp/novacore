@@ -1,0 +1,19 @@
+# Development settings, for speed over durability. Applied when MariaDB
+# starts, so run novacore up --restart after changing them.
+
+[mysqld]
+# Write the redo log to disk once a second rather than on every commit. A
+# crash of the whole machine can lose the last second; a crash of MariaDB
+# itself loses nothing. Makes imports several times faster.
+innodb_flush_log_at_trx_commit = 2
+
+# Room for a few sites' working sets, and fewer checkpoints during big imports.
+innodb_buffer_pool_size = 512M
+innodb_log_file_size = 256M
+
+# Dumps with large rows (serialized options, base64 images) import whole.
+max_allowed_packet = 256M
+
+# And for the mariadb client that novacore db import uses.
+[client]
+max_allowed_packet = 256M

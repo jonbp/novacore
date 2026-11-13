@@ -274,8 +274,8 @@ load_env() {
     export COMPOSE_FILE="docker-compose.yml:data/compose.generated.yml"
     export COMPOSE_PROFILES=php
 
-    [[ -d $DATA_DIR/certs && -d $DATA_DIR/nginx/sites && -d $DATA_DIR/nginx/www && -d $LOGS_DIR ]] ||
-        mkdir -p "$DATA_DIR/certs" "$DATA_DIR/nginx/sites" "$DATA_DIR/nginx/www" "$LOGS_DIR"
+    [[ -d $DATA_DIR/certs && -d $DATA_DIR/nginx/sites && -d $DATA_DIR/nginx/www && -d $LOGS_DIR/xdebug ]] ||
+        mkdir -p "$DATA_DIR/certs" "$DATA_DIR/nginx/sites" "$DATA_DIR/nginx/www" "$LOGS_DIR/xdebug"
     load_sites
     [[ -f $DATA_DIR/compose.generated.yml ]] || write_overrides
 }
@@ -461,6 +461,9 @@ server {
         fastcgi_param DOCUMENT_ROOT \$realpath_root;
         fastcgi_param PATH_INFO \$path_info;
         fastcgi_param HTTPS \$https if_not_empty;
+        # A request's Proxy header would otherwise reach PHP as HTTP_PROXY,
+        # which some HTTP clients use as their proxy (httpoxy).
+        fastcgi_param HTTP_PROXY "";
         fastcgi_param PHP_VALUE "error_log=/var/log/novacore/$name.log";
         fastcgi_param NOVACORE_DB_HOST mariadb;
     }
@@ -599,21 +602,43 @@ check_sites_conf() {
         fail "sites.conf lists the same site twice"
 }
 
+# Error logs past LOG_MAX_BYTES are cut down to their last LOG_KEEP_BYTES.
+LOG_MAX_BYTES=$(( 50 * 1024 * 1024 ))
+LOG_KEEP_BYTES=$(( 5 * 1024 * 1024 ))
+
+# trim_log FILE — keep only the end of a log that has grown too big, starting
+# at a whole line. The file is written over rather than replaced, as PHP may
+# have it open. Says what it did in TRIMMED.
+trim_log() {
+    local file=$1 size tmp
+    size=$(wc -c < "$file" | tr -d ' ')
+    (( size > LOG_MAX_BYTES )) || return 0
+    tmp=$(mktemp)
+    tail -c "$LOG_KEEP_BYTES" "$file" | tail -n +2 > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+    TRIMMED+=("$(basename "$file") ($(( size / 1024 / 1024 )) MB)")
+}
+
 generate() {
     check_php "$DEFAULT_PHP"
     check_sites_conf
     ensure_certs
     rm -f "$DATA_DIR"/nginx/sites/*.conf
     local i name
+    TRIMMED=()
     for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
         name=${SITE_NAMES[i]}
         [[ -d $SITES_PATH/$name ]] || warn "$name has no folder at $SITES_PATH/$name"
         write_vhost "$i"
         : >> "$LOGS_DIR/$name.log"
+        trim_log "$LOGS_DIR/$name.log"
     done
     write_overrides
     write_index
     result "Wrote config for $(count ${#SITE_NAMES[@]} site sites)"
+    (( ! ${#TRIMMED[@]} )) ||
+        result "Trimmed big error logs to their last $(( LOG_KEEP_BYTES / 1024 / 1024 )) MB: $(join ', ' "${TRIMMED[@]}")"
 }
 
 is_running() {
@@ -622,19 +647,35 @@ is_running() {
 }
 require_running() { is_running || fail "Novacore isn't running" "Start it with novacore up"; }
 
+# A checksum of everything nginx reads from Novacore: its config, the vhosts
+# and the certificates.
+nginx_config_sum() {
+    cat docker/nginx/nginx.conf docker/nginx/autoindex.xslt \
+        "$DATA_DIR"/nginx/sites/*.conf "$DATA_DIR"/certs/*.crt 2>/dev/null | cksum
+}
+
+# Have nginx load its config again, if it's changed since it last did. The
+# reload signal returns before nginx has acted on it, so then wait a moment.
+reload_nginx() {
+    local sum stamp="$DATA_DIR/nginx/.loaded"
+    sum=$(nginx_config_sum)
+    [[ $(cat "$stamp" 2>/dev/null) != "$sum" ]] || return 0
+    compose exec -T nginx nginx -s reload >/dev/null 2>&1 || return 0
+    printf '%s\n' "$sum" > "$stamp"
+    sleep 0.5
+}
+
 start_services() {
     local services
     # shellcheck disable=SC2207
     services=(nginx mariadb mailpit $(needed_services))
     run compose up -d --wait --remove-orphans "${services[@]}" ||
         fail "Couldn't start the containers" "Run novacore logs to see why"
-    compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    reload_nginx
     # The init script grants this on first run, but it can fail silently (e.g. a
     # bind mount Docker Desktop won't let the entrypoint read), so ensure it here.
     db_sql -e "GRANT ALL PRIVILEGES ON *.* TO \`$DB_USER\`@'%' WITH GRANT OPTION" >/dev/null 2>&1 ||
         warn "Couldn't give $DB_USER access to all databases"
-    # The reload signal returns before old workers retire; give them a moment.
-    sleep 0.5
     result "Running $(join ', ' "${services[@]}")"
     remove_unused_containers
 }
@@ -925,7 +966,7 @@ cmd_prune() {
 # --- Updates ---
 #
 # Novacore's images follow upstream tags (php:8.4-fpm, mariadb:11.8,
-# nginx:stable-alpine), which get patch releases and security fixes all the
+# nginx:stable-alpine, axllent/mailpit:v1), which get patch releases and security fixes all the
 # time, but Docker keeps whichever copy it first downloaded. novacore update
 # asks Docker Hub what the tags point to now, and pulls or rebuilds whatever is
 # behind. The last check is kept in data/updates for the tray and novacore up.
@@ -935,13 +976,17 @@ UPDATES_PID="$DATA_DIR/updates.pid"
 UPDATES_MAX_AGE=86400
 
 # The images to keep up to date, one per line: KEY, NAME, the upstream image,
-# Novacore's image made from it, and the variable holding its version. PHP
-# versions without an image are left out, as they're built fresh when needed.
+# Novacore's image made from it, and the variable holding its version, or for
+# an image that doesn't record one, a command (starting with /) that prints
+# it. PHP versions without an image are left out, as they're built fresh when
+# needed.
 update_targets() {
-    local mariadb nginx v
-    mariadb=$(sed -n 's/^ *image: *\(mariadb:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1)
+    local mariadb mailpit nginx v
+    mariadb=$(pulled_image mariadb)
+    mailpit=$(pulled_image axllent/mailpit)
     nginx=$(sed -n 's/^FROM *\([^ ]*\).*/\1/p' docker/nginx/Dockerfile | head -n 1)
     printf '%s\t%s\t%s\t%s\t%s\n' mariadb MariaDB "$mariadb" "$mariadb" MARIADB_VERSION
+    printf '%s\t%s\t%s\t%s\t%s\n' mailpit Mailpit "$mailpit" "$mailpit" "/mailpit version"
     printf '%s\t%s\t%s\t%s\t%s\n' nginx nginx "$nginx" novacore/nginx NGINX_VERSION
     load_built_php
     for v in "${SUPPORTED_PHP[@]}"; do
@@ -949,6 +994,10 @@ update_targets() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$(php_service "$v")" "PHP $v" "php:$v-fpm" "novacore/php:$v" PHP_VERSION
     done
 }
+
+# pulled_image REPO — the tag docker-compose.yml uses for REPO, e.g.
+# mariadb:11.8, for the images Novacore pulls rather than builds.
+pulled_image() { sed -n "s|^ *image: *\($1:[^ ]*\).*|\1|p" docker-compose.yml | head -n 1; }
 
 # short_version VERSION — e.g. 11.8.9 from MariaDB's 1:11.8.9+maria~ubu2404.
 short_version() { local v=${1#*:}; echo "${v%%[+~-]*}"; }
@@ -1008,8 +1057,10 @@ check_target() {
         printf '%s\t%s\t-\t-\tmissing\t-\t-\n' "$key" "$name"
         return
     fi
-    env=$(docker image inspect "$local" --format '{{range .Config.Env}}{{println .}}{{end}}')
-    cur=$(short_version "$(printf '%s\n' "$env" | sed -n "s/^$var=//p")")
+    if [[ $var != /* ]]; then
+        env=$(docker image inspect "$local" --format '{{range .Config.Env}}{{println .}}{{end}}')
+        cur=$(short_version "$(printf '%s\n' "$env" | sed -n "s/^$var=//p")")
+    fi
     hub_repo "$upstream"; read -r repo tag <<<"$REPLY"
 
     target_error() { printf '%s\t%s\t%s\t-\terror\t-\t%s\n' "$key" "$name" "${cur:--}" "$id"; }
@@ -1025,6 +1076,14 @@ check_target() {
             printf '%s\n' "$prev"
             return
         fi
+    fi
+    # The image doesn't record its version, so ask the program. It's left
+    # until now as it starts a container. Upstream's version stays unknown,
+    # but a moved tag is still an update.
+    if [[ $var == /* ]]; then
+        # shellcheck disable=SC2086
+        cur=$(docker run --rm --network none --entrypoint "${var%% *}" "$local" ${var#* } 2>/dev/null |
+            grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -n 1) || true
     fi
     # A pulled image that is the tag, such as MariaDB's.
     if docker image inspect "$local" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
@@ -1042,7 +1101,9 @@ check_target() {
     fi
     config=$(printf '%s' "$index" | tr -d '\n' | grep -o '"config": *{[^}]*}' | grep -o 'sha256:[0-9a-f]*' | head -n 1)
     [[ -n $config ]] && blob=$(hub "$token" "$repo" "blobs/$config") || { target_error; return; }
-    new=$(short_version "$(printf '%s' "$blob" | grep -o "\"$var=[^\"]*\"" | head -n 1 | sed "s/^\"$var=//; s/\"\$//")")
+    new=''
+    [[ $var == /* ]] ||
+        new=$(short_version "$(printf '%s' "$blob" | grep -o "\"$var=[^\"]*\"" | head -n 1 | sed "s/^\"$var=//; s/\"\$//")")
     last=$(printf '%s' "$blob" | tr -d '\n' | grep -o '"diff_ids": *\[[^]]*\]' | grep -o 'sha256:[0-9a-f]*' | tail -n 1)
     layers=$(docker image inspect "$local" --format '{{range .RootFS.Layers}}{{println .}}{{end}}')
     if [[ -n $last ]] && has_line "$layers" "$last"; then status=ok
@@ -1102,8 +1163,8 @@ load_updates() {
 # "8.4.27 → 8.4.28", or "8.4.27, system updates".
 update_change() {
     case ${UPD_STATUS[$1]} in
-        update)  REPLY="${UPD_CUR[$1]} → ${UPD_NEW[$1]}" ;;
-        rebuild) REPLY="${UPD_CUR[$1]}, system updates" ;;
+        update)  REPLY="${UPD_CUR[$1]:-?} → ${UPD_NEW[$1]:-newer}" ;;
+        rebuild) REPLY="${UPD_CUR[$1]}${UPD_CUR[$1]:+, }system updates" ;;
         error)   REPLY="${UPD_CUR[$1]}${UPD_CUR[$1]:+, }couldn't check" ;;
         *)       REPLY=${UPD_CUR[$1]} ;;
     esac
@@ -1198,7 +1259,10 @@ cmd_update() {
     print_updates
     for (( i = 0; i < ${#UPD_KEY[@]}; i++ )); do
         [[ ${UPD_STATUS[i]} == update || ${UPD_STATUS[i]} == rebuild ]] || continue
-        if [[ ${UPD_KEY[i]} == mariadb ]]; then pulls+=(mariadb); else builds+=("${UPD_KEY[i]}"); fi
+        case ${UPD_KEY[i]} in
+            mariadb|mailpit) pulls+=("${UPD_KEY[i]}") ;;
+            *)               builds+=("${UPD_KEY[i]}") ;;
+        esac
         names+=("${UPD_NAME[i]}")
     done
     if (( ! ${#names[@]} )); then
@@ -1210,7 +1274,8 @@ cmd_update() {
     # The images being replaced, to remove once nothing uses them.
     for id in ${pulls[@]+"${pulls[@]}"} ${builds[@]+"${builds[@]}"}; do
         case $id in
-            mariadb) id=$(sed -n 's/^ *image: *\(mariadb:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1) ;;
+            mariadb) id=$(pulled_image mariadb) ;;
+            mailpit) id=$(pulled_image axllent/mailpit) ;;
             nginx)   id=novacore/nginx ;;
             *)       id=novacore/php:$(service_php "$id") ;;
         esac
@@ -2751,7 +2816,7 @@ Stack:
   reload                      Regenerate config from sites.conf and apply it
   logs [service]              Follow container logs (nginx, mariadb, php84, ...)
   build [--all]               Rebuild images (--all builds every PHP version)
-  update [--check]            Install new PHP, MariaDB and nginx releases (--check only lists them)
+  update [--check]            Install new PHP, MariaDB, nginx and Mailpit releases (--check only lists them)
   prune [--cache]             Remove images of PHP versions no site uses
   trust                       Trust Novacore's local CA (one-off, uses sudo)
   tray [install|uninstall]    Add Novacore to the tray (Linux, Windows via WSL) or menu bar (macOS)

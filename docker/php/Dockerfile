@@ -4,6 +4,11 @@ FROM php:${PHP_VERSION}-fpm
 ARG UID=1000
 ARG GID=1000
 
+# WP-CLI's release and its checksum, from the .sha256 file on the release at
+# https://github.com/wp-cli/wp-cli/releases. Change both together.
+ARG WP_CLI_VERSION=2.12.0
+ARG WP_CLI_SHA256=ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c
+
 # install-php-extensions picks the right extension versions for each PHP
 # release (e.g. Xdebug 3.1 on PHP 7.4).
 COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
@@ -23,7 +28,9 @@ RUN apt-get update \
         bcmath exif gd imagick intl mysqli opcache pcntl pdo_mysql redis soap zip \
         xdebug \
         @composer \
-    && curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+    && curl -fsSL -o /usr/local/bin/wp \
+        "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
+    && echo "${WP_CLI_SHA256}  /usr/local/bin/wp" | sha256sum -c --quiet - \
     && chmod +x /usr/local/bin/wp
 
 # Run PHP as your host user so files it writes stay yours.

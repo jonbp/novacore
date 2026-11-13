@@ -91,6 +91,8 @@ novacore errors                # follow every site's log
 novacore errors blog --clear   # empty it
 ```
 
+A log that grows past 50 MB is cut down to its last 5 MB the next time you run `novacore up` or `novacore reload`.
+
 ## Xdebug
 
 ```sh
@@ -99,6 +101,8 @@ novacore xdebug off          # fastest
 novacore xdebug on           # "develop,debug" (the default)
 novacore xdebug debug,profile
 ```
+
+Profiles and traces are written to `logs/xdebug/`.
 
 `develop` mode is always active. Step debugging starts only for requests with an `XDEBUG_SESSION` cookie or query parameter (a browser extension like "Xdebug helper" sets it), and connects to your IDE on port **9003**. Map `/var/www/sites/<name>` in the container to `sites/<name>` on your machine.
 
@@ -122,6 +126,8 @@ novacore xdebug debug,profile
 ## Databases
 
 MariaDB is `mariadb:3306` from PHP and `127.0.0.1:3306` from your machine. User `novacore` / `novacore` can access every database; root's password is `root`.
+
+It's set up for speed rather than durability (see `docker/mariadb/conf.d/novacore.cnf`): commits reach the disk once a second, so a crash of the whole machine can lose the last second of writes. Imports are several times faster.
 
 ```sh
 novacore db list
@@ -155,14 +161,14 @@ Apps with their own SMTP settings (Laravel, Symfony Mailer, WP Mail SMTP) can se
 
 ## Updates
 
-Novacore follows upstream's images (`php:8.4-fpm`, `mariadb:11.8`, `nginx:stable-alpine`), which get patch releases and security fixes all the time. Docker keeps whichever copy it downloaded first, so bring them up to date with:
+Novacore follows upstream's images (`php:8.4-fpm`, `mariadb:11.8`, `nginx:stable-alpine`, `axllent/mailpit:v1`), which get patch releases and security fixes all the time. Docker keeps whichever copy it downloaded first, so bring them up to date with:
 
 ```sh
 novacore update --check   # list what's behind, e.g. PHP 8.4.27 → 8.4.28
 novacore update           # pull or rebuild those images, and restart their containers
 ```
 
-It updates the PHP versions you have images for, MariaDB and nginx, and removes the images they replace. Rebuilding a PHP image also brings its extensions, Composer and WP-CLI up to date. Checking only asks Docker Hub what each tag points to now, so it costs next to nothing against Docker Hub's limits. The tray icon checks once a day and lists what's behind under **Updates**, and `novacore up` mentions it too.
+It updates the PHP versions you have images for, MariaDB, nginx and Mailpit, and removes the images they replace. Rebuilding a PHP image also brings its extensions and Composer up to date. WP-CLI is pinned to a release, checked against its checksum, in `docker/php/Dockerfile`. Checking only asks Docker Hub what each tag points to now, so it costs next to nothing against Docker Hub's limits. The tray icon checks once a day and lists what's behind under **Updates**, and `novacore up` mentions it too.
 
 MariaDB stays on its release series (11.8): its patch releases upgrade your databases in place when they start. A new series, or a new PHP version, is a change to Novacore itself.
 
@@ -197,7 +203,7 @@ Click it for a panel with Novacore's status, your sites, Start/Stop/Restart, Xde
 - **Add Site…** asks for a name, PHP version, document root, and whether to create a database.
 - **Each site** expands to open it, its git remote, its folder, VS Code or Zed, a terminal, a PHP shell or its error log, switch its PHP version, show its **Info…** (with copy buttons), or remove it.
 - **Xdebug** sets the mode; **Tools** opens the caught mail, a database shell, container logs or the sites folder.
-- **Updates** lists newer PHP, MariaDB and nginx releases, with a button to install them.
+- **Updates** lists newer PHP, MariaDB, nginx and Mailpit releases, with a button to install them.
 
 ```sh
 novacore tray install     # on Windows, run inside WSL
