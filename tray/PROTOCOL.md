@@ -142,7 +142,7 @@ When you submit the form, its action runs with one `ID=VALUE` argument added for
 
 | Field `type` | Keys | Answer |
 |---|---|---|
-| `text` | `label`, `value`, `lowercase`, `hint`, `rules` | The trimmed text. Submit stays disabled while it's empty or breaks a rule. |
+| `text` | `label`, `value`, `lowercase`, `hint`, `rules`, `optional` | The trimmed text. Submit stays disabled while it breaks a rule, or is empty unless `optional` is `true`. |
 | `choice` | `label`, `options`, `value`, `hints` | The chosen option. `hints` maps an option to a note shown while it's chosen. |
 | `combo` | `label`, `options`, `value`, `note` | The typed or chosen text. `note` shows under it. |
 | `check` | `label`, `value` | `1` or `0`. |

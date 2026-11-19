@@ -53,6 +53,8 @@ services:
       - ./data/nginx/sites:/etc/nginx/sites:ro,z
       - ./data/nginx/www:/etc/novacore/www:ro,z
       - ./data/certs:/etc/novacore/certs:z
+      # Also in the image, but mounted so changes apply without a rebuild.
+      - ./docker/nginx/novacore-cert:/usr/local/bin/novacore-cert:ro,z
       - ${SITES_DIR:-./sites}:/var/www/sites:ro,z
     networks: [novacore]
 

@@ -364,7 +364,7 @@ class Form:
                 v = control.text().strip()
                 problem = None
                 if not v:
-                    ok = False
+                    ok = ok and bool(spec.get("optional"))
                 else:
                     for rule in spec.get("rules", []):
                         error = rule.get("error", "Not allowed").replace("{value}", v)

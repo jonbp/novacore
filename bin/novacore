@@ -254,6 +254,7 @@ load_env() {
 
     NOVACORE_TLD=${NOVACORE_TLD:-localhost}
     DEFAULT_PHP=${DEFAULT_PHP:-8.4}
+    HOSTS_FILE=${HOSTS_FILE:-auto}
     SITES_DIR=${SITES_DIR:-./sites}
     XDEBUG_MODE=${XDEBUG_MODE:-develop,debug}
     DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:-root}
@@ -285,15 +286,16 @@ load_env() {
 # Read sites.conf into arrays with an entry per site: SITE_NAMES, SITE_PHP (its
 # PHP version), SITE_ROOT (its document root, relative to its folder),
 # SITE_ROOT_CONF (the root as sites.conf has it, where "-" auto-detects),
-# SITE_DOMAIN and SITE_DB (its database). They're read once, rather than each
-# time something asks about a site, so run this again after changing
-# sites.conf or DEFAULT_PHP.
+# SITE_DOMAIN, SITE_HOSTS (its other hostnames, separated by spaces) and
+# SITE_DB (its database). They're read once, rather than each time something
+# asks about a site, so run this again after changing sites.conf or
+# DEFAULT_PHP.
 load_sites() {
-    SITE_NAMES=() SITE_PHP=() SITE_ROOT=() SITE_ROOT_CONF=() SITE_DOMAIN=() SITE_DB=()
+    SITE_NAMES=() SITE_PHP=() SITE_ROOT=() SITE_ROOT_CONF=() SITE_DOMAIN=() SITE_HOSTS=() SITE_DB=()
     [[ -f $SITES_CONF ]] || return 0
-    local line name php conf root d rest
+    local line name php conf hosts root d rest
     while IFS= read -r line || [[ -n $line ]]; do
-        read -r name php conf rest <<<"${line%%#*}" || true
+        read -r name php conf hosts rest <<<"${line%%#*}" || true
         [[ -n $name ]] || continue
         [[ ${php:--} != - ]] || php=$DEFAULT_PHP
         # "-" auto-detects common layouts, else the folder itself.
@@ -309,6 +311,8 @@ load_sites() {
         SITE_ROOT+=("$root")
         SITE_ROOT_CONF+=("$conf")
         SITE_DOMAIN+=("$name.$NOVACORE_TLD")
+        [[ ${hosts:--} != - ]] || hosts=""
+        SITE_HOSTS+=("${hosts//,/ }")
         SITE_DB+=("${name//[-.]/_}")
     done < "$SITES_CONF"
 }
@@ -333,6 +337,34 @@ check_name() {
     [[ $1 != default ]] || fail "'default' is a reserved name"
 }
 
+# check_root DIR — a document root: "-" to auto-detect, "." for the site's
+# folder, or a folder inside it.
+check_root() {
+    [[ $1 =~ ^[A-Za-z0-9._/-]+$ ]] ||
+        fail "Invalid document root '$1'" "Use a folder inside the site's folder, such as public or web/app"
+    [[ $1 != /* && /$1/ != */../* ]] ||
+        fail "The document root must be inside the site's folder" "Give it relative to the folder, such as public"
+}
+
+# check_host HOST — a site's own hostname, such as blog.test.
+check_host() {
+    [[ $1 =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
+        fail "Invalid hostname '$1'" "Use lowercase letters, numbers, hyphens and dots, such as blog.test"
+}
+
+# parse_hosts LIST... — REPLY = the hostnames in LISTs, separated by commas or
+# spaces, lowercased and checked, one space between each. "-" is none.
+parse_hosts() {
+    local list h out=()
+    list=$(printf '%s ' "$@" | tr ',[:upper:]' ' [:lower:]')
+    for h in $list; do
+        [[ $h != - ]] || continue
+        check_host "$h"
+        [[ " ${out[*]-} " == *" $h "* ]] || out+=("$h")
+    done
+    REPLY=${out[*]-}
+}
+
 check_php() {
     local v
     for v in "${SUPPORTED_PHP[@]}"; do [[ $v == "$1" ]] && return 0; done
@@ -345,18 +377,27 @@ sites_conf_init() {
 # Novacore sites, one per line. Edit by hand and run `novacore reload`, or use
 # `novacore site add` / `novacore php <site> <version>`.
 #
-# php:  PHP version, or "-" for DEFAULT_PHP from .env
-# root: document root inside the site folder, or "-" to auto-detect
-#       (public, web, public_html, htdocs, else the folder itself)
+# php:   PHP version, or "-" for DEFAULT_PHP from .env
+# root:  document root inside the site folder, or "-" to auto-detect
+#        (public, web, public_html, htdocs, else the folder itself)
+# hosts: optional, more hostnames for the site, separated by commas, such as
+#        blog.test,www.blog.test. Novacore adds them to your hosts file.
 #
-# name          php     root
+# name          php     root            hosts
 EOF
 }
 
-# sites_conf_set NAME PHP ROOT — replace the site's line, or append one.
+# sites_conf_set NAME PHP ROOT [HOSTS] — replace the site's line, or append
+# one. HOSTS are separated by spaces.
 sites_conf_set() {
+    local line hosts=${4:-}
     sites_conf_init
-    rewrite "$SITES_CONF" -v n="$1" -v line="$(printf '%-15s %-7s %s' "$1" "$2" "$3")" '
+    line=$(printf '%-15s %-7s %s' "$1" "$2" "$3")
+    if [[ -n $hosts ]]; then
+        hosts=${hosts// /,}
+        line=$(printf '%-15s %-7s %-15s %s' "$1" "$2" "$3" "$hosts")
+    fi
+    rewrite "$SITES_CONF" -v n="$1" -v line="$line" '
         { s = $0; sub(/#.*/, "", s); split(s, f) }
         f[1] == n { if (!done) print line; done = 1; next }
         { print }
@@ -411,23 +452,39 @@ remove_unused_containers() {
     result "Stopped PHP $(join ', ' "${versions[@]}"), which no site uses"
 }
 
+# Issue the certificates that are missing, and reissue a site's when its
+# hostnames change. Each covers the domain, its subdomains and the site's
+# other hostnames, which data/certs/DOMAIN.hosts records.
 ensure_certs() {
-    local missing=() d
-    for d in localhost ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"}; do
-        [[ -f $DATA_DIR/certs/$d.crt ]] || missing+=("$d")
+    local args=() names=() i d hosts dir=$DATA_DIR/certs
+    [[ -f $dir/localhost.crt ]] || { args+=(localhost); names+=(localhost); }
+    for (( i = 0; i < ${#SITE_DOMAIN[@]}; i++ )); do
+        d=${SITE_DOMAIN[i]} hosts=${SITE_HOSTS[i]}
+        [[ ! -f $dir/$d.crt || $(cat "$dir/$d.hosts" 2>/dev/null) != "$hosts" ]] || continue
+        if [[ -n $hosts ]]; then args+=("$d,${hosts// /,}"); else args+=("$d"); fi
+        names+=("$d")
     done
-    (( ${#missing[@]} )) || return 0
+    (( ${#args[@]} )) || return 0
     run compose run --rm --no-deps -T --user "$(id -u):$(id -g)" \
-        --entrypoint novacore-cert nginx "${missing[@]}" ||
+        --entrypoint novacore-cert nginx "${args[@]}" ||
         fail "Couldn't issue certificates"
-    result "Issued $(count ${#missing[@]} certificate certificates): $(join ', ' "${missing[@]}")"
+    for (( i = 0; i < ${#SITE_DOMAIN[@]}; i++ )); do
+        d=${SITE_DOMAIN[i]}
+        if [[ -n ${SITE_HOSTS[i]} ]]; then printf '%s\n' "${SITE_HOSTS[i]}" > "$dir/$d.hosts"
+        else rm -f "$dir/$d.hosts"
+        fi
+    done
+    result "Issued $(count ${#names[@]} certificate certificates): $(join ', ' "${names[@]}")"
 }
 
 # write_vhost INDEX — a site's nginx config.
 write_vhost() {
     local name=${SITE_NAMES[$1]} php=${SITE_PHP[$1]} root=${SITE_ROOT[$1]} dom=${SITE_DOMAIN[$1]} docroot
+    local names="$dom *.$dom${SITE_HOSTS[$1]:+ ${SITE_HOSTS[$1]}}"
     docroot="/var/www/sites/$name"
-    [[ $root == . ]] || docroot+="/${root#./}"
+    root=${root#./}
+    root=${root%/}
+    [[ $root == . || -z $root ]] || docroot+="/$root"
 
     cat > "$DATA_DIR/nginx/sites/$name.conf" <<EOF
 # Generated by novacore from sites.conf. Changes here are overwritten.
@@ -435,7 +492,7 @@ server {
     listen 80;
     listen 443 ssl;
     http2 on;
-    server_name $dom *.$dom;
+    server_name $names;
 
     ssl_certificate     /etc/novacore/certs/$dom.crt;
     ssl_certificate_key /etc/novacore/certs/$dom.key;
@@ -528,7 +585,8 @@ write_overrides() {
         echo "    networks:"
         echo "      novacore:"
         echo "        aliases:"
-        for d in ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"}; do echo "          - $d"; done
+        # shellcheck disable=SC2068
+        for d in ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"} ${SITE_HOSTS[@]+${SITE_HOSTS[@]}}; do echo "          - $d"; done
         (( ${#SITE_DOMAIN[@]} )) || echo "          - novacore.$NOVACORE_TLD"
 
         # Share the host's SSH agent, known hosts and SSH config with PHP, for
@@ -575,10 +633,13 @@ ssh_agent_status() {
 # Fill in the dashboard template (dashboard/index.html) served at https://localhost,
 # alongside its icon.
 write_index() {
-    local i dom rows="" page
+    local i dom h rows="" links page
     for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
-        dom=${SITE_DOMAIN[i]}
-        rows+="<tr><td><a href=\"https://$dom\" target=\"_blank\" rel=\"noopener\">$dom</a></td><td>PHP ${SITE_PHP[i]}</td><td><code>${SITE_DB[i]}</code></td><td><code>${SITE_ROOT[i]}</code></td></tr>"
+        links=""
+        for dom in ${SITE_DOMAIN[i]} ${SITE_HOSTS[i]}; do
+            links+="${links:+<br>}<a href=\"https://$dom\" target=\"_blank\" rel=\"noopener\">$dom</a>"
+        done
+        rows+="<tr><td>$links</td><td>PHP ${SITE_PHP[i]}</td><td><code>${SITE_DB[i]}</code></td><td><code>${SITE_ROOT[i]}</code></td></tr>"
     done
     [[ -n $rows ]] || rows='<tr><td colspan="4">No sites yet. Run <code>novacore site add &lt;name&gt;</code>.</td></tr>'
 
@@ -593,13 +654,193 @@ write_index() {
 }
 
 check_sites_conf() {
-    local i
+    local i h dup
     for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
         check_name "${SITE_NAMES[i]}"
         check_php "${SITE_PHP[i]}"
+        check_root "${SITE_ROOT_CONF[i]}"
+        for h in ${SITE_HOSTS[i]}; do check_host "$h"; done
     done
     [[ -z $(printf '%s\n' ${SITE_NAMES[@]+"${SITE_NAMES[@]}"} | sort | uniq -d) ]] ||
         fail "sites.conf lists the same site twice"
+    # shellcheck disable=SC2068
+    dup=$(printf '%s\n' ${SITE_DOMAIN[@]+"${SITE_DOMAIN[@]}"} ${SITE_HOSTS[@]+${SITE_HOSTS[@]}} | sort | uniq -d | head -n 1)
+    [[ -z $dup ]] || fail "sites.conf gives $dup to more than one site"
+}
+
+# --- Hosts file --------------------------------------------------------------
+#
+# *.localhost finds its way to 127.0.0.1 by itself, but a site's other
+# hostnames (and every site, with a NOVACORE_TLD other than localhost) need a
+# hosts file entry. Novacore writes them all to data/hosts, which dnsmasq
+# (addn-hosts) or a hosts manager can read, and keeps a marked block of them in
+# step in the hosts file that HOSTS_FILE in .env names: "auto" for the
+# system's, "none", or a path.
+#
+# On WSL, "auto" is Windows' hosts file, which the browsers on Windows read.
+# WSL rewrites its own /etc/hosts when it starts, and looks names up through
+# Windows anyway (DNS tunnelling), so the Windows entries serve both.
+
+HOSTS_BEGIN="# BEGIN Novacore. Managed by novacore from sites.conf; changes here are overwritten."
+HOSTS_END="# END Novacore"
+
+# The address the entries point at: where nginx listens.
+hosts_ip() {
+    case ${BIND_ADDRESS:-127.0.0.1} in
+        0.0.0.0|::|'[::]') echo 127.0.0.1 ;;
+        *)                 echo "${BIND_ADDRESS:-127.0.0.1}" ;;
+    esac
+}
+
+# The entries, one per hostname: "IP<tab>HOST<tab># SITE".
+hosts_entries() {
+    local i h ip
+    ip=$(hosts_ip)
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        for h in ${SITE_DOMAIN[i]} ${SITE_HOSTS[i]}; do
+            [[ $h == *.localhost ]] || printf '%s\t%s\t# %s\n' "$ip" "$h" "${SITE_NAMES[i]}"
+        done
+    done
+}
+
+# hosts_merge BLOCK — print stdin, a hosts file, with its Novacore block
+# replaced by BLOCK (or added at the end, or removed if BLOCK is empty).
+hosts_merge() {
+    # Blank lines are held back, so the one before a removed block goes too.
+    BLOCK=$1 awk '
+        index($0, "# BEGIN Novacore") == 1 {
+            if (ENVIRON["BLOCK"] != "" && !done) { printf "%s", blanks; print ENVIRON["BLOCK"] }
+            blanks = ""; done = 1; skip = 1; next
+        }
+        skip { if (index($0, "# END Novacore") == 1) skip = 0; next }
+        $0 == "" { blanks = blanks "\n"; next }
+        { printf "%s", blanks; blanks = ""; print; last = $0 }
+        END {
+            printf "%s", blanks
+            if (done || ENVIRON["BLOCK"] == "") exit
+            if (last != "" && blanks == "") print ""
+            print ENVIRON["BLOCK"]
+        }'
+}
+
+# The hosts files to keep the block in, in HOSTS_TARGETS. "windows" is the
+# Windows one, from WSL.
+hosts_targets() {
+    HOSTS_TARGETS=()
+    case ${HOSTS_FILE:-auto} in
+        none) ;;
+        auto)
+            if is_wsl && command -v powershell.exe >/dev/null; then HOSTS_TARGETS=(windows)
+            else HOSTS_TARGETS=(/etc/hosts)
+            fi
+            ;;
+        *) HOSTS_TARGETS=("$HOSTS_FILE") ;;
+    esac
+}
+
+# The Windows hosts file, as WSL sees it.
+windows_hosts_path() { wslpath -u 'C:\Windows\System32\drivers\etc\hosts' 2>/dev/null; }
+
+# hosts_current TARGET — print a hosts file, without Windows' line endings.
+hosts_current() {
+    local file=$1
+    [[ $file != windows ]] || file=$(windows_hosts_path)
+    [[ -f $file ]] || return 0
+    tr -d '\r' < "$file"
+}
+
+# hosts_wanted TARGET — print the hosts file as it should be.
+hosts_wanted() {
+    local entries block=""
+    entries=$(hosts_entries)
+    [[ -z $entries ]] || block="$HOSTS_BEGIN"$'\n'"$entries"$'\n'"$HOSTS_END"
+    hosts_current "$1" | hosts_merge "$block"
+}
+
+# write_as_root FILE SOURCE — copy SOURCE's contents over FILE, asking for
+# root if need be: sudo in a terminal, or a password dialog (polkit on Linux,
+# macOS's own) for the tray icons. Writing over FILE, rather than replacing
+# it, keeps its owner, permissions and SELinux label.
+write_as_root() {
+    local file=$1 src=$2
+    if [[ -w $file || ( ! -e $file && -w $(dirname "$file") ) ]]; then
+        cat "$src" > "$file"
+    elif sudo -n true 2>/dev/null; then
+        sudo tee "$file" < "$src" > /dev/null
+    elif [[ -t 0 ]]; then
+        note "Updating $file needs sudo."
+        sudo tee "$file" < "$src" > /dev/null
+    elif [[ $(uname) == Darwin ]]; then
+        osascript -e "do shell script \"cat '$src' > '$file'\" with administrator privileges" >/dev/null 2>&1
+    elif command -v pkexec >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
+        pkexec sh -c 'cat "$1" > "$2"' sh "$src" "$file" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+# write_windows_hosts SOURCE — copy SOURCE over Windows' hosts file, through
+# PowerShell run as an administrator, so Windows asks first (UAC). SOURCE is
+# copied to Windows' temp folder for it, as that PowerShell may not see WSL.
+write_windows_hosts() {
+    local temp inner
+    temp=$(printf '%s\n' '[IO.Path]::GetTempPath()' | windows_ps) || return 1
+    temp="${temp%\\}\\novacore-hosts.txt"
+    sed 's/$/\r/' "$1" > "$(wslpath -u "$temp")" || return 1
+    inner=$(printf '%s' "[IO.File]::WriteAllBytes((Join-Path \$env:SystemRoot 'System32\\drivers\\etc\\hosts'), [IO.File]::ReadAllBytes('$temp'))" |
+        iconv -f utf-8 -t utf-16le | base64 -w0)
+    windows_ps >/dev/null 2>&1 <<EOF || true
+\$p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', '$inner'
+exit \$p.ExitCode
+EOF
+    rm -f "$(wslpath -u "$temp")"
+    # Declining the prompt doesn't always show in the exit code, so check.
+    [[ $(hosts_current windows) == "$(cat "$1")" ]]
+}
+
+# hosts_name TARGET — how to refer to a hosts file.
+hosts_name() { if [[ $1 == windows ]]; then echo "the Windows hosts file"; else echo "$1"; fi; }
+
+# Write data/hosts, and bring the hosts files' blocks in line with it. Ones
+# that couldn't be updated go in HOSTS_STALE.
+write_hosts() {
+    local entries
+    entries=$(hosts_entries)
+    {
+        echo "# Generated by novacore: the hostnames your sites need, for a hosts file,"
+        echo "# dnsmasq (addn-hosts) or a hosts manager. *.localhost needs no entry."
+        [[ -z $entries ]] || printf '%s\n' "$entries"
+    } > "$DATA_DIR/hosts"
+}
+
+# Bring each hosts file's block in line with sites.conf, saying what changed.
+# HOSTS_UPDATED counts the files it updated, and HOSTS_STALE lists the ones
+# it couldn't.
+sync_hosts() {
+    local target tmp name
+    HOSTS_STALE=() HOSTS_UPDATED=0
+    hosts_targets
+    tmp=$(mktemp)
+    for target in ${HOSTS_TARGETS[@]+"${HOSTS_TARGETS[@]}"}; do
+        hosts_wanted "$target" > "$tmp"
+        [[ $(hosts_current "$target") != "$(cat "$tmp")" ]] || continue
+        name=$(hosts_name "$target")
+        if [[ $target == windows ]]; then
+            note "Windows will ask to let PowerShell make changes, to update its hosts file." 33
+            if write_windows_hosts "$tmp"; then result "Updated $name"; (( ++HOSTS_UPDATED )); continue; fi
+        elif write_as_root "$target" "$tmp"; then
+            result "Updated $name"
+            (( ++HOSTS_UPDATED ))
+            continue
+        fi
+        warn "Couldn't update $name"
+        HOSTS_STALE+=("$target")
+    done
+    rm -f "$tmp"
+    if (( ${#HOSTS_STALE[@]} )); then
+        hint "Run novacore hosts sync in a terminal, or add the entries in $DATA_DIR/hosts yourself"
+    fi
+    return 0
 }
 
 # Error logs past LOG_MAX_BYTES are cut down to their last LOG_KEEP_BYTES.
@@ -636,9 +877,11 @@ generate() {
     done
     write_overrides
     write_index
+    write_hosts
     result "Wrote config for $(count ${#SITE_NAMES[@]} site sites)"
     (( ! ${#TRIMMED[@]} )) ||
         result "Trimmed big error logs to their last $(( LOG_KEEP_BYTES / 1024 / 1024 )) MB: $(join ', ' "${TRIMMED[@]}")"
+    sync_hosts
 }
 
 is_running() {
@@ -850,7 +1093,10 @@ status_json() {
     for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
         jobj name "${SITE_NAMES[i]}" url "https://${SITE_DOMAIN[i]}" php "${SITE_PHP[i]}" root "${SITE_ROOT[i]}" \
             path "$SITES_PATH/${SITE_NAMES[i]}" database "${SITE_DB[i]}" errorLog "$LOGS_DIR/${SITE_NAMES[i]}.log"
-        printf '%s%s' "$sep" "$REPLY"
+        local site=$REPLY
+        # shellcheck disable=SC2086
+        jstrs ${SITE_HOSTS[i]}
+        printf '%s%s' "$sep" "${site%\}},\"hosts\":$REPLY}"
         sep=,
     done
     printf ']}\n'
@@ -1328,10 +1574,12 @@ EOF
 }
 
 site_add() {
-    local name="" php=$DEFAULT_PHP root=- db=1
-    local usage="Usage: novacore site add <name> [--php X.Y] [--root DIR] [--no-db]"
+    local name="" php=$DEFAULT_PHP root=- db=1 hosts=() h
+    local usage="Usage: novacore site add <name> [--php X.Y] [--root DIR] [--host HOST]... [--no-db]"
     while (( $# )); do
         case $1 in
+            --host|--hosts) [[ -n ${2:-} ]] || fail "$1 needs a hostname"; hosts+=("$2"); shift 2 ;;
+            --host=*|--hosts=*) hosts+=("${1#*=}"); shift ;;
             --php)    php=${2:-}; [[ -n $php ]] || fail "--php needs a version"; shift 2 ;;
             --php=*)  php=${1#*=}; shift ;;
             --root)   root=${2:-}; [[ -n $root ]] || fail "--root needs a directory"; shift 2 ;;
@@ -1344,7 +1592,10 @@ site_add() {
     [[ -n $name ]] || fail "Which site?" "$usage"
     check_name "$name"
     check_php "$php"
+    check_root "$root"
+    parse_hosts ${hosts[@]+"${hosts[@]}"}; hosts=$REPLY
     ! site_index "$name" || fail "Site '$name' already exists"
+    for h in $hosts; do check_host_free "$h" "$name"; done
 
     header "Adding $name"
     ensure_php_image "$php"
@@ -1361,7 +1612,7 @@ site_add() {
         result "Using the existing folder $dir"
     fi
 
-    sites_conf_set "$name" "$php" "$root"
+    sites_conf_set "$name" "$php" "$root" "$hosts"
     apply
     site_index "$name"
 
@@ -1379,6 +1630,7 @@ site_add() {
     complete "Added $name"
     echo
     detail URL "https://${SITE_DOMAIN[SITE]}"
+    for h in $hosts; do detail "" "https://$h"; done
     detail PHP "$php"
     detail "Doc root" "${SITE_ROOT[SITE]}"
     if (( db )); then
@@ -1417,9 +1669,10 @@ site_info() {
 
     heading "$name"
     detail URL "https://${SITE_DOMAIN[SITE]}"
+    for i in ${SITE_HOSTS[SITE]}; do detail "" "https://$i"; done
     detail PHP "${SITE_PHP[SITE]}"
     detail Folder "$SITES_PATH/$name"
-    detail "Doc root" "${SITE_ROOT[SITE]}"
+    detail "Doc root" "$(root_label "$SITE")"
     detail "Error log" "$LOGS_DIR/$name.log"
 
     heading Database
@@ -1455,7 +1708,7 @@ site_rm() {
 
     header "Removing $name"
     local dbname=${SITE_DB[SITE]}
-    rm -f "$DATA_DIR/certs/${SITE_DOMAIN[SITE]}".{crt,key}
+    rm -f "$DATA_DIR/certs/${SITE_DOMAIN[SITE]}".{crt,key,hosts}
     sites_conf_remove "$name"
     apply
     if (( drop_db )); then
@@ -1468,15 +1721,130 @@ site_rm() {
     echo
 }
 
+# check_host_free HOST SITE — fail if another site than SITE has HOST.
+check_host_free() {
+    local i
+    for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
+        [[ ${SITE_NAMES[i]} != "$2" ]] || continue
+        [[ $1 != "${SITE_DOMAIN[i]}" && " ${SITE_HOSTS[i]} " != *" $1 "* ]] ||
+            fail "$1 already belongs to ${SITE_NAMES[i]}"
+    done
+}
+
+# root_label INDEX — a site's document root, and whether it was auto-detected.
+root_label() {
+    local root=${SITE_ROOT[$1]}
+    [[ $root != . ]] || root="the site's folder"
+    if [[ ${SITE_ROOT_CONF[$1]} == - ]]; then echo "$root (auto-detected)"; else echo "$root"; fi
+}
+
+# site_save NAME PHP ROOT HOSTS MESSAGE — change a site's line in sites.conf,
+# and apply it.
+site_save() {
+    local name=$1 dir
+    header "$5"
+    dir="$SITES_PATH/$name"
+    [[ $3 == - || -d $dir/$3 ]] || warn "There's no folder at $dir/$3 yet"
+    sites_conf_set "$name" "$2" "$3" "$4"
+    apply
+    finish "$5"
+}
+
+# site root NAME [DIR] — show or change a site's document root.
+site_root() {
+    local name=${1:-} root=${2:-}
+    [[ -n $name ]] || fail "Which site?" "Usage: novacore site root <name> [DIR|-]"
+    require_site "$name"
+    if [[ -z $root ]]; then root_label "$SITE"; return; fi
+    root=${root%/}
+    root=${root#./}
+    [[ -n $root ]] || root=.
+    check_root "$root"
+    [[ $root != "${SITE_ROOT_CONF[SITE]}" ]] || { note "$name's document root is already $root"; return; }
+    site_save "$name" "${SITE_PHP[SITE]}" "$root" "${SITE_HOSTS[SITE]}" "$name's document root → $root"
+}
+
+# site hosts NAME [add|rm HOST...] — list, add or remove a site's other
+# hostnames.
+site_hosts() {
+    local name=${1:-} sub=${2:-} hosts h new=() usage="Usage: novacore site hosts <name> [add|rm <host>...]"
+    [[ -n $name ]] || fail "Which site?" "$usage"
+    require_site "$name"
+    hosts=${SITE_HOSTS[SITE]}
+    if [[ -z $sub ]]; then
+        if [[ -z $hosts ]]; then note "$name has no other hostnames. Add one with novacore site hosts $name add <host>."
+        else printf '%s\n' $hosts
+        fi
+        return
+    fi
+    shift 2
+    (( $# )) || fail "Which hostnames?" "$usage"
+    parse_hosts "$@"
+    case $sub in
+        add)
+            for h in $REPLY; do
+                check_host_free "$h" "$name"
+                [[ " $hosts " == *" $h "* ]] || hosts+="${hosts:+ }$h"
+            done
+            ;;
+        rm|remove)
+            for h in $REPLY; do
+                [[ " $hosts " == *" $h "* ]] || fail "$name doesn't have the hostname $h"
+            done
+            for h in $hosts; do [[ " $REPLY " == *" $h "* ]] || new+=("$h"); done
+            hosts=${new[*]-}
+            ;;
+        *) fail "Unknown command 'site hosts $name $sub'" "$usage" ;;
+    esac
+    [[ $hosts != "${SITE_HOSTS[SITE]}" ]] || { note "Nothing to change"; return; }
+    site_save "$name" "${SITE_PHP[SITE]}" "${SITE_ROOT_CONF[SITE]}" "$hosts" "Updated $name's hostnames"
+}
+
+# site edit NAME [--root DIR] [--hosts HOSTS] — change several things at once,
+# as the tray's Settings dialog does. --hosts replaces them all ("" or "-" for
+# none).
+site_edit() {
+    local name="" root="" hosts="" set_hosts=0 h usage="Usage: novacore site edit <name> [--root DIR] [--hosts HOST,...]"
+    while (( $# )); do
+        case $1 in
+            --root)    root=${2:-}; [[ -n $root ]] || fail "--root needs a directory"; shift 2 ;;
+            --root=*)  root=${1#*=}; shift ;;
+            --hosts|--host) (( $# >= 2 )) || fail "$1 needs hostnames"; hosts=$2; set_hosts=1; shift 2 ;;
+            --hosts=*|--host=*) hosts=${1#*=}; set_hosts=1; shift ;;
+            -*)        fail "Unknown option '$1'" "$usage" ;;
+            *)         [[ -z $name ]] || fail "Unexpected argument '$1'"; name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]] || fail "Which site?" "$usage"
+    require_site "$name"
+    [[ -n $root ]] || root=${SITE_ROOT_CONF[SITE]}
+    root=${root%/}
+    root=${root#./}
+    [[ -n $root ]] || root=.
+    check_root "$root"
+    if (( set_hosts )); then
+        parse_hosts "$hosts"; hosts=$REPLY
+        for h in $hosts; do check_host_free "$h" "$name"; done
+    else
+        hosts=${SITE_HOSTS[SITE]}
+    fi
+    if [[ $root == "${SITE_ROOT_CONF[SITE]}" && $hosts == "${SITE_HOSTS[SITE]}" ]]; then
+        note "Nothing to change"
+        return
+    fi
+    site_save "$name" "${SITE_PHP[SITE]}" "$root" "$hosts" "Updated $name"
+}
+
 site_list() {
     if (( ! ${#SITE_NAMES[@]} )); then
         note "No sites yet. Add one with novacore site add <name>."
         return
     fi
-    local i
+    local i h
     note "$(printf '%-36s %-6s %s' URL PHP ROOT)"
     for (( i = 0; i < ${#SITE_NAMES[@]}; i++ )); do
         printf '  %-36s %-6s %s\n' "https://${SITE_DOMAIN[i]}" "${SITE_PHP[i]}" "${SITE_ROOT[i]}"
+        for h in ${SITE_HOSTS[i]}; do printf '  %s\n' "$(color "https://$h" 90)"; done
     done
 }
 
@@ -1488,7 +1856,55 @@ cmd_site() {
         rm|remove)    site_rm "$@" ;;
         ls|list)      site_list ;;
         info)         site_info "$@" ;;
-        *)            fail "Unknown command 'site $sub'" "Try site add, rm, list or info" ;;
+        root)         site_root "$@" ;;
+        hosts|host)   site_hosts "$@" ;;
+        edit)         site_edit "$@" ;;
+        *)            fail "Unknown command 'site $sub'" "Try site add, rm, list, info, root, hosts or edit" ;;
+    esac
+}
+
+# hosts [sync] — show the hosts file entries Novacore needs and whether each
+# hosts file has them, or bring them up to date.
+cmd_hosts() {
+    local target entries
+    hosts_targets
+    case ${1:-} in
+        "")
+            entries=$(hosts_entries)
+            heading "Entries"
+            if [[ -z $entries ]]; then
+                note "None needed: every site is on .localhost, and none has other hostnames."
+            else
+                printf '%s\n' "$entries" | while IFS=$'\t' read -r ip host site; do
+                    printf '  %-15s %-36s %s\n' "$ip" "$host" "$(color "$site" 90)"
+                done
+            fi
+            note "Also in $DATA_DIR/hosts"
+            heading "Hosts files"
+            if (( ! ${#HOSTS_TARGETS[@]} )); then
+                note "None: HOSTS_FILE is none in .env, so add the entries yourself."
+            fi
+            for target in ${HOSTS_TARGETS[@]+"${HOSTS_TARGETS[@]}"}; do
+                if [[ $(hosts_current "$target") == "$(hosts_wanted "$target")" ]]; then
+                    printf '  %s\n' "$(color "✔ $(hosts_name "$target")" 32)"
+                else
+                    printf '  %s  %s\n' "$(color "! $(hosts_name "$target")" 33)" "$(color "out of date: run novacore hosts sync" 90)"
+                fi
+            done
+            echo
+            ;;
+        sync)
+            header "Hosts file"
+            heading "Hosts files"
+            write_hosts
+            sync_hosts
+            (( ${#HOSTS_STALE[@]} || HOSTS_UPDATED || ! ${#HOSTS_TARGETS[@]} )) || result "Already up to date"
+            (( ${#HOSTS_TARGETS[@]} )) || note "HOSTS_FILE is none in .env, so only $DATA_DIR/hosts was written."
+            (( ! ${#HOSTS_STALE[@]} )) || fail "Couldn't update $(hosts_name "${HOSTS_STALE[0]}")"
+            complete Done
+            echo
+            ;;
+        *) fail "Unknown command 'hosts $1'" "Usage: novacore hosts [sync]" ;;
     esac
 }
 
@@ -1522,7 +1938,7 @@ cmd_php() {
             check_php "$version"
             header "$name → PHP $version"
             ensure_php_image "$version"
-            sites_conf_set "$name" "$version" "${SITE_ROOT_CONF[SITE]}"
+            sites_conf_set "$name" "$version" "${SITE_ROOT_CONF[SITE]}" "${SITE_HOSTS[SITE]}"
             apply
             complete "$name now runs PHP $version"
             echo
@@ -2071,7 +2487,9 @@ info_dialog() {
     [[ $root == . ]] && root=$path || root="$path/$root"
     [[ -z $WSL_ROOT ]] || wsl=("In Windows" "$WSL_ROOT${path//\//\\}")
 
-    info_section Site URL "$url" PHP "${SITE_PHP[$1]}" Folder "$path" ${wsl[@]+"${wsl[@]}"} \
+    local hosts=()
+    for i in ${SITE_HOSTS[$1]}; do hosts+=("Also at" "https://$i"); done
+    info_section Site URL "$url" ${hosts[@]+"${hosts[@]}"} PHP "${SITE_PHP[$1]}" Folder "$path" ${wsl[@]+"${wsl[@]}"} \
         "Document root" "$root" "Error log" "$LOGS_DIR/$name.log"
     sections+=("$REPLY")
     info_section Database Name "${SITE_DB[$1]}" User "$DB_USER" Password "$DB_PASSWORD" \
@@ -2128,6 +2546,25 @@ add_site_dialog() {
 '"$php,$root,$db"'],"action":'"$action"'}'
 }
 
+# edit_site_dialog INDEX — the Settings dialog for a site: its document root
+# and other hostnames.
+edit_site_dialog() {
+    local name=${SITE_NAMES[$1]} root=${SITE_ROOT_CONF[$1]} hosts options root_field hosts_field action
+    [[ $root != - ]] || root=Auto-detect
+    options=(Auto-detect public web public_html htdocs)
+    [[ " ${options[*]} " == *" $root "* ]] || options+=("$root")
+    jstrs "${options[@]}"; options=$REPLY
+    js "$root"
+    root_field='{"id":"root","type":"combo","label":"Document root","options":'"$options"',"value":'"$REPLY"',"note":"Auto-detect looks for public, web, public_html or htdocs. Use . for the folder itself."}'
+    js "${SITE_HOSTS[$1]}"; hosts=$REPLY
+    hosts_field='{"id":"hosts","type":"text","label":"Other hostnames","value":'"$hosts"',"optional":true,"lowercase":true,"hint":"Novacore adds these to your hosts file, with HTTPS.","rules":[
+{"match":"^[a-z0-9.-]+([ ,]+[a-z0-9.-]+)*[ ,]*$","error":"Use hostnames like '"$name"'.test, separated by spaces."}]}'
+    act_run "Updating ${name}…" "Updated $name" "" tray submit edit-site "site=$name"
+    action=$REPLY
+    js "$name Settings"
+    REPLY='{"dialog":"form","title":'"$REPLY"',"submit":"Save","fields":['"$root_field,$hosts_field"'],"action":'"$action"'}'
+}
+
 # remove_site_dialog INDEX — the Remove dialog for a site.
 remove_site_dialog() {
     local name=${SITE_NAMES[$1]} path="$SITES_PATH/${SITE_NAMES[$1]}" text db action
@@ -2151,6 +2588,7 @@ site_menu() {
         act open "$REPO_URL"; mitem "Open on $REPO_LABEL" "$REPLY" icon=git; sub_link "$REPLY"
     fi
     info_dialog "$1"; mitem "Info…" "$REPLY"; sub_link "$REPLY"
+    edit_site_dialog "$1"; mitem "Settings…" "$REPLY" idle icon=tools; sub_link "$REPLY"
     sub_break
     act folder "$path"; mitem "Open Folder" "$REPLY"; sub_link "$REPLY"
     act editor "$path" app vscode; mitem "Open in VS Code" "$REPLY"; sub_link "$REPLY"
@@ -2303,13 +2741,14 @@ tray_menu() {
 # tray submit FORM FIELD=VALUE... — for the tray icons: run the command a
 # dialog from tray_menu stands for, given its answers.
 tray_submit() {
-    local form=${1:-} kv name="" php="" root="" db=0 drop_db=0 site="" args=()
+    local form=${1:-} kv name="" php="" root="" hosts="" db=0 drop_db=0 site="" args=()
     shift || true
     for kv in "$@"; do
         case $kv in
             name=*)    name=${kv#*=} ;;
             php=*)     php=${kv#*=} ;;
             root=*)    root=${kv#*=} ;;
+            hosts=*)   hosts=${kv#*=} ;;
             db=*)      db=${kv#*=} ;;
             drop-db=*) drop_db=${kv#*=} ;;
             site=*)    site=${kv#*=} ;;
@@ -2321,6 +2760,10 @@ tray_submit() {
             args=(site add "$name" --php "$php")
             [[ -z $root || $root == Auto-detect ]] || args+=(--root "$root")
             [[ $db == 1 ]] || args+=(--no-db)
+            ;;
+        edit-site)
+            [[ -n $root && $root != Auto-detect ]] || root=-
+            args=(site edit "$site" --root "$root" --hosts "${hosts:--}")
             ;;
         remove-site)
             args=(site rm "$site")
@@ -2822,11 +3265,17 @@ Stack:
   tray [install|uninstall]    Add Novacore to the tray (Linux, Windows via WSL) or menu bar (macOS)
 
 Sites:
-  site add <name> [--php X.Y] [--root DIR] [--no-db]
+  site add <name> [--php X.Y] [--root DIR] [--host HOST]... [--no-db]
                               Serve sites/<name> at https://<name>.localhost
   site rm <name> [--drop-db]  Stop serving a site (its files are kept)
   site list                   List sites
   site info <name>            Show a site's URL, paths and database settings
+  site root <name> [DIR|-]    Show or change a site's document root (- auto-detects)
+  site hosts <name> [add|rm <host>...]
+                              Show, add or remove a site's other hostnames, such as blog.test
+  site edit <name> [--root DIR] [--hosts HOST,...]
+                              Change both at once (--hosts replaces them all)
+  hosts [sync]                Show the hosts file entries sites need, or update the hosts files
   errors [site] [--clear]     Follow a site's PHP error log (logs/<site>.log), or all of them
   open [site]                 Open a site (or the dashboard) in your browser
   mail                        Open Mailpit, which catches every email PHP sends
@@ -2879,6 +3328,7 @@ main() {
         trust)        cmd_trust ;;
         site)         cmd_site "$@" ;;
         sites)        site_list ;;
+        hosts)        cmd_hosts "$@" ;;
         open)         cmd_open "$@" ;;
         mail)         cmd_open --mail ;;
         php)          cmd_php "$@" ;;

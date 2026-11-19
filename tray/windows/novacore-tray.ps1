@@ -1032,7 +1032,7 @@ function Update-FormState {
         } elseif ($spec.type -ne 'check' -and $spec.type -ne 'combo') {
             $v = $f.Control.Text.Trim()
             $problem = ''
-            if (-not $v) { $ok = $false }
+            if (-not $v) { if (-not $spec.optional) { $ok = $false } }
             else {
                 foreach ($rule in $spec.rules) {
                     if (($rule.match -and $v -cnotmatch $rule.match) -or ($rule.notIn -and @($rule.notIn) -ccontains $v)) {

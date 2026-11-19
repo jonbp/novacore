@@ -278,7 +278,7 @@ class Form: NSObject, NSTextFieldDelegate {
                 let v = text.stringValue.trimmed
                 var problem: String?
                 if v.isEmpty {
-                    ok = false
+                    if field.spec["optional"] as? Bool != true { ok = false }
                 } else {
                     for rule in field.spec["rules"] as? [JSON] ?? [] {
                         let error = (rule["error"] as? String ?? "Not allowed").replacingOccurrences(of: "{value}", with: v)

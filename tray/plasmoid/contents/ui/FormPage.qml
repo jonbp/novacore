@@ -105,7 +105,7 @@ SubPage {
                                 if (problem) break
                             }
                         }
-                        valid = v !== "" && problem === ""
+                        valid = (v !== "" || !!fieldSpec.optional) && problem === ""
                         hintIsError = problem !== ""
                         hint = problem || (v && fieldSpec.hint ? fieldSpec.hint.split("{value}").join(v) : "")
                     } else if (type === "choice") {

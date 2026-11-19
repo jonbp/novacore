@@ -1,9 +1,11 @@
 #!/bin/sh
 #
-# novacore-cert <domain>... — issue certificates signed by the Novacore local CA.
+# novacore-cert <domain>[,<hostname>...]... — issue certificates signed by the
+# Novacore local CA.
 #
 # Creates the CA on first use. Each certificate covers the domain and its
-# subdomains (example.localhost and *.example.localhost).
+# subdomains (example.localhost and *.example.localhost), and any hostnames
+# after it, such as example.localhost,example.test,www.example.test.
 
 set -eu
 
@@ -31,13 +33,20 @@ EOF
     rm -f ca.cnf
 fi
 
-for domain in "$@"; do
-    echo "Issuing certificate for $domain"
+for arg in "$@"; do
+    domain=${arg%%,*}
+    names="DNS:$domain, DNS:*.$domain"
+    hosts=""
+    if [ "$arg" != "$domain" ]; then
+        hosts=${arg#*,}
+        names="$names, DNS:$(echo "$hosts" | sed 's/,/, DNS:/g')"
+    fi
+    echo "Issuing certificate for $domain${hosts:+ ($hosts)}"
     cat > "$domain.ext" <<EOF
 basicConstraints = CA:FALSE
 keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:$domain, DNS:*.$domain
+subjectAltName = $names
 authorityKeyIdentifier = keyid
 EOF
     openssl req -new -nodes -newkey rsa:2048 -subj "/CN=$domain" \

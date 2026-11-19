@@ -9,7 +9,7 @@
 
 A local LEMP stack in Docker for PHP sites: nginx, PHP-FPM 7.4–8.5 with Xdebug, MariaDB and a mail catcher, driven by a small CLI.
 
-- **No hosts-file edits.** Sites live at `https://<name>.localhost`, which already resolves to 127.0.0.1.
+- **No hosts-file edits.** Sites live at `https://<name>.localhost`, which already resolves to 127.0.0.1. Give a site its own hostnames too, and Novacore keeps your hosts file up to date.
 - **Trusted HTTPS.** A local certificate authority issues a certificate per site. Trust it once.
 - **PHP version per site**, switched with one command. Xdebug is built into every version.
 - **Every email caught.** Mail sent from PHP lands in an inbox at `https://localhost/mail/`, never a real one.
@@ -44,14 +44,15 @@ The dashboard at <https://localhost> lists every site.
 Each site is a folder in `sites/` (or set an absolute `SITES_DIR` in `.env`, such as `~/Sites`). `sites.conf` has one line per site:
 
 ```
-# name          php     root
-blog            8.4     -
+# name          php     root            hosts
+blog            8.4     -               blog.test,www.blog.test
 shop            8.2     web
 legacy          7.4     public_html
 ```
 
 - `php`: the PHP version, or `-` for `DEFAULT_PHP`.
 - `root`: the document root. `-` auto-detects `public/`, `web/`, `public_html/` or `htdocs/`, else the folder itself.
+- `hosts`: optional, more hostnames for the site, separated by commas (see [Custom hostnames](#custom-hostnames)).
 
 Edit it by hand and run `novacore reload`, or use the CLI:
 
@@ -61,9 +62,40 @@ novacore site add api --no-db       # skip the database
 novacore site rm shop               # keeps files; --drop-db drops the database
 novacore site list
 novacore site info shop             # URL, paths, database settings
+novacore site root shop public      # change the document root (- auto-detects, . is the folder)
 ```
 
 Subdomains work too (`*.blog.localhost`, for multisite). Containers reach sites by domain over HTTPS, so WordPress loopback requests and calls between sites just work.
+
+### Custom hostnames
+
+A site can answer to other hostnames as well as `<name>.localhost`, such as `blog.test` to match a live site's setup:
+
+```sh
+novacore site add blog --host blog.test --host www.blog.test
+novacore site hosts blog add blog.example     # or rm
+novacore site hosts blog                      # list them
+novacore site edit blog --hosts blog.test --root public   # set both at once
+```
+
+Each one gets HTTPS (the site's certificate is reissued to cover it) and works from inside the containers too. Each name is exact: list `www.` and other subdomains separately.
+
+These names don't resolve by themselves, unlike `*.localhost`, so Novacore adds them to your hosts file between `# BEGIN Novacore` and `# END Novacore` lines, and leaves the rest alone. Where is set by `HOSTS_FILE` in `.env`:
+
+| `HOSTS_FILE` | Hosts file |
+|---|---|
+| `auto` (the default) | `/etc/hosts`, asking for your password with sudo (or a password dialog from the tray icon). On WSL, the Windows hosts file instead, after Windows asks you to confirm. WSL looks names up through Windows, so this covers both. |
+| A path | Another hosts file, kept up to date the same way. |
+| `none` | None. Add them yourself. |
+
+The entries are always in `data/hosts` too, so another hosts file or tool can read them from there, such as dnsmasq (`addn-hosts=/path/to/novacore/data/hosts`) or a hosts manager.
+
+```sh
+novacore hosts        # the entries, and whether each hosts file has them
+novacore hosts sync   # update the hosts file now, e.g. after declining the prompt
+```
+
+Novacore only asks when the entries change. With a `NOVACORE_TLD` other than `localhost`, every site's own domain goes in the hosts file as well.
 
 ## PHP
 
@@ -201,7 +233,7 @@ Novacore has one tray icon, the same everywhere: a globe whose pill shows the st
 Click it for a panel with Novacore's status, your sites, Start/Stop/Restart, Xdebug, Tools and Updates. Right-click for the same as a menu (the Linux Qt icon only has the menu). It covers most of the CLI:
 
 - **Add Site…** asks for a name, PHP version, document root, and whether to create a database.
-- **Each site** expands to open it, its git remote, its folder, VS Code or Zed, a terminal, a PHP shell or its error log, switch its PHP version, show its **Info…** (with copy buttons), or remove it.
+- **Each site** expands to open it, its git remote, its folder, VS Code or Zed, a terminal, a PHP shell or its error log, switch its PHP version, show its **Info…** (with copy buttons), change its document root and hostnames in **Settings…**, or remove it.
 - **Xdebug** sets the mode; **Tools** opens the caught mail, a database shell, container logs or the sites folder.
 - **Updates** lists newer PHP, MariaDB, nginx and Mailpit releases, with a button to install them.
 
@@ -248,7 +280,7 @@ bin/novacore               the CLI
 docker-compose.yml         nginx, mariadb, mailpit, php74 … php85
 docker/                    nginx, PHP-FPM and MariaDB images and config
 sites.conf                 your sites
-data/                      generated: vhosts, certificates, dashboard, compose overrides
+data/                      generated: vhosts, certificates, dashboard, compose overrides, hosts entries
 logs/                      PHP error log per site
 tray/                      the tray icon: protocol, status icons and one folder per platform
 ```
@@ -265,4 +297,5 @@ Don't edit `data/` by hand. Deleting it is safe, but you'll get a new CA and nee
 - **SSH: "Permission denied (publickey)".** Your agent has no keys: run `ssh-add`. Debug with `novacore exec <site> ssh -v user@host`.
 - **SSH: "Host key verification failed".** Connect once from your own terminal to add the host to `~/.ssh/known_hosts`.
 - **Port in use.** Change `HTTP_PORT`, `HTTPS_PORT` or `DB_PORT` in `.env`, then run `novacore up`.
-- **A different TLD.** `NOVACORE_TLD=test` works, but you must resolve `*.test` yourself (dnsmasq or hosts file).
+- **A different TLD.** `NOVACORE_TLD=test` works. Novacore adds each site to your hosts file (see [Custom hostnames](#custom-hostnames)), but not their subdomains: resolve `*.test` with dnsmasq for those.
+- **A custom hostname doesn't resolve.** Run `novacore hosts` to see whether your hosts file has it, and `novacore hosts sync` to add it. Browsers can cache lookups for a minute or so.
