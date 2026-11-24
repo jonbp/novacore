@@ -644,13 +644,48 @@ write_index() {
     [[ -n $rows ]] || rows='<tr><td colspan="4">No sites yet. Run <code>novacore site add &lt;name&gt;</code>.</td></tr>'
 
     page=$(<"$NOVACORE_ROOT/dashboard/index.html")
-    page=${page//'{{SITE_ROWS}}'/$rows}
-    page=${page//'{{DB_USER}}'/$DB_USER}
-    page=${page//'{{DB_PASSWORD}}'/$DB_PASSWORD}
-    page=${page//'{{DB_PORT}}'/$DB_PORT}
-    page=${page//'{{NOVACORE_TLD}}'/$NOVACORE_TLD}
+    page=${page//'{{SITE_ROWS}}'/"$rows"}
+    page=${page//'{{DB_USER}}'/"$DB_USER"}
+    page=${page//'{{DB_PASSWORD}}'/"$DB_PASSWORD"}
+    page=${page//'{{DB_PORT}}'/"$DB_PORT"}
+    page=${page//'{{NOVACORE_TLD}}'/"$NOVACORE_TLD"}
+    write_trust_downloads
+    page=${page//'{{CA_SHA256}}'/"$REPLY"}
     printf '%s\n' "$page" > "$DATA_DIR/nginx/www/index.html"
     cp "$NOVACORE_ROOT/dashboard/novacore.svg" "$DATA_DIR/nginx/www/novacore.svg"
+}
+
+# ca_fingerprint CA — REPLY = the certificate's SHA-256 fingerprint, as
+# AA:BB:..., the way browsers and openssl show it.
+ca_fingerprint() {
+    local hex
+    if command -v openssl >/dev/null; then
+        REPLY=$(openssl x509 -in "$1" -noout -fingerprint -sha256 | cut -d= -f2)
+        return
+    fi
+    hex=$(sed '/-----/d' "$1" | base64 -d | shasum -a 256 | cut -d' ' -f1 | tr 'a-f' 'A-F')
+    REPLY=$(sed 's/../&:/g; s/:$//' <<< "$hex")
+}
+
+# Put the CA certificate on the dashboard, with scripts that trust it, so
+# other machines can use a Novacore that listens on the network
+# (BIND_ADDRESS). Only the certificate: the CA's key never leaves data/certs.
+# REPLY = its fingerprint.
+write_trust_downloads() {
+    local ca=$DATA_DIR/certs/ca.crt www=$DATA_DIR/nginx/www pem script f
+    REPLY=""
+    [[ -f $ca ]] || return 0
+    pem=$(<"$ca")
+    ca_fingerprint "$ca"
+    cp "$ca" "$www/novacore-ca.crt"
+    for f in trust.sh trust.ps1; do
+        script=$(<"$NOVACORE_ROOT/dashboard/$f")
+        script=${script//'{{CA_PEM}}'/"$pem"}
+        script=${script//'{{CA_SHA256}}'/"$REPLY"}
+        printf '%s\n' "$script" > "$www/novacore-$f"
+    done
+    # Windows line endings, for anyone who opens it in Notepad first.
+    sed -i.bak 's/$/\r/' "$www/novacore-trust.ps1" && rm -f "$www/novacore-trust.ps1.bak"
 }
 
 check_sites_conf() {
