@@ -191,6 +191,21 @@ Every email PHP sends with `mail()` goes to [Mailpit](https://mailpit.axllent.or
 
 Apps with their own SMTP settings (Laravel, Symfony Mailer, WP Mail SMTP) can send to host `mailpit`, port `1025`, without encryption. Any username and password are accepted. Caught mail is kept between restarts; Mailpit keeps the newest 500 messages.
 
+## Branding the dashboard
+
+Give the dashboard at <https://localhost> your own name, logo and colours in `.env`, then run `novacore reload`:
+
+```sh
+BRAND_NAME="Acme Dev"
+BRAND_LOGO=brand/acme.svg   # absolute, or relative to the Novacore folder; also the favicon
+BRAND_ACCENT=#6d4aff        # headings, rules, card edges, buttons
+BRAND_ACCENT_TEXT=white     # text on accent buttons
+BRAND_LINK=#4b2fd1          # links in light mode
+BRAND_LINK_DARK=            # links in dark mode (the accent if empty)
+```
+
+Colours are any CSS colour. Leave a setting empty for Novacore's own. Folder listings on sites keep Novacore's look.
+
 ## Updates
 
 Novacore follows upstream's images (`php:8.4-fpm`, `mariadb:11.8`, `nginx:stable-alpine`, `axllent/mailpit:v1`), which get patch releases and security fixes all the time. Docker keeps whichever copy it downloaded first, so bring them up to date with:

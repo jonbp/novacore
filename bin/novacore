@@ -261,6 +261,12 @@ load_env() {
     DB_USER=${DB_USER:-novacore}
     DB_PASSWORD=${DB_PASSWORD:-novacore}
     DB_PORT=${DB_PORT:-3306}
+    BRAND_NAME=${BRAND_NAME:-Novacore}
+    BRAND_LOGO=${BRAND_LOGO:-dashboard/novacore.svg}
+    BRAND_ACCENT=${BRAND_ACCENT:-#17d4a4}
+    BRAND_ACCENT_TEXT=${BRAND_ACCENT_TEXT:-#0d1f1a}
+    BRAND_LINK=${BRAND_LINK:-#0b8f6d}
+    BRAND_LINK_DARK=${BRAND_LINK_DARK:-$BRAND_ACCENT}
     # What DB_HOST is outside Novacore: MariaDB's published port.
     HOST_DB_HOST=127.0.0.1
     [[ $DB_PORT == 3306 ]] || HOST_DB_HOST+=":$DB_PORT"
@@ -644,6 +650,19 @@ write_index() {
     [[ -n $rows ]] || rows='<tr><td colspan="4">No sites yet. Run <code>novacore site add &lt;name&gt;</code>.</td></tr>'
 
     page=$(<"$NOVACORE_ROOT/dashboard/index.html")
+    write_brand
+    page=${page//'{{BRAND_LOGO}}'/"$REPLY"}
+    html_escape "$BRAND_NAME"
+    page=${page//'{{BRAND_NAME}}'/"$REPLY"}
+    css_color BRAND_ACCENT '#17d4a4'
+    page=${page//'{{BRAND_ACCENT}}'/"$REPLY"}
+    local accent=$REPLY
+    css_color BRAND_ACCENT_TEXT '#0d1f1a'
+    page=${page//'{{BRAND_ACCENT_TEXT}}'/"$REPLY"}
+    css_color BRAND_LINK '#0b8f6d'
+    page=${page//'{{BRAND_LINK}}'/"$REPLY"}
+    css_color BRAND_LINK_DARK "$accent"
+    page=${page//'{{BRAND_LINK_DARK}}'/"$REPLY"}
     page=${page//'{{SITE_ROWS}}'/"$rows"}
     page=${page//'{{DB_USER}}'/"$DB_USER"}
     page=${page//'{{DB_PASSWORD}}'/"$DB_PASSWORD"}
@@ -652,7 +671,46 @@ write_index() {
     write_trust_downloads
     page=${page//'{{CA_SHA256}}'/"$REPLY"}
     printf '%s\n' "$page" > "$DATA_DIR/nginx/www/index.html"
+    # Always there, for the folder listings' favicon.
     cp "$NOVACORE_ROOT/dashboard/novacore.svg" "$DATA_DIR/nginx/www/novacore.svg"
+}
+
+# write_brand — copy BRAND_LOGO next to the dashboard. REPLY = its URL there.
+# Falls back to the Novacore logo, with a warning, if it's missing or isn't an
+# image.
+write_brand() {
+    local logo=$BRAND_LOGO ext www=$DATA_DIR/nginx/www
+    [[ $logo == /* ]] || logo="$NOVACORE_ROOT/$logo"
+    ext=$(tr 'A-Z' 'a-z' <<<"${logo##*.}")
+    rm -f "$www"/brand-logo.*
+    case $ext in
+        svg|png|jpg|jpeg|gif|webp|avif|ico) ;;
+        *) warn "BRAND_LOGO isn't an image (svg, png, jpg, gif, webp, avif or ico), so the dashboard uses Novacore's"
+           REPLY=novacore.svg; return ;;
+    esac
+    if [[ ! -f $logo ]]; then
+        warn "BRAND_LOGO has no file at $logo, so the dashboard uses Novacore's"
+        REPLY=novacore.svg; return
+    fi
+    cp "$logo" "$www/brand-logo.$ext"
+    REPLY="brand-logo.$ext"
+}
+
+# html_escape TEXT — REPLY = TEXT with &, < and > escaped.
+html_escape() {
+    REPLY=${1//&/&amp;}
+    REPLY=${REPLY//</&lt;}
+    REPLY=${REPLY//>/&gt;}
+}
+
+# css_color VAR DEFAULT — REPLY = the colour in VAR, or DEFAULT, with a
+# warning, when it couldn't be a CSS colour (and might break out of the style
+# sheet).
+css_color() {
+    REPLY=${!1}
+    [[ $REPLY =~ ^[#a-zA-Z0-9(),.%/\ -]+$ ]] && return
+    warn "$1 doesn't look like a CSS colour, so the dashboard uses $2"
+    REPLY=$2
 }
 
 # ca_fingerprint CA — REPLY = the certificate's SHA-256 fingerprint, as
