@@ -652,6 +652,9 @@ write_index() {
     page=$(<"$NOVACORE_ROOT/dashboard/index.html")
     write_brand
     page=${page//'{{BRAND_LOGO}}'/"$REPLY"}
+    local logo_img="<img src=\"$REPLY\" alt=\"\">"
+    case $BRAND_LOGO in [Nn][Oo][Nn][Ee]) logo_img= ;; esac
+    page=${page//'{{BRAND_LOGO_IMG}}'/"$logo_img"}
     html_escape "$BRAND_NAME"
     page=${page//'{{BRAND_NAME}}'/"$REPLY"}
     css_color BRAND_ACCENT '#17d4a4'
@@ -677,12 +680,13 @@ write_index() {
 
 # write_brand — copy BRAND_LOGO next to the dashboard. REPLY = its URL there.
 # Falls back to the Novacore logo, with a warning, if it's missing or isn't an
-# image.
+# image. "none" hides the logo; the favicon is then Novacore's.
 write_brand() {
     local logo=$BRAND_LOGO ext www=$DATA_DIR/nginx/www
+    rm -f "$www"/brand-logo.*
+    case $logo in [Nn][Oo][Nn][Ee]) REPLY=novacore.svg; return ;; esac
     [[ $logo == /* ]] || logo="$NOVACORE_ROOT/$logo"
     ext=$(tr 'A-Z' 'a-z' <<<"${logo##*.}")
-    rm -f "$www"/brand-logo.*
     case $ext in
         svg|png|jpg|jpeg|gif|webp|avif|ico) ;;
         *) warn "BRAND_LOGO isn't an image (svg, png, jpg, gif, webp, avif or ico), so the dashboard uses Novacore's"

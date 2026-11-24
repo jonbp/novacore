@@ -197,14 +197,14 @@ Give the dashboard at <https://localhost> your own name, logo and colours in `.e
 
 ```sh
 BRAND_NAME="Acme Dev"
-BRAND_LOGO=brand/acme.svg   # absolute, or relative to the Novacore folder; also the favicon
+BRAND_LOGO=brand/acme.svg   # absolute, or relative to the Novacore folder; also the favicon. "none" hides it
 BRAND_ACCENT=#6d4aff        # headings, rules, card edges, buttons
 BRAND_ACCENT_TEXT=white     # text on accent buttons
 BRAND_LINK=#4b2fd1          # links in light mode
 BRAND_LINK_DARK=            # links in dark mode (the accent if empty)
 ```
 
-Colours are any CSS colour. Leave a setting empty for Novacore's own. Folder listings on sites keep Novacore's look.
+Colours are any CSS colour. Leave a setting empty for Novacore's own. Folder listings on sites keep Novacore's look. The `brand/` folder is gitignored, so your logo stays on your machine.
 
 ## Updates
 

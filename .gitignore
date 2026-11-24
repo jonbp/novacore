@@ -4,6 +4,8 @@ sites.conf
 sites/
 data/
 logs/
+# Dashboard branding (BRAND_LOGO and friends)
+brand/
 
 # macOS Finder metadata
 .DS_Store
